@@ -158,6 +158,7 @@ let liveScanned = 0;
 let cachedSize: { width: number; height: number } | null = null;
 let sizeObserver: ResizeObserver | null = null;
 let observed: HTMLCanvasElement | null = null;
+let redrawRequest: (() => void) | null = null;
 
 /** Call when a new take starts, so the axis is not inherited from the last. */
 export function resetRollRange(): void {
@@ -172,14 +173,38 @@ export function invalidateRollSize(): void {
 }
 
 /**
+ * Ask the app to redraw the finished plot after the canvas changed size.
+ *
+ * Only the *cold* path needs this. While a take is running the animation loop
+ * redraws sixty times a second and will pick up the new size on its own; a
+ * result sitting on screen is drawn once and then never again until some state
+ * changes, so without this its bitmap stays at the old size — stretched or
+ * clipped by the browser — for as long as the user looks at it.
+ */
+export function setRollRedraw(redraw: () => void): void {
+  redrawRequest = redraw;
+}
+
+/**
  * Watch the canvas itself for size changes.
  *
- * A window `resize` listener only catches the reasons the *window* changed
- * size, and the canvas has others: the warning line appearing mid-take, the
- * message line growing to two rows, the transcript pushing the layout around.
- * Each of those re-flows the canvas without a resize event, and the live path
- * would then keep drawing into a stale cached height — a plot silently
- * stretched or squashed against its own gridlines.
+ * The stylesheet gives this canvas `width: 100%` and a viewport-derived height,
+ * so the reasons it changes size are not the ones a `resize` listener sees:
+ *
+ * - **Width, from the page's own layout.** The transcript, the staff and the
+ *   debug panel all grow the document; the moment it passes the viewport a
+ *   scrollbar appears on a desktop browser and every `100%` element gets
+ *   narrower, with no window resize anywhere.
+ * - **Pinch-zoom and page zoom**, which change the CSS-pixel size of a fixed
+ *   layout. Ctrl-+ does fire `resize`; a two-finger pinch on a phone does not.
+ * - **Device pixel ratio**, when a window is dragged to a second monitor. The
+ *   element's CSS size is unchanged, so the observer will not fire either — but
+ *   the backing store is now wrong, which is why `drawPianoRoll` re-derives
+ *   `dpr` on every call rather than caching it.
+ *
+ * (Height is *not* one of them, despite what this comment used to claim. The
+ *   canvas has an explicit height, so a warning line appearing above it moves
+ *   the canvas without resizing it.)
  *
  * Best-effort by design: `ResizeObserver` is everywhere that matters but the
  * feature test costs one line, and without it the window listener in `main.ts`
@@ -189,9 +214,18 @@ function observeSize(canvas: HTMLCanvasElement): void {
   if (observed === canvas || typeof ResizeObserver === "undefined") return;
   sizeObserver?.disconnect();
   observed = canvas;
-  // The observer fires once on `observe`, which is a free invalidation of a
-  // cache that is about to be filled anyway.
-  sizeObserver = new ResizeObserver(invalidateRollSize);
+  sizeObserver = new ResizeObserver(() => {
+    // The observer fires once on `observe`, and again for changes the caller
+    // already knows about. Comparing against the cache keeps the redraw request
+    // to actual news — and, more importantly, makes it impossible for a redraw
+    // that itself resized the canvas to feed itself.
+    const changed =
+      cachedSize === null ||
+      cachedSize.width !== canvas.clientWidth ||
+      cachedSize.height !== canvas.clientHeight;
+    invalidateRollSize();
+    if (changed) redrawRequest?.();
+  });
   sizeObserver.observe(canvas);
 }
 

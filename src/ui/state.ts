@@ -147,6 +147,24 @@ export function setTranspose(shift: number): void {
 }
 
 /**
+ * What to say about a take that produced no notes.
+ *
+ * "Try whistling louder or closer" is the right advice for a take that was
+ * simply too quiet, and the wrong advice for every empty result the app can
+ * already explain: a browser that kept noise suppression on and gated the
+ * whistle out, a four-minute file whose melody was past the 60 s cut, a
+ * recording the platform interrupted. In those cases the explanation is
+ * already sitting in `warning`, and it is shown on the line underneath — so
+ * the message steps back and stops arguing with it.
+ *
+ * Pure and exported so the rule is pinned by a test: this is a sentence the
+ * user only ever sees on their worst attempt.
+ */
+export function emptyResultMessage(warning: string | null): string {
+  return warning ? "No notes found in that take." : "No notes found — try whistling louder or closer.";
+}
+
+/**
  * Enter the `result` phase with a finished transcription.
  *
  * The octave default lives here rather than in a view because it is a decision
@@ -170,7 +188,7 @@ export function applyResult(
     transpose,
     playing: false,
     playingIndex: null,
-    message: notes.length === 0 ? "No notes found — try whistling louder or closer." : "",
+    message: notes.length === 0 ? emptyResultMessage(state.warning) : "",
     tuningOffsetCents,
   });
 }

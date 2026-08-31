@@ -18,12 +18,17 @@ import {
 import { AudioFileError, decodeAudioFile } from "./audio/decode.js";
 import { isPlaying, startPlayback, stopPlayback } from "./audio/synth.js";
 import { downloadWav, takeFilename } from "./audio/wav-export.js";
-import { a4FromOffsetCents, formatCents, transposeMidi } from "./notes/format.js";
+import { a4FromOffsetCents, transposeMidi } from "./notes/format.js";
 import { createControls } from "./ui/controls.js";
 import { createDebugView } from "./ui/debug.js";
 import { createLiveView, formatClock } from "./ui/live.js";
 import { highlightNoteList, initNoteList, renderNoteList } from "./ui/notelist.js";
-import { drawPianoRoll, invalidateRollSize, resetRollRange } from "./ui/pianoroll.js";
+import {
+  drawPianoRoll,
+  invalidateRollSize,
+  resetRollRange,
+  setRollRedraw,
+} from "./ui/pianoroll.js";
 import { highlightStaff, renderStaff } from "./ui/staff.js";
 import {
   applyResult,
@@ -33,7 +38,7 @@ import {
   subscribe,
   type AppState,
 } from "./ui/state.js";
-import { shouldApplyUpdate, type UpdateTrigger } from "./ui/sw-update.js";
+import { createUpdatePolicy, type UpdateTrigger } from "./ui/sw-update.js";
 import { invalidatePalette } from "./ui/theme.js";
 
 function element<T extends HTMLElement>(id: string): T {
@@ -124,11 +129,39 @@ function renderTuning(state: AppState): void {
   const show =
     state.phase === "result" && state.notes.length > 0 && Math.abs(cents) >= TUNING_NOTICE_CENTS;
   tuningElement.hidden = !show;
+  // `formatCents` already carries the sign, so "+38 cents (sharp)" said it
+  // twice. The word is the half a non-technical reader actually parses, so the
+  // magnitude goes in bare and the direction is spelled out.
   tuningElement.textContent = show
-    ? `Whistle ran ${formatCents(cents)} cents (${cents > 0 ? "sharp" : "flat"}) — ` +
+    ? `Whistle ran ${Math.abs(Math.round(cents))} cents ${cents > 0 ? "sharp" : "flat"} — ` +
       `snapped to A = ${Math.round(a4FromOffsetCents(cents))} Hz.`
     : "";
 }
+
+/**
+ * Draw the finished plot for the state as it stands.
+ *
+ * While a take is running the roll belongs to the animation loop, so every cold
+ * caller has to check that first — three of them did, in three copies. One
+ * function, one check.
+ */
+function redrawRoll(): void {
+  const state = getState();
+  if (state.phase === "recording") return;
+  drawPianoRoll(canvas, {
+    frames: state.frames,
+    notes: state.notes,
+    transpose: state.transpose,
+    playingIndex: state.playingIndex,
+    live: false,
+    tuningOffsetCents: state.tuningOffsetCents,
+  });
+}
+
+// A finished plot is drawn once and then left alone, so a canvas that changes
+// size afterwards would show a stale, browser-stretched bitmap until the next
+// state change. See `setRollRedraw` in ui/pianoroll.ts.
+setRollRedraw(redrawRoll);
 
 function render(state: AppState): void {
   controls.render(state);
@@ -149,14 +182,7 @@ function render(state: AppState): void {
   // touching them from here would fight it.
   if (state.phase === "recording") return;
 
-  drawPianoRoll(canvas, {
-    frames: state.frames,
-    notes: state.notes,
-    transpose: state.transpose,
-    playingIndex: state.playingIndex,
-    live: false,
-    tuningOffsetCents: state.tuningOffsetCents,
-  });
+  redrawRoll();
 
   const playing = state.playingIndex === null ? null : state.notes[state.playingIndex];
   switch (state.phase) {
@@ -381,7 +407,17 @@ function analyze(audio: CapturedAudio, subject: string): void {
         applyResult(result.notes, result.frames, result.tuningOffsetCents);
       } catch (error) {
         console.error("[transcribe] failed", error);
-        setState({ phase: "error", message: `Something went wrong analysing ${subject}.` });
+        // A take that crashed the segmenter is the most valuable recording this
+        // app will ever hold, and it is the one nobody can whistle again. Save
+        // stays on screen in the error phase (see `ui/controls.ts`), so the way
+        // to turn this into a fixture is one tap away rather than gone.
+        const rescuable = getState().hasRecording && lastTake !== null;
+        setState({
+          phase: "error",
+          message:
+            `Something went wrong analysing ${subject}.` +
+            (rescuable ? " The audio is still here — save it before trying again." : ""),
+        });
       }
     }, 0);
   });
@@ -429,16 +465,7 @@ window.addEventListener("resize", () => {
   invalidateRollSize();
   const state = getState();
   renderStaff(state.notes, staffElement, state.transpose, state.playingIndex);
-  if (state.phase !== "recording") {
-    drawPianoRoll(canvas, {
-      frames: state.frames,
-      notes: state.notes,
-      transpose: state.transpose,
-      playingIndex: state.playingIndex,
-      live: false,
-      tuningOffsetCents: state.tuningOffsetCents,
-    });
-  }
+  redrawRoll();
 });
 
 /**
@@ -492,49 +519,70 @@ if (stamp) stamp.textContent = `build ${__BUILD__}`;
  * with `immediate: true` and re-check on every foreground; the build stamp in
  * the footer is how you confirm it worked.
  *
- * *Too eager*: the plugin's `autoUpdate` mode reloads the page the instant a new
- * worker activates. Deploy while someone is whistling — or while a second tab of
- * the same app triggers the update — and the take is destroyed mid-recording
- * with no explanation. So the SW is registered in `prompt` mode (see
- * `vite.config.ts`), which parks the new worker in `waiting`, and we apply it
- * ourselves at a moment when a reload costs nothing. Which moments those are is
- * `shouldApplyUpdate` in `ui/sw-update.ts`; if now is not one of them the update
- * simply waits — for the next phase change or the next foreground.
+ * *Too eager*: `autoUpdate` mode reloads the page the instant a new worker
+ * activates, which destroys a take mid-recording. `prompt` mode (see
+ * `vite.config.ts`) is necessary but **not sufficient**: the plugin still owns
+ * the reload, in its own `controlling` listener, and a worker claims *every*
+ * client in its scope. So a second tab — or the installed window sitting behind
+ * the browser — would be reloaded by a decision the first tab made, mid-take,
+ * with nothing on its screen to explain it.
+ *
+ * Passing `onNeedReload` takes that listener over, so both halves of the
+ * hand-over are ours and each client answers for itself:
+ *
+ *   1. `onNeedRefresh` — a worker is parked in `waiting`. Telling it to take
+ *      over costs this page nothing, but it is what makes *other* clients reach
+ *      step 2, so it goes through the same policy.
+ *   2. `onNeedReload` — the new worker is now serving this page. The only way
+ *      to run its code is `location.reload()`; by this point there is no
+ *      `updateSW(true)` left to call, because the skipping already happened.
+ *
+ * The policy is `shouldApplyUpdate` in `ui/sw-update.ts`; if now is not a safe
+ * moment the update simply waits — for the next phase change or the next
+ * foreground. The honest cost of waiting at step 2 is that this page then runs
+ * old JS against newly-precached assets. The only asset fetched after load is
+ * `pcm-recorder.worklet.js`, at Record time, and a mismatch there already has a
+ * message ("could not load the audio recorder module") rather than silence.
  */
-let updatePending = false;
+const updates = createUpdatePolicy({
+  skipWaiting() {
+    void updateSW(true).catch((error: unknown) => {
+      console.error("[sw] could not ask the waiting worker to take over", error);
+    });
+  },
+  reload() {
+    window.location.reload();
+  },
+});
 
+function considerUpdate(trigger: UpdateTrigger): void {
+  const { phase, playing } = getState();
+  // Both views of "is audio running": the store is updated by the app, the two
+  // audio modules by their own callbacks, and a reload must lose to either.
+  updates.apply({ phase, playing: playing || isPlaying(), recording: isRecording() }, trigger);
+}
+
+// Declared after `updates` on purpose — the callbacks above only run once
+// registration has resolved, which is several ticks after this line.
 const updateSW = registerSW({
   immediate: true,
   onNeedRefresh() {
-    updatePending = true;
-    applyPendingUpdate("state");
+    updates.onWaiting();
+    considerUpdate("state");
+  },
+  onNeedReload() {
+    updates.onControlling();
+    considerUpdate("state");
   },
   onRegisteredSW(_swUrl, registration) {
     if (!registration) return;
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "visible") return;
       void registration.update();
-      applyPendingUpdate("foreground");
+      considerUpdate("foreground");
     });
   },
 });
 
-function applyPendingUpdate(trigger: UpdateTrigger): void {
-  if (!updatePending) return;
-  const { phase, playing } = getState();
-  // Both views of "is audio running": the store is updated by the app, the two
-  // audio modules by their own callbacks, and a reload must lose to either.
-  const context = {
-    phase,
-    playing: playing || isPlaying(),
-    recording: isRecording(),
-  };
-  if (!shouldApplyUpdate(context, trigger)) return;
-  updatePending = false;
-  // Tells the waiting worker to take over; the plugin's registration reloads
-  // the page once it is controlling.
-  void updateSW(true);
-}
-
 // Every phase change is a chance for a deferred update to land.
-subscribe(() => applyPendingUpdate("state"));
+subscribe(() => considerUpdate("state"));

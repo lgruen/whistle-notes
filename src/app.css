@@ -240,6 +240,29 @@ button {
   color: var(--danger);
 }
 
+/* Two lines, not one: what happened, then why it might have. The warning is
+   the line that explains an empty result, so it is never allowed to be
+   suppressed by the message above it — see `statusLines` in ui/controls.ts. */
+.message > span {
+  display: block;
+}
+
+/* After `.is-error` and at the same specificity, so it wins: the message can be
+   an error, but a warning about the device is a warning either way. */
+.message > .warning {
+  margin-top: 0.35rem;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  opacity: 0.9;
+}
+
+/* No top margin when the warning is the only line on screen. The message span
+   is always in the DOM and merely hidden, so this is an adjacent-sibling test
+   rather than `:first-child`, which would never match. */
+.message > [hidden] + .warning {
+  margin-top: 0;
+}
+
 /* Quieter than .message: this is information about the take, not a status. */
 .tuning {
   margin: 0;
