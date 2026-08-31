@@ -153,6 +153,11 @@ export const DEFAULT_CONFIG: DspConfig = {
     minNoteMs: 80,
     // Under 60 ms at the same pitch is a detector dropout, not a rest.
     gapMergeMs: 60,
+    // 400 ms for a gap the room drowned out. That is comfortably longer than
+    // the events this rule exists for — a cough, a door, a chair scrape all
+    // run 150–350 ms — and comfortably shorter than any stretch over which a
+    // whistler could have played something we would then be discarding.
+    maskedGapMs: 400,
     restGapMs: 180,
   },
 

@@ -227,6 +227,89 @@ describe("adaptive noise floor", () => {
   });
 });
 
+/**
+ * The masking rule: a gap louder than the notes around it is a room event, and
+ * the note probably continued underneath it.
+ *
+ * Sound reasoning with two edges that a round-2 review found unguarded. It had
+ * no length limit at all — "length is no evidence here" — so five seconds of
+ * noise between two E6s produced a single 6.6-second note, over which a
+ * whistler could have played a whole phrase. And it demanded that *every* frame
+ * of the gap clear the notes' level, so a single frame in an event's decay
+ * flipped the answer, which made the outcome non-monotonic in the gap's length:
+ * the same event slightly longer could merge where a shorter one had not.
+ */
+describe("a gap the room drowned out", () => {
+  const broadband = (n: number, levelDb: number, seed: number): Float32Array =>
+    addNoise({ samples: new Float32Array(n), sampleRate: SR, expected: [] }, { type: "white", levelDb, seed })
+      .samples;
+
+  /** Two E6s in a quiet room with `gapSec` of loud noise between them, of which
+   *  `dipSec` in the middle is 20 dB down — loud enough still not to be silence,
+   *  quiet enough not to be masking. */
+  function masked(gapSec: number, dipSec = 0): Float32Array {
+    const total = 1.0 + 0.6 + gapSec + 0.6 + 0.6;
+    const n = Math.round(total * SR);
+    const out = addNoise({ samples: new Float32Array(n), sampleRate: SR, expected: [] }, {
+      type: "pink",
+      levelDb: -55,
+      seed: 4,
+    }).samples;
+    const burst = broadband(n, -6, 9);
+    const from = Math.round(1.6 * SR);
+    const to = Math.round((1.6 + gapSec) * SR);
+    const dipFrom = Math.round((1.6 + (gapSec - dipSec) / 2) * SR);
+    const dipTo = dipFrom + Math.round(dipSec * SR);
+    for (let i = from; i < to; i++) out[i] += burst[i] * (i >= dipFrom && i < dipTo ? 0.1 : 1);
+    for (const at of [1.0, 1.6 + gapSec]) {
+      const note = sequence([{ midi: 88, durSec: 0.6, amp: 0.25 }], {}).samples;
+      const off = Math.round(at * SR);
+      for (let i = 0; i < note.length && off + i < n; i++) out[off + i] += note[i];
+    }
+    return out;
+  }
+
+  it("bridges a short event and gives up on a long one, monotonically", () => {
+    // Two claims. The rule has a limit — `maskedGapMs`, 400 ms — and below it
+    // the note is held through the event while above it the two things actually
+    // heard are reported as two notes. And the answer never flips back: once a
+    // gap is long enough to be reported as two notes, every longer gap is too.
+    //
+    // The boundary is asserted with a frame of slack either side, because the
+    // rule measures the gap in *voiced* frames and the fixture specifies it in
+    // samples: a 43 ms analysis window straddling each end makes the first
+    // slightly longer than the second, which is a fact about measurement and
+    // not about this rule.
+    let seenSplit = false;
+    const lengths = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+    for (const gapSec of lengths) {
+      const count = transcribe(masked(gapSec), SR).notes.length;
+      const label = `gap ${gapSec.toFixed(2)}s`;
+      if (gapSec <= 0.35) expect(count, label).toBe(1);
+      if (gapSec >= 0.45) expect(count, label).toBe(2);
+      if (count > 1) seenSplit = true;
+      else expect(seenSplit, `${label} merged again after splitting`).toBe(false);
+    }
+  });
+
+  it("is the config knob it claims to be", () => {
+    const generous = mergeConfig(DEFAULT_CONFIG, { segment: { maskedGapMs: 800 } });
+    expect(transcribe(masked(0.6), SR).notes).toHaveLength(2);
+    expect(transcribe(masked(0.6), SR, generous).notes).toHaveLength(1);
+  });
+
+  it("is not decided by one frame in the event's decay", () => {
+    // A real event is not a rectangle. Twenty milliseconds of this 300 ms burst
+    // dropping 20 dB puts three of the gap's twenty-two frames under the level
+    // of the notes — enough for an all-or-nothing rule to call the whole thing a
+    // rest, and nowhere near enough for anyone listening to hear one.
+    expect(transcribe(masked(0.3, 0.02), SR).notes).toHaveLength(1);
+    // Widen the quiet patch and it stops being masked, which is the right
+    // answer for the right reason rather than a threshold nobody can see.
+    expect(transcribe(masked(0.3, 0.1), SR).notes).toHaveLength(2);
+  });
+});
+
 describe("microphone warm-up", () => {
   /** A melody that starts at t=0 and never stops: no silence for the floor to
    *  measure anywhere, and the opening frames are full-level signal. */

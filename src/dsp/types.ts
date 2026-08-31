@@ -236,6 +236,13 @@ export interface SegmentConfig {
    *  dropout, so they merge. True silence never merges, however brief —
    *  that is what distinguishes one long note from two repeated ones. */
   gapMergeMs: number;
+  /** ...and this is the same limit for a gap that is *louder* than the notes
+   *  around it — a cough, a door, a chair scrape that buried the whistle. Such
+   *  a gap merges on the argument that a re-articulation would have been just
+   *  as inaudible under it, which is a fair guess about a door slam and an
+   *  absurd one about five seconds of noise. Wider than `gapMergeMs`, because
+   *  the evidence is genuinely better; finite, because it is not unlimited. */
+  maskedGapMs: number;
   /** Silence longer than this is reported as a rest. */
   restGapMs: number;
 }

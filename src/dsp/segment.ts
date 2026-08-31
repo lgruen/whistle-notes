@@ -1118,11 +1118,30 @@ function noteLevel(note: Measured, frames: PitchFrame[]): number {
   return median(levels);
 }
 
-/** Was every frame in this span louder than `levelDb`? */
-function louderThan(from: number, to: number, levelDb: number, frames: PitchFrame[]): boolean {
-  for (let i = from; i <= to; i++) if (frames[i].bandRmsDb < levelDb) return false;
-  return true;
+/** What fraction of this span was louder than `levelDb`? */
+function fractionLouderThan(
+  from: number,
+  to: number,
+  levelDb: number,
+  frames: PitchFrame[],
+): number {
+  let louder = 0;
+  for (let i = from; i <= to; i++) if (frames[i].bandRmsDb >= levelDb) louder++;
+  return louder / (to - from + 1);
 }
+
+/** How much of a gap has to be louder than the notes around it before the gap
+ *  is a masking event rather than a rest.
+ *
+ *  A fraction rather than "all of it", because a real event is not a rectangle:
+ *  a door swinging shut has a body and a decay, and one frame in its tail
+ *  dipping under the whistle's level should not turn one held note into two
+ *  repeated ones. It used to, which made the outcome non-monotonic in the gap's
+ *  length — the same event a little longer or a little shorter could go either
+ *  way for no reason a listener would recognise. Four frames in five is a
+ *  comfortable majority and still nowhere near what an ordinary quiet rest
+ *  produces, which is zero. */
+const MASKED_GAP_FRACTION = 0.8;
 
 /** Merge same-pitch notes separated only by a brief dropout. Repeats until
  *  stable, since merging two can bring a third within reach. */
@@ -1156,19 +1175,27 @@ function mergeDropouts(
       // door, a chair — that buried the whistle rather than interrupted it.
       // The tone is unrecoverable while it lasts, but a re-articulation would
       // have been inaudible under it too, so the better guess is that the note
-      // continued. Length is no evidence here, which is why this bypasses
-      // `gapMergeMs`; that limit exists to stop two genuinely repeated notes
-      // in a noisy room from merging, and in that case the gap sits at the
-      // *room's* level, below the notes, not above them.
+      // continued. That reasoning is why the ordinary `gapMergeMs` limit does
+      // not apply: it exists to stop two genuinely repeated notes in a noisy
+      // room from merging, and in that case the gap sits at the *room's* level,
+      // below the notes, not above them.
+      //
+      // But the reasoning has a shelf life, and `maskedGapMs` is it. "A
+      // re-articulation would have been inaudible" is a fair guess about a door
+      // slam and an absurd one about five seconds of noise, over which a
+      // whistler could have played a whole phrase. Past the limit the honest
+      // answer is that we cannot tell, and two notes is the answer that at
+      // least reports the two things actually heard.
       const masked =
         gapFrames > 0 &&
         !silent &&
-        louderThan(
+        gapMs <= s.maskedGapMs &&
+        fractionLouderThan(
           previous.endIndex + 1,
           next.startIndex - 1,
           Math.min(noteLevel(previous, frames), noteLevel(next, frames)),
           frames,
-        );
+        ) >= MASKED_GAP_FRACTION;
 
       if (samePitch && (gapMs <= s.gapMergeMs || masked) && !silent) {
         out[out.length - 1] = measure(
