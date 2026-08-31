@@ -51,6 +51,7 @@ import {
   setMode,
   setState,
   setTranspose,
+  setVoice,
   subscribe,
   type AppState,
 } from "./ui/state.js";
@@ -90,6 +91,7 @@ const controls = createControls(
   {
     record: element<HTMLButtonElement>("record"),
     play: element<HTMLButtonElement>("play"),
+    voice: element<HTMLButtonElement>("voice"),
     importLabel: element("import"),
     importInput: element<HTMLInputElement>("import-input"),
     save: element<HTMLButtonElement>("save-wav"),
@@ -103,6 +105,10 @@ const controls = createControls(
     onStopRecord: finishRecording,
     onPlay: beginPlayback,
     onStopPlay: stopPlayback,
+    // Unlike the octave, this deliberately leaves a running playback alone:
+    // the notes are still the right notes, only the colour changes, and it
+    // lands on the next tap of Play. See `setVoice`.
+    onVoice: setVoice,
     onImport: beginImport,
     onSave: saveRecording,
     onTranspose: (shift) => {
@@ -659,10 +665,15 @@ function beginPlayback(): void {
   // `audio/synth.ts`), so a refusal has to be respected here rather than
   // assumed away: flagging `playing` against a playback that never started
   // would leave a Stop button that stops nothing.
-  const started = startPlayback(state.notes, state.transpose, {
-    onIndex: (index) => setState({ playingIndex: index }),
-    onEnd: () => setState({ playing: false, playingIndex: null }),
-  });
+  const started = startPlayback(
+    state.notes,
+    state.transpose,
+    {
+      onIndex: (index) => setState({ playingIndex: index }),
+      onEnd: () => setState({ playing: false, playingIndex: null }),
+    },
+    state.voice,
+  );
   if (!started) return;
   // After `startPlayback`, which internally stops any previous run and would
   // otherwise clear the flag we just set.

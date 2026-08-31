@@ -173,6 +173,73 @@ describe("the mode switch", () => {
   });
 });
 
+/**
+ * The playback voice.
+ *
+ * Persisted like the octave and validated like the mode, and for the same
+ * reason as both: `localStorage` is shared with every past and future build of
+ * this app, so a voice that no longer exists — or a hand-edited string — must
+ * come back as the default rather than reach the synth as an unknown name.
+ *
+ * The one thing it deliberately does *not* share with the octave is stopping a
+ * running playback: a transposed melody is playing the wrong notes the instant
+ * the toggle moves, where a different voice is the same notes in a different
+ * colour. See `setVoice`.
+ */
+describe("the playback voice", () => {
+  it("starts clean and remembers what was chosen last time", async () => {
+    expect((await loadStore()).getState().voice).toBe("clean");
+    expect((await loadStore({ "whistle-notes:voice": "supersaw" })).getState().voice).toBe(
+      "supersaw",
+    );
+  });
+
+  it("ignores a stored value this build has no voice for", async () => {
+    expect((await loadStore({ "whistle-notes:voice": "hoover" })).getState().voice).toBe("clean");
+    expect((await loadStore({ "whistle-notes:voice": "" })).getState().voice).toBe("clean");
+  });
+
+  it("persists a choice and refuses one it does not recognise", async () => {
+    const store = await loadStore();
+    store.setVoice("supersaw");
+    expect(store.getState().voice).toBe("supersaw");
+    expect(localStorage.getItem("whistle-notes:voice")).toBe("supersaw");
+
+    store.setVoice("theremin" as never);
+    expect(store.getState().voice).toBe("supersaw");
+  });
+
+  it("does not disturb anything else in the store", async () => {
+    const store = await loadStore();
+    store.applyResult(WHISTLED, []);
+    store.setState({ playing: true, playingIndex: 1 });
+    store.setVoice("supersaw");
+    // Switching voices mid-playback is allowed; it lands on the next tap of
+    // Play. Nothing about the take on screen may move because of it.
+    const state = store.getState();
+    expect(state.playing).toBe(true);
+    expect(state.playingIndex).toBe(1);
+    expect(state.transpose).toBe(-2);
+    expect(state.notes).toEqual(WHISTLED);
+  });
+
+  it("survives a localStorage that throws", async () => {
+    vi.resetModules();
+    vi.stubGlobal("localStorage", {
+      getItem: () => {
+        throw new Error("denied");
+      },
+      setItem: () => {
+        throw new Error("denied");
+      },
+    });
+    const store: Store = await import("../src/ui/state.js");
+    expect(store.getState().voice).toBe("clean");
+    expect(() => store.setVoice("supersaw")).not.toThrow();
+    expect(store.getState().voice).toBe("supersaw");
+  });
+});
+
 describe("the take's tuning offset", () => {
   it("reaches the state, so the result view can mention it", async () => {
     const store = await loadStore();

@@ -8,7 +8,12 @@ import {
   type Note,
   type PitchFrame,
 } from "../src/dsp/index.js";
-import { playbackSchedule, scheduleDuration } from "../src/audio/synth.js";
+import {
+  playbackSchedule,
+  scheduleDuration,
+  supersawDetuneCents,
+  voiceSpec,
+} from "../src/audio/synth.js";
 import { formatClock } from "../src/ui/live.js";
 import { sequenceText } from "../src/ui/notelist.js";
 import { rollMidiRange, rollSpanSec } from "../src/ui/pianoroll.js";
@@ -140,6 +145,117 @@ describe("playback scheduling", () => {
       expect(schedule[i].startSec).toBeGreaterThanOrEqual(schedule[i - 1].startSec);
     }
     expect(scheduleDuration([])).toBe(0);
+  });
+});
+
+/**
+ * The supersaw, as arithmetic.
+ *
+ * Whether it *sounds* good is a question for a phone speaker, and nothing here
+ * claims an answer to it. What can be settled on paper is everything that would
+ * make it sound wrong for a reason that is not taste: a spread that is not
+ * symmetric drags the perceived pitch off the note the user is trying to check,
+ * and a stack that is not level-matched turns the toggle into a volume control.
+ */
+describe("the supersaw spread", () => {
+  it("is symmetric about the written pitch", () => {
+    const spread = supersawDetuneCents();
+    for (let i = 0; i < spread.length; i++) {
+      // Exactly, not approximately: the two halves are the same expression with
+      // one sign flipped, so any drift here would be a real asymmetry. Summing
+      // rather than negating, because the centre entry is `0` and `-0` is a
+      // different value to `Object.is` while being the same detune.
+      expect(spread[i] + spread[spread.length - 1 - i]).toBe(0);
+    }
+    expect(spread.reduce((sum, cents) => sum + cents, 0)).toBe(0);
+  });
+
+  it("keeps exactly one oscillator on the note, so the pitch stays unambiguous", () => {
+    expect(supersawDetuneCents().filter((cents) => cents === 0)).toHaveLength(1);
+    expect(supersawDetuneCents(5).filter((cents) => cents === 0)).toHaveLength(1);
+    // An even count has no centre to put it on, and says so rather than
+    // rounding one of the pairs onto the fundamental.
+    expect(supersawDetuneCents(6).filter((cents) => cents === 0)).toHaveLength(0);
+  });
+
+  it("is bounded by the stated maximum, and reaches it exactly once each way", () => {
+    const spread = supersawDetuneCents(7, 25);
+    expect(Math.min(...spread)).toBe(-25);
+    expect(Math.max(...spread)).toBe(25);
+    for (const cents of spread) expect(Math.abs(cents)).toBeLessThanOrEqual(25);
+    // A quarter-tone stack would be a different instrument.
+    expect(spread.filter((cents) => Math.abs(cents) === 25)).toHaveLength(2);
+  });
+
+  it("orders the oscillators from flat to sharp, with no duplicates", () => {
+    const spread = supersawDetuneCents();
+    for (let i = 1; i < spread.length; i++) expect(spread[i]).toBeGreaterThan(spread[i - 1]);
+  });
+
+  it("spaces the pairs the JP-8000 way: clustered inside, flung out at the edges", () => {
+    const spread = supersawDetuneCents(7, 25);
+    const sharpSide = spread.slice(4); // the three above the fundamental
+    const gaps = [sharpSide[0], sharpSide[1] - sharpSide[0], sharpSide[2] - sharpSide[1]];
+    for (let i = 1; i < gaps.length; i++) expect(gaps[i]).toBeGreaterThan(gaps[i - 1]);
+    // Evenly spaced would put the inner pair at 1/3 of maximum; pulling it in
+    // to under a quarter is what makes the stack one thick voice rather than
+    // three audible chorus taps.
+    expect(sharpSide[0] / 25).toBeLessThan(0.25);
+    expect(sharpSide[1] / 25).toBeGreaterThan(0.45);
+    expect(sharpSide[1] / 25).toBeLessThan(0.65);
+  });
+
+  it("is deterministic, and generalises to other oscillator counts", () => {
+    expect(supersawDetuneCents()).toEqual(supersawDetuneCents());
+    expect(supersawDetuneCents(5)).toHaveLength(5);
+    expect(supersawDetuneCents(9)).toHaveLength(9);
+    // Degenerate counts stay finite rather than dividing by a zero pair count.
+    expect(supersawDetuneCents(1)).toEqual([0]);
+    expect(supersawDetuneCents(0)).toEqual([]);
+    expect(supersawDetuneCents(9).every(Number.isFinite)).toBe(true);
+  });
+});
+
+describe("the two playback voices", () => {
+  it("leaves the clean voice exactly what it was", () => {
+    const clean = voiceSpec("clean");
+    expect(clean.oscillatorType).toBe("triangle");
+    expect(clean.detuneCents).toEqual([0]);
+    expect(clean.peakGain).toBeCloseTo(0.25, 10);
+    expect(clean.releaseSec).toBeCloseTo(0.03, 10);
+    expect(clean.lowpassHz).toBeNull();
+  });
+
+  it("scales the supersaw by 1/√N, because detuned saws sum as power", () => {
+    const clean = voiceSpec("clean");
+    const saw = voiceSpec("supersaw");
+    const n = saw.detuneCents.length;
+
+    // Seven saws at 1/√7 the amplitude carry the same RMS as one at full: they
+    // beat rather than reinforce, so their *powers* add. The extra factor is a
+    // perceptual trim for the saw's brighter spectrum, not a fudge.
+    const trim = (saw.peakGain * Math.sqrt(n)) / clean.peakGain;
+    expect(trim).toBeGreaterThan(0.6);
+    expect(trim).toBeLessThanOrEqual(1);
+    // Even with every oscillator momentarily in phase the note cannot clip on
+    // its own — which is the arithmetic the 1/√N is quietly also buying.
+    expect(saw.peakGain * n).toBeLessThan(1);
+  });
+
+  it("gives the supersaw a longer tail and a lid on the fizz", () => {
+    const saw = voiceSpec("supersaw");
+    expect(saw.oscillatorType).toBe("sawtooth");
+    expect(saw.detuneCents).toEqual(supersawDetuneCents());
+    expect(saw.releaseSec).toBeGreaterThan(voiceSpec("clean").releaseSec);
+    expect(saw.lowpassHz).not.toBeNull();
+
+    // A note at the scheduler's 90 ms floor is shorter than attack+release, so
+    // it *does* spill past its own end — deliberately, and boundedly:
+    // `sustainEnd` shortens the sustain and never the release, so the overhang
+    // can only ever be attack + release − floor. Keeping that under ~70 ms is
+    // what makes a run of very short notes read as legato and not as a chord.
+    const shortestNoteSec = 0.09; // `playbackSchedule`'s minDuration default
+    expect(0.005 + saw.releaseSec - shortestNoteSec).toBeLessThan(0.07);
   });
 });
 

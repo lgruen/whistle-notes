@@ -24,6 +24,7 @@
  * split has been broken.
  */
 
+import { VOICES, type Voice } from "../audio/synth.js";
 import type { Note, PitchFrame } from "../dsp/index.js";
 import { OCTAVE_SHIFTS, suggestOctaveShift } from "../notes/format.js";
 
@@ -59,6 +60,9 @@ export interface AppState {
   /** Display octave shift, one of {@link OCTAVE_SHIFTS}. Applied at render and
    *  playback time only; `notes` is never rewritten. */
   transpose: number;
+  /** Which synth plays the transcript back. Read once per playback — see
+   *  {@link setVoice}. */
+  voice: Voice;
   /** Whether the synth is running. Distinct from `playingIndex !== null`
    *  because playback passes through rests, and the Stop button must not
    *  flicker back to Play in the gaps. */
@@ -83,6 +87,7 @@ export interface AppState {
 
 const TRANSPOSE_KEY = "whistle-notes:transpose";
 const MODE_KEY = "whistle-notes:mode";
+const VOICE_KEY = "whistle-notes:voice";
 
 /** The mode the last visit ended in. Someone who is practising is practising
  *  across sessions, and landing them back on the transcriber every time would
@@ -110,6 +115,20 @@ function loadTranspose(): number | null {
   }
 }
 
+/** The stored playback voice. Validated against the synth's own list rather
+ *  than trusted, for the same reason the octave is: `localStorage` is shared
+ *  with every past and future version of this app, and a voice that was removed
+ *  (or a hand-edited value) must degrade to the default rather than reach
+ *  `voiceSpec` as an unknown string. */
+function loadVoice(): Voice {
+  try {
+    const raw = localStorage.getItem(VOICE_KEY);
+    return VOICES.includes(raw as Voice) ? (raw as Voice) : "clean";
+  } catch {
+    return "clean";
+  }
+}
+
 const restoredTranspose = loadTranspose();
 
 let state: AppState = {
@@ -118,6 +137,7 @@ let state: AppState = {
   notes: [],
   frames: [],
   transpose: restoredTranspose ?? 0,
+  voice: loadVoice(),
   playing: false,
   playingIndex: null,
   message: "",
@@ -172,6 +192,28 @@ export function setTranspose(shift: number): void {
     // Persistence is a nicety; the toggle still works for this session.
   }
   setState({ transpose: shift });
+}
+
+/**
+ * Choose the playback voice, and remember it for next time.
+ *
+ * Deliberately does **not** stop a running playback the way the octave toggle
+ * does. The two cases look alike and are not: a transposed melody is playing
+ * the *wrong notes* the moment the toggle moves, so stopping is the honest
+ * answer; a different voice is the same notes in a different colour, and there
+ * is nothing wrong with what is currently sounding. The synth reads the voice
+ * once when it builds its graph (`startPlayback`), so a switch mid-playback
+ * simply lands on the next tap of Play — which is also the only way to hear the
+ * two voices against each other.
+ */
+export function setVoice(voice: Voice): void {
+  if (!VOICES.includes(voice) || state.voice === voice) return;
+  try {
+    localStorage.setItem(VOICE_KEY, voice);
+  } catch {
+    // Persistence is a nicety; the toggle still works for this session.
+  }
+  setState({ voice });
 }
 
 /**

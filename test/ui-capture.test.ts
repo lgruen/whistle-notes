@@ -95,22 +95,50 @@ class FakeNode {
   disconnect(): void {}
 }
 
+/** One scheduled envelope point, in the order the synth wrote it. */
+interface EnvelopePoint {
+  kind: "set" | "ramp" | "cancel";
+  value: number;
+  time: number;
+}
+
 class FakeGain extends FakeNode {
   /** Enough of an `AudioParam` for the synth to schedule an envelope on it —
-   *  the capture path only ever reads and writes `value`. */
+   *  the capture path only ever reads and writes `value`. The schedule is kept
+   *  because the *shape* of a note's envelope is the thing worth asserting. */
+  readonly envelope: EnvelopePoint[] = [];
   gain = {
     value: 1,
-    setValueAtTime(): void {},
-    linearRampToValueAtTime(): void {},
-    cancelScheduledValues(): void {},
+    setValueAtTime: (value: number, time: number): void => {
+      this.envelope.push({ kind: "set", value, time });
+    },
+    linearRampToValueAtTime: (value: number, time: number): void => {
+      this.envelope.push({ kind: "ramp", value, time });
+    },
+    cancelScheduledValues: (time: number): void => {
+      this.envelope.push({ kind: "cancel", value: NaN, time });
+    },
   };
 }
 
 class FakeOscillator extends FakeNode {
   type = "";
   frequency = { value: 0 };
-  start(): void {}
-  stop(): void {}
+  detune = { value: 0 };
+  startedAt: number | null = null;
+  stoppedAt: number | null = null;
+  start(when: number): void {
+    this.startedAt = when;
+  }
+  stop(when: number): void {
+    this.stoppedAt = when;
+  }
+}
+
+class FakeBiquadFilter extends FakeNode {
+  type = "";
+  frequency = { value: 0 };
+  Q = { value: 0 };
 }
 
 /** Whether a suspended context comes back when `resume()` is called. */
@@ -146,8 +174,15 @@ class FakeAudioContext {
     return Promise.resolve();
   }
 
+  /** Everything the synth built in this context, in creation order. */
+  readonly gains: FakeGain[] = [];
+  readonly oscillators: FakeOscillator[] = [];
+  readonly filters: FakeBiquadFilter[] = [];
+
   createGain(): FakeGain {
-    return new FakeGain();
+    const gain = new FakeGain();
+    this.gains.push(gain);
+    return gain;
   }
 
   createMediaStreamSource(): FakeNode {
@@ -155,7 +190,15 @@ class FakeAudioContext {
   }
 
   createOscillator(): FakeOscillator {
-    return new FakeOscillator();
+    const osc = new FakeOscillator();
+    this.oscillators.push(osc);
+    return osc;
+  }
+
+  createBiquadFilter(): FakeBiquadFilter {
+    const filter = new FakeBiquadFilter();
+    this.filters.push(filter);
+    return filter;
   }
 
   /** The audio session was interrupted — a call, a route change, iOS. */
@@ -669,27 +712,27 @@ describe("what the device actually granted", () => {
   });
 });
 
+/** The synth, loaded against the same fresh capture module. */
+async function loadSynth(): Promise<typeof import("../src/audio/synth.js")> {
+  return import("../src/audio/synth.js");
+}
+
+function melody(): Note[] {
+  return [72, 74, 76].map((midi, i) => ({
+    midi,
+    noteName: midiToName(midi),
+    centsOffset: 0,
+    startSec: i * 0.5,
+    endSec: i * 0.5 + 0.4,
+    durationSec: 0.4,
+    pitchHz: midiToHz(midi),
+    confidence: 0.9,
+    gapBeforeSec: 0,
+    flags: {},
+  }));
+}
+
 describe("recording and playback are mutually exclusive", () => {
-  /** The synth, loaded against the same fresh capture module. */
-  async function loadSynth(): Promise<typeof import("../src/audio/synth.js")> {
-    return import("../src/audio/synth.js");
-  }
-
-  function melody(): Note[] {
-    return [72, 74, 76].map((midi, i) => ({
-      midi,
-      noteName: midiToName(midi),
-      centsOffset: 0,
-      startSec: i * 0.5,
-      endSec: i * 0.5 + 0.4,
-      durationSec: 0.4,
-      pitchHz: midiToHz(midi),
-      confidence: 0.9,
-      gapBeforeSec: 0,
-      flags: {},
-    }));
-  }
-
   it("refuses to start the synth while the microphone is open", async () => {
     const capture = await loadCapture();
     const synth = await loadSynth();
@@ -740,5 +783,186 @@ describe("recording and playback are mutually exclusive", () => {
     expect(synth.startPlayback([], 0, { onIndex: () => {}, onEnd: () => {} })).toBe(false);
     capture.stopRecording();
     expect(synth.startPlayback([], 0, { onIndex: () => {}, onEnd: () => {} })).toBe(false);
+  });
+});
+
+/**
+ * The graph the voices actually build.
+ *
+ * The supersaw's spread and its gain are arithmetic, and they are tested as
+ * arithmetic in `ui-display.test.ts`. What can only be seen from here is the
+ * *wiring*, and it is where the interesting failures would be: seven
+ * oscillators per note is seven times as many things to leave running, seven
+ * times as many to forget to detune, and one shared filter that a naive
+ * implementation would build once per note. The two rules the supersaw could
+ * plausibly break — the click-free stop and the highlight following note
+ * boundaries rather than release tails — are pinned at the bottom.
+ */
+describe("the playback voices", () => {
+  const NOTE_COUNT = 3;
+
+  /** The synth's rAF loop, driven by hand: nothing calls the real one under
+   *  vitest, and the whole question is what the loop decides at a given
+   *  reading of the audio clock. */
+  let frame: (() => void) | null = null;
+
+  function hookFrames(): void {
+    frame = null;
+    vi.stubGlobal("requestAnimationFrame", (callback: () => void) => {
+      frame = callback;
+      return 1;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+  }
+
+  /** Run one animation frame with the clock `elapsed` seconds past the first
+   *  note. `t0` is read back off the graph rather than restated here, so the
+   *  test cannot drift away from the synth's lead-in. */
+  function frameAt(ctx: FakeAudioContext, elapsed: number): void {
+    const t0 = ctx.oscillators[0].startedAt ?? 0;
+    ctx.currentTime = t0 + elapsed;
+    frame?.();
+  }
+
+  async function play(
+    voice: "clean" | "supersaw",
+    handlers: { onIndex?: (i: number | null) => void; onEnd?: () => void } = {},
+  ): Promise<{ synth: Awaited<ReturnType<typeof loadSynth>>; ctx: FakeAudioContext }> {
+    await loadCapture();
+    const synth = await loadSynth();
+    hookFrames();
+    const started = synth.startPlayback(
+      melody(),
+      0,
+      { onIndex: handlers.onIndex ?? ((): void => {}), onEnd: handlers.onEnd ?? ((): void => {}) },
+      voice,
+    );
+    expect(started).toBe(true);
+    // The most recent context, not the first: a test that plays twice to
+    // compare the voices would otherwise be reading the earlier graph.
+    return { synth, ctx: FakeAudioContext.instances[FakeAudioContext.instances.length - 1] };
+  }
+
+  it("leaves the clean voice one triangle per note, as it always was", async () => {
+    const { ctx } = await play("clean");
+
+    expect(ctx.oscillators).toHaveLength(NOTE_COUNT);
+    expect(ctx.gains).toHaveLength(NOTE_COUNT);
+    // Straight to the destination: the filter exists for the saws' fizz, and a
+    // triangle has none to remove.
+    expect(ctx.filters).toHaveLength(0);
+    for (const osc of ctx.oscillators) {
+      expect(osc.type).toBe("triangle");
+      expect(osc.detune.value).toBe(0);
+    }
+    expect(ctx.oscillators.map((osc) => osc.frequency.value)).toEqual(
+      [72, 74, 76].map((midi) => midiToHz(midi)),
+    );
+  });
+
+  it("gives every supersaw note its own detuned stack on one envelope", async () => {
+    const { ctx } = await play("supersaw");
+    const synth = await loadSynth();
+    const spread = synth.supersawDetuneCents();
+
+    expect(ctx.oscillators).toHaveLength(NOTE_COUNT * spread.length);
+    // One gain per *note*, not per oscillator: the stack has to open and close
+    // in lockstep or Stop turns into a chord.
+    expect(ctx.gains).toHaveLength(NOTE_COUNT);
+
+    for (let note = 0; note < NOTE_COUNT; note++) {
+      const stack = ctx.oscillators.slice(note * spread.length, (note + 1) * spread.length);
+      expect(stack.map((osc) => osc.type)).toEqual(spread.map(() => "sawtooth"));
+      expect(stack.map((osc) => osc.detune.value)).toEqual(spread);
+      // The detune is the only thing that differs inside a stack; every
+      // oscillator is nominally the written pitch.
+      for (const osc of stack) expect(osc.frequency.value).toBe(midiToHz(72 + note * 2));
+      // ...and they start together, or the attack would smear.
+      for (const osc of stack) expect(osc.startedAt).toBe(stack[0].startedAt);
+    }
+  });
+
+  it("builds one lowpass for the whole playback rather than one per note", async () => {
+    const { ctx } = await play("supersaw");
+    expect(ctx.filters).toHaveLength(1);
+    expect(ctx.filters[0].type).toBe("lowpass");
+    expect(ctx.filters[0].frequency.value).toBeGreaterThanOrEqual(4000);
+    expect(ctx.filters[0].frequency.value).toBeLessThanOrEqual(6000);
+    // Butterworth: a resonant peak near the corner would make one pitch louder
+    // than its neighbour, which is exactly the judgment this synth is for.
+    expect(ctx.filters[0].Q.value).toBeCloseTo(Math.SQRT1_2, 10);
+  });
+
+  it("peaks the supersaw envelope well below the clean one, since the saws sum", async () => {
+    const clean = await play("clean");
+    const cleanPeak = Math.max(...clean.ctx.gains[0].envelope.map((point) => point.value));
+    const saw = await play("supersaw");
+    const sawPeak = Math.max(...saw.ctx.gains[0].envelope.map((point) => point.value));
+
+    // Seven detuned saws beat rather than reinforce, so their powers add: the
+    // per-oscillator amplitude has to come down by √7 (plus a timbre trim) for
+    // the two voices to land at the same apparent level.
+    expect(sawPeak).toBeLessThan(cleanPeak / 2);
+    expect(sawPeak * Math.sqrt(7)).toBeCloseTo(cleanPeak * 0.8, 10);
+  });
+
+  it("ends every note's supersaw envelope inside the note it belongs to", async () => {
+    const { ctx } = await play("supersaw");
+    const t0 = ctx.oscillators[0].startedAt ?? 0;
+    // The melody's notes are 0.4 s long at 0.5 s spacing, i.e. comfortably
+    // longer than attack+release. So the longer release is taken *out of* the
+    // note rather than added to it, and playback timing is identical to the
+    // clean voice's — which is what keeps the highlight honest.
+    for (let note = 0; note < NOTE_COUNT; note++) {
+      const envelope = ctx.gains[note].envelope;
+      const last = envelope[envelope.length - 1];
+      expect(last.value).toBe(0);
+      expect(last.time).toBeCloseTo(t0 + note * 0.5 + 0.4, 10);
+    }
+  });
+
+  it("ramps every oscillator of every note down on Stop", async () => {
+    const { synth, ctx } = await play("supersaw");
+    ctx.currentTime = 1;
+    synth.stopPlayback();
+
+    for (const gain of ctx.gains) {
+      const tail = gain.envelope.slice(-3);
+      expect(tail.map((point) => point.kind)).toEqual(["cancel", "set", "ramp"]);
+      expect(tail[2].value).toBe(0);
+    }
+    // Every one of the twenty-one, not just the first of each stack: an
+    // oscillator left running past the ramp is the click the ramp exists to
+    // prevent, seven times over.
+    for (const osc of ctx.oscillators) expect(osc.stoppedAt).toBeCloseTo(1.03, 10);
+  });
+
+  it("waits for the supersaw's longer tail before auto-stopping", async () => {
+    // The melody sounds for 1.4 s. The clean voice's release is 30 ms and the
+    // supersaw's is 150, so 1.45 s is past the end of one and inside the other
+    // — closing the context there would cut the decay, which is the very click
+    // the stop ramp exists to avoid.
+    let cleanEnded = false;
+    const clean = await play("clean", { onEnd: () => void (cleanEnded = true) });
+    frameAt(clean.ctx, 1.45);
+    expect(cleanEnded).toBe(true);
+
+    let sawEnded = false;
+    const saw = await play("supersaw", { onEnd: () => void (sawEnded = true) });
+    frameAt(saw.ctx, 1.45);
+    expect(sawEnded).toBe(false);
+    frameAt(saw.ctx, 1.56);
+    expect(sawEnded).toBe(true);
+  });
+
+  it("highlights on note boundaries for both voices, not on release tails", async () => {
+    for (const voice of ["clean", "supersaw"] as const) {
+      const seen: (number | null)[] = [];
+      const { ctx } = await play(voice, { onIndex: (index) => seen.push(index) });
+      // Read at the same four clock positions for both voices; the supersaw's
+      // longer decay must not shift a single one of them.
+      for (const elapsed of [0.05, 0.45, 0.55, 1.05]) frameAt(ctx, elapsed);
+      expect(seen).toEqual([0, 1, 2]);
+    }
   });
 });

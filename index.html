@@ -154,6 +154,10 @@
     <div class="dock">
       <button type="button" class="btn btn-record" id="record">Record</button>
       <button type="button" class="btn btn-play" id="play" hidden>Play</button>
+      <!-- Which synth Play uses. Shows the voice you have, switches to the
+           other one when tapped; the label and the accessible name are written
+           by `ui/controls.ts` from the stored preference. -->
+      <button type="button" class="btn btn-voice" id="voice" hidden>Clean</button>
       <!-- The escape hatch. A file goes through the very same transcribe()
            call a live take does, so this keeps working when the microphone
            does not — denied, missing, or hijacked by another app. The input

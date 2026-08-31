@@ -634,13 +634,37 @@ button {
   color: #fff;
 }
 
+/* 5rem rather than the 6 it had alone: the voice toggle joined it in the dock,
+   and four controls only fit across a 360 px phone if Play gives up the slack
+   it was never using. "Play"/"Stop" are four letters. */
 .btn-play {
   flex: none;
-  min-width: 6rem;
+  min-width: 5rem;
   border: 1px solid var(--accent);
   background: transparent;
   color: var(--accent);
   font-size: 1rem;
+}
+
+/* The playback voice. Small on purpose — it is a setting, not an action, and it
+   sits in a bar whose one loud button should stay Record. Full dock height all
+   the same, so the row reads as one bar rather than a bar with a chip in it. */
+.btn-voice {
+  flex: none;
+  min-width: 4.5rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--text-dim);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+/* Lit when the non-default voice is on, so "why does it sound like that" has a
+   visible answer sitting right next to Play. */
+.btn-voice.is-supersaw {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 /* Same outline treatment as Play, so the dock reads as one primary action and

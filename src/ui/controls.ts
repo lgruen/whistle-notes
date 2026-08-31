@@ -22,8 +22,13 @@
  *    with nothing on screen that gets back to a Stop. The store refuses it
  *    (`setMode`); this file is where that refusal becomes visible, as a
  *    disabled tab rather than a tap that does nothing.
+ * 6. **The voice toggle shares Play's visibility, and only that.** It is a
+ *    setting for one button, so it appears and disappears with it — but it is
+ *    never disabled, because switching voices mid-playback is allowed and
+ *    simply takes effect on the next tap of Play.
  */
 
+import type { Voice } from "../audio/synth.js";
 import { OCTAVE_SHIFTS } from "../notes/format.js";
 // Type-only, deliberately. A value import from `state.js` would make every
 // importer of this module instantiate the store — which reads `localStorage`
@@ -33,6 +38,9 @@ import type { AppState, Mode } from "./state.js";
 export interface ControlElements {
   record: HTMLButtonElement;
   play: HTMLButtonElement;
+  /** The playback voice toggle; shows the voice that is *currently* selected,
+   *  and tapping it switches. Shares Play's visibility. */
+  voice: HTMLButtonElement;
   /** The label wrapping {@link importInput}; hidden, not disabled, because a
    *  `<label>` has no disabled state to respect. */
   importLabel: HTMLElement;
@@ -52,6 +60,7 @@ export interface ControlHandlers {
   onStopRecord(): void;
   onPlay(): void;
   onStopPlay(): void;
+  onVoice(voice: Voice): void;
   onImport(file: File): void;
   onSave(): void;
   onTranspose(shift: number): void;
@@ -91,12 +100,20 @@ export function statusLines(state: Pick<AppState, "message" | "warning">): reado
   return lines;
 }
 
+/** What each voice is called on its button. Short on purpose: this is the
+ *  fourth control in a dock that still has to fit across a 360 px phone. */
+const VOICE_LABELS: Record<Voice, string> = {
+  clean: "Clean",
+  supersaw: "Supersaw",
+};
+
 export function createControls(
   elements: ControlElements,
   handlers: ControlHandlers,
 ): Controls {
   let phase: AppState["phase"] = "idle";
   let playing = false;
+  let voice: Voice = "clean";
 
   // Two lines inside the one message element, built once. `ownerDocument`
   // rather than the global `document` so this module keeps depending on the
@@ -115,6 +132,16 @@ export function createControls(
   elements.play.addEventListener("click", () => {
     if (playing) handlers.onStopPlay();
     else handlers.onPlay();
+  });
+
+  // A single two-state button rather than a segmented pair: the dock has no
+  // room for a control that shows you both options, and with exactly two voices
+  // "what you have" and "what you get if you tap" carry the same information.
+  // The flip is written out rather than derived from `VOICES` because a third
+  // voice would need a different control here anyway, and a silent modulo would
+  // hide that.
+  elements.voice.addEventListener("click", () => {
+    handlers.onVoice(voice === "supersaw" ? "clean" : "supersaw");
   });
 
   elements.importInput.addEventListener("change", () => {
@@ -152,6 +179,7 @@ export function createControls(
     render(state) {
       phase = state.phase;
       playing = state.playing;
+      voice = state.voice;
 
       const recordingNow = state.phase === "recording";
 
@@ -187,6 +215,22 @@ export function createControls(
       elements.play.textContent = state.playing ? "Stop" : "Play";
       elements.play.disabled = !playable && !state.playing;
       elements.play.hidden = !playable && !state.playing;
+
+      // Exactly Play's visibility: the voice only means anything next to the
+      // button that uses it, and a lone "Supersaw" in an otherwise empty dock
+      // would be a setting with nothing to set. It stays *enabled* while
+      // playing, though — the switch lands on the next playback rather than
+      // interrupting this one (see `setVoice`), so there is nothing to forbid,
+      // and A/B-ing the two voices is the whole point of the control.
+      elements.voice.hidden = elements.play.hidden;
+      elements.voice.textContent = VOICE_LABELS[state.voice];
+      elements.voice.classList.toggle("is-supersaw", state.voice === "supersaw");
+      // The visible label is the *state*, not the action, so it cannot double
+      // as the accessible name without reading like a command.
+      elements.voice.setAttribute(
+        "aria-label",
+        `Playback voice: ${VOICE_LABELS[state.voice]}. Tap to switch.`,
+      );
 
       // `busyWithAudio` means the microphone is open or the analyser is
       // running; every other phase — including `error` — can accept a file.
