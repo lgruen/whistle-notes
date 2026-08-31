@@ -519,7 +519,8 @@ function importMidiFile(file: File): void {
     },
     (error: unknown) => {
       console.error("[midi] could not open the file", error);
-      endMidiRead(wanted() ? "That file could not be opened on this device." : "");
+      if (!wanted()) return endMidiRead();
+      endMidiRead("That file could not be opened on this device.");
     },
   );
 }

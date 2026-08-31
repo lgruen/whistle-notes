@@ -113,6 +113,9 @@ function weightedPick(weights: readonly number[], rng: Rng): number {
       last = i;
     }
   }
+  // Nothing is allowed at all. Unreachable through `echoPhrase` — `drillRange`
+  // guarantees a register at least an octave wide, so a step of a semitone is
+  // always legal from somewhere — and index 0 is the only answer left.
   if (last < 0) return 0;
 
   const threshold = rng() * total;

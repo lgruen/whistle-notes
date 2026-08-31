@@ -599,10 +599,19 @@ export function beginMidiRead(): void {
   setPracticeState({ midiReading: true, message: "" });
 }
 
-/** The read is over, however it went. Idempotent, because the caller cannot
- *  always tell whether the result was still wanted by the time it arrived. */
-export function endMidiRead(message = ""): void {
-  setPracticeState({ midiReading: false, message });
+/**
+ * The read is over, however it went.
+ *
+ * With a message when the answer was still wanted, and **without one** when it
+ * was not: a read that finishes after the user has walked off has nothing to
+ * say, and passing an empty string would wipe whatever the screen they walked
+ * *to* is saying instead. Idempotent either way, because the caller cannot
+ * always tell which case it is in until it asks.
+ */
+export function endMidiRead(message?: string): void {
+  setPracticeState(
+    message === undefined ? { midiReading: false } : { midiReading: false, message },
+  );
 }
 
 /**

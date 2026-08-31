@@ -490,7 +490,11 @@ function durationCost(attemptSec: number, targetSec: number, weight: number): nu
  *
  * Generic in the note type so a transcription's `Note` — which carries start
  * and end times the overlay needs — survives the round trip with only its two
- * pitch fields rewritten.
+ * pitch fields rewritten. Which is also the caveat: a `Note`'s `noteName` and
+ * `pitchHz` are *not* rewritten and still describe the corrected pitch, because
+ * nothing in practice mode reads them (`AttemptNote` and `HeardNote` are the
+ * fields that matter, and they are the two that move). Anything that starts
+ * reading them off one of these has to be given the same treatment.
  */
 export function undoTuningCorrection<T extends AttemptNote>(
   notes: readonly T[],

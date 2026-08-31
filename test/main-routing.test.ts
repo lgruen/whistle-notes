@@ -701,12 +701,16 @@ describe("a MIDI file read", () => {
     // do.
     el("practice-drill-hold").click();
     await flush();
+    store.setPracticeMessage("Hear it, then hold it back.");
     release();
     await flush();
 
     expect(store.getPracticeState().screen).toBe("hold");
     expect(store.getPracticeState().draft).toBeNull();
     expect(store.getPracticeState().midi).toBeNull();
+    // ...and it does not clear the line the screen it landed on is showing
+    // either. A read nobody is waiting for has nothing to say.
+    expect(store.getPracticeState().message).toBe("Hear it, then hold it back.");
   });
 
   it("drops a melody that arrives while a take is running", async () => {
