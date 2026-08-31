@@ -379,7 +379,7 @@ So the attempt is aligned against the target with Needleman–Wunsch, once per
 candidate transposition, keeping the shift that fits best. Three constants decide
 everything, and their *relationships* matter far more than their values:
 
-| | | |
+| cost | value | what it buys |
 |---|---|---|
 | gap | 1 | a target note left unsung, or a note that answers to nothing |
 | substitution | 0 → 1.5 | zero within 30 cents, rising, flat past a whole tone |
