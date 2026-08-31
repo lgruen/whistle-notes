@@ -1,17 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
   CLEAN_CENTS,
+  DURATION_TIEBREAK_COST,
   GAP_COST,
   OFF_CENTS,
   SUB_MAX_COST,
+  TRANSPOSE_PRIOR_MAX,
   alignAttempt,
   countVerdicts,
   substitutionCost,
+  transpositionPrior,
   verdictForCents,
   type Alignment,
   type AttemptNote,
   type TargetNote,
 } from "../src/practice/align.js";
+import { BUNDLED_MELODIES } from "../src/practice/bundled.js";
 
 /**
  * The diagnosis engine, tested the way the DSP is: by constructing attempts
@@ -90,6 +94,36 @@ describe("the cost design", () => {
     // A melody in whole-tone steps: shifting every later note onto the wrong
     // slot costs this much per slot, and two slots already outvote one gap.
     expect(2 * substitutionCost(2)).toBeGreaterThan(GAP_COST);
+  });
+
+  /**
+   * The anti-cascade inequality has two more terms in it now. Both the register
+   * prior and the duration tie-break ride on the *diagonal*, so a pairing's
+   * worst case is all three together — and that has to stay under two gaps or
+   * the guarantee above becomes a suggestion.
+   */
+  it("leaves the anti-cascade inequality room for both tie-breakers", () => {
+    for (let semitones = 0; semitones <= 30; semitones += 0.25) {
+      expect(
+        substitutionCost(semitones) + TRANSPOSE_PRIOR_MAX + DURATION_TIEBREAK_COST,
+        `${semitones} st`,
+      ).toBeLessThan(2 * GAP_COST);
+    }
+  });
+
+  it("charges nothing for the register the melody played in, and saturates at an octave", () => {
+    expect(transpositionPrior(0)).toBe(0);
+    expect(transpositionPrior(12)).toBeCloseTo(TRANSPOSE_PRIOR_MAX, 12);
+    expect(transpositionPrior(-12)).toBeCloseTo(TRANSPOSE_PRIOR_MAX, 12);
+    // Past an octave it stops growing, for the same reason `substitutionCost`
+    // stops at a whole tone — and because an unbounded prior would eventually
+    // eat the anti-cascade headroom swept above.
+    expect(transpositionPrior(26)).toBeCloseTo(TRANSPOSE_PRIOR_MAX, 12);
+    for (let semitones = 0; semitones < 12; semitones++) {
+      expect(transpositionPrior(semitones + 1)).toBeGreaterThan(transpositionPrior(semitones));
+    }
+    // A tie-breaker, not a wall: one note's worth of it is far below one gap.
+    expect(TRANSPOSE_PRIOR_MAX).toBeLessThan(GAP_COST);
   });
 });
 
@@ -184,6 +218,18 @@ describe("one note off pitch", () => {
     expect(at(OFF_CENTS - 1)).toBe("off");
     expect(at(OFF_CENTS + 1)).toBe("wrong");
     expect(at(-OFF_CENTS - 1)).toBe("wrong");
+
+    // Exactly *on* a boundary, through the aligner, the answer is whichever way
+    // IEEE-754 rounded `(midi + cents/100 + transposition - targetMidi) * 100`
+    // — building 30 cents that way lands about 3e-13 short of it. So the
+    // assertion here is the honest one: the boundary separates two verdicts, a
+    // cent either side is decisive (above), and nothing is allowed to depend on
+    // which side an exact boundary value falls. The pure function is where the
+    // rule itself is pinned.
+    expect(["clean", "off"]).toContain(at(CLEAN_CENTS));
+    expect(["clean", "off"]).toContain(at(-CLEAN_CENTS));
+    expect(["off", "wrong"]).toContain(at(OFF_CENTS));
+    expect(["off", "wrong"]).toContain(at(-OFF_CENTS));
   });
 });
 
@@ -442,6 +488,238 @@ describe("adversarial", () => {
       searchSemitones: 0,
     });
     expect(narrow.transposition).toBe(0);
+  });
+});
+
+/**
+ * The register prior, which is the difference between a diagnosis and its exact
+ * opposite.
+ *
+ * A cracked octave and a chosen register look identical to a symmetric cost
+ * function: half the notes fit here, half fit there, and whichever half the
+ * search reached first became the reference. Every case below has an
+ * unambiguous truth — the app played the melody at a pitch it chose — and the
+ * failure mode is not "slightly worse feedback", it is telling a beginner the
+ * notes they got right were the wrong ones.
+ */
+describe("the register the melody played in", () => {
+  /** `count` notes from `from` cracked an octave up; everything else exact. */
+  function cracked(
+    target: readonly TargetNote[],
+    from: number,
+    count: number,
+  ): AttemptNote[] {
+    return target.map((note, i) => ({
+      midi: note.midi + (i >= from && i < from + count ? 12 : 0),
+      centsOffset: 0,
+      durationSec: note.durSec,
+    }));
+  }
+
+  it("marks the cracked half wrong, not the half that was right", () => {
+    // Four notes, the first two an octave up. Evenly split, so the cost is
+    // identical in both registers and only the prior can tell them apart.
+    const target = melody([84, 87, 85, 88]);
+    const first = alignAttempt(cracked(target, 0, 2), target);
+    expect(first.transposition).toBe(0);
+    expect(verdicts(first)).toEqual(["wrong", "wrong", "clean", "clean"]);
+
+    const second = alignAttempt(cracked(target, 2, 2), target);
+    expect(second.transposition).toBe(0);
+    expect(verdicts(second)).toEqual(["clean", "clean", "wrong", "wrong"]);
+  });
+
+  it("holds when the crack is the majority of the melody", () => {
+    // Für Elise, last five of nine cracked. Cost alone prefers the crack — it
+    // is four wrong notes there against five here — and the app would report
+    // the four notes that were *right* as an octave low.
+    const target = BUNDLED_MELODIES[4].notes;
+    const alignment = alignAttempt(cracked(target, 4, 5), target);
+    expect(alignment.transposition).toBe(0);
+    expect(verdicts(alignment)).toEqual([
+      "clean",
+      "clean",
+      "clean",
+      "clean",
+      "wrong",
+      "wrong",
+      "wrong",
+      "wrong",
+      "wrong",
+    ]);
+  });
+
+  it("never invents a register from a contiguous crack, over every bundled melody", () => {
+    // The sweep the adversarial review ran: every melody, every run length up
+    // to just over half of it, at every position — 365 attempts whose truth is
+    // "in the register that played, with k cracked notes". 40 of them used to
+    // report a register the user was never in.
+    const wrong: string[] = [];
+    let cases = 0;
+    for (const bundled of BUNDLED_MELODIES) {
+      const target = bundled.notes;
+      for (let count = 1; count <= Math.floor(target.length / 2) + 1; count++) {
+        for (let from = 0; from + count <= target.length; from++) {
+          const alignment = alignAttempt(cracked(target, from, count), target);
+          cases++;
+          if (alignment.transposition !== 0) {
+            wrong.push(`${bundled.id} ${from}..${from + count - 1}: T=${alignment.transposition}`);
+          }
+        }
+      }
+    }
+    expect(cases).toBe(365);
+    expect(wrong.length, wrong.slice(0, 5).join(" | ")).toBe(0);
+  });
+
+  it("still forgives a whole melody echoed in another register", () => {
+    // The prior is a tie-breaker, not a wall. A melody genuinely sung an octave
+    // or a fifth up — flubs and all — is still one register error and not
+    // twelve wrong notes.
+    const target = melody(PHRASE);
+    for (const shift of [12, -12, 7, -7]) {
+      const clean = alignAttempt(whistled(PHRASE.map((midi) => midi + shift)), target);
+      expect(clean.transposition, `${shift} st`).toBe(-shift);
+
+      // ...and with a third of it flubbed by a semitone, which is what a real
+      // echo of a phrase in a new register looks like.
+      const flubbed = PHRASE.map((midi, i) => midi + shift + (i === 1 || i === 4 ? 1 : 0));
+      const messy = alignAttempt(whistled(flubbed), target);
+      expect(messy.transposition, `${shift} st, flubbed`).toBe(-shift);
+      expect(countVerdicts(messy).wrong, `${shift} st, flubbed`).toBe(2);
+    }
+  });
+
+  it("reads a short attempt as the melody's opening, in the register that played", () => {
+    // Somebody who gets three notes in and stops. Without a preference for the
+    // front, `k` notes against `m` slots tie across every placement, and the
+    // aligner used to scatter them mid-melody with a transposition invented to
+    // make them fit.
+    for (const target of [melody([60, 62, 64, 65, 67, 69, 71, 72]), BUNDLED_MELODIES[0].notes]) {
+      for (let kept = 1; kept <= 6; kept++) {
+        const attempt = target.slice(0, kept).map((note) => ({
+          midi: note.midi,
+          centsOffset: 0,
+          durationSec: note.durSec,
+        }));
+        const alignment = alignAttempt(attempt, target);
+        const label = `${target.length} slots, first ${kept}`;
+        expect(alignment.transposition, label).toBe(0);
+        expect(
+          alignment.slots.map((slot) => slot.attemptIndex),
+          label,
+        ).toEqual(target.map((_, i) => (i < kept ? i : null)));
+      }
+    }
+  });
+
+  it("puts one answered note at the slot it answers, not one that ties", () => {
+    // A single note against three: the pitch says which slot, and where the
+    // pitch says nothing the opening wins.
+    const target = melody([60, 62, 64]);
+    expect(verdicts(alignAttempt(whistled([60]), target))).toEqual([
+      "clean",
+      "missing",
+      "missing",
+    ]);
+    expect(alignAttempt(whistled([60]), target).transposition).toBe(0);
+    expect(verdicts(alignAttempt(whistled([62]), target))).toEqual([
+      "missing",
+      "clean",
+      "missing",
+    ]);
+  });
+});
+
+describe("rhythm as the tie-breaker of last resort", () => {
+  const sameNote = (durations: readonly number[]): AttemptNote[] =>
+    durations.map((durationSec) => ({ midi: 60, centsOffset: 0, durationSec }));
+  const beats = (durations: readonly number[]): TargetNote[] =>
+    durations.map((durSec) => ({ midi: 60, durSec }));
+
+  /**
+   * Every drop of every pattern, checked against the *duration* of the slot
+   * that was actually dropped rather than its index — two slots of the same
+   * length are genuinely indistinguishable and the engine is not asked to
+   * guess between them.
+   *
+   * Normalising each side by its own median used to misattribute 8 of these 35,
+   * because the two medians are taken over different lists the moment a note is
+   * missing. Both sides now ride on one tempo estimate.
+   */
+  it("names a slot of the right length, whichever repeat went missing", () => {
+    const patterns = [
+      [1.0, 0.25, 0.25],
+      [0.25, 0.25, 1.0],
+      [1.0, 1.0, 0.25],
+      [0.25, 0.9, 0.5, 0.25],
+      [1.0, 0.5, 0.25, 0.25],
+      [0.5, 0.5, 0.5, 2.0],
+      [2.0, 0.5, 0.5, 0.5],
+      [1.0, 0.25, 0.25, 0.25, 0.25],
+      [0.25, 0.25, 0.25, 0.25, 1.0],
+    ];
+    const wrong: string[] = [];
+    let cases = 0;
+    for (const pattern of patterns) {
+      for (let dropped = 0; dropped < pattern.length; dropped++) {
+        const alignment = alignAttempt(
+          sameNote(pattern.filter((_, i) => i !== dropped)),
+          beats(pattern),
+        );
+        const reported = alignment.slots.findIndex((slot) => slot.verdict === "missing");
+        cases++;
+        if (countVerdicts(alignment).missing !== 1 || pattern[reported] !== pattern[dropped]) {
+          wrong.push(`${JSON.stringify(pattern)} drop ${dropped} -> ${reported}`);
+        }
+      }
+    }
+    expect(cases).toBe(35);
+    expect(wrong.length, wrong.join(" | ")).toBe(0);
+  });
+
+  it("says the same thing however fast the echo was", () => {
+    // The tempo invariance the common scale has to keep: the same shape, three
+    // times as slow, is the same answer.
+    for (const scale of [0.5, 1, 2, 3]) {
+      const alignment = alignAttempt(
+        sameNote([1.0 * scale, 0.25 * scale]),
+        beats([1.0, 0.25, 0.25]),
+      );
+      const reported = alignment.slots.findIndex((slot) => slot.verdict === "missing");
+      expect([1, 2], `scale ${scale}`).toContain(reported);
+    }
+  });
+
+  /**
+   * A budget, not just a per-pair bound. At 0.02 a pair, a hundred and twenty
+   * pairs of mismatched durations were worth more than the two gaps it takes to
+   * slide the whole melody by one slot — so the tie-breaker bought itself a
+   * missing note and an extra one, which is precisely the cascade the cost
+   * design forbids. Recorded targets have no length limit of their own.
+   */
+  it("cannot buy a gap by accumulating over a long melody", () => {
+    for (const length of [64, 120, 200]) {
+      const target: TargetNote[] = Array.from({ length }, (_, i) => ({
+        midi: 60,
+        durSec: i % 2 === 0 ? 0.2 : 1.2,
+      }));
+      // The same pitches, with the durations shifted by one, so every diagonal
+      // pairing pays the full tie-break.
+      const attempt: AttemptNote[] = Array.from({ length }, (_, i) => ({
+        midi: 60,
+        centsOffset: 0,
+        durationSec: i % 2 === 0 ? 1.2 : 0.2,
+      }));
+      const counts = countVerdicts(alignAttempt(attempt, target));
+      expect(counts, `n=${length}`).toEqual({
+        clean: length,
+        off: 0,
+        wrong: 0,
+        missing: 0,
+        extra: 0,
+      });
+    }
   });
 });
 

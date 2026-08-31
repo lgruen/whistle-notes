@@ -74,16 +74,78 @@
  * whole-tone steps, so any two remaining slots already outvote it). One gap,
  * not a cascade, in both directions.
  *
+ * ## The two priors: the app already chose the register
+ *
+ * Cost alone leaves the transposition search *symmetric*, and symmetry is
+ * wrong here. The melody was played at a pitch the app itself picked
+ * (`range.ts` moves every target into the whistler's register before it
+ * sounds), so "the register it played in" is not one hypothesis among
+ * twenty-nine — it is the null hypothesis, and every other one is a claim that
+ * the user moved.
+ *
+ * Without a prior the aligner reads a beginner's most ordinary failure exactly
+ * backwards. Whistle six notes, crack the first three an octave: at `T = 0`
+ * three notes are wrong, at `T = −12` the *other* three are, the two cost the
+ * same, and the tie went to whichever the sweep happened to reach first. The
+ * verdicts then come out inverted — the half that was right is marked wrong —
+ * and the interval ledger learns the inverse of what happened.
+ *
+ * So two small, strictly-bounded terms:
+ *
+ * - {@link transpositionPrior} — a per-pairing surcharge on moving off the
+ *   played register, rising with the distance and saturating at an octave
+ *   ({@link TRANSPOSE_PRIOR_MAX} = 0.25). Per *pairing* rather than per
+ *   attempt, because that is the shape of the evidence: every note that fits
+ *   better in another register is one more vote for it, so a whole melody
+ *   echoed an octave up still wins its register by 6:1 while a bare majority
+ *   of cracked notes does not. The bound keeps the anti-cascade inequality
+ *   intact — `SUB_MAX_COST + TRANSPOSE_PRIOR_MAX + DURATION_TIEBREAK_COST` is
+ *   1.77, still under `2 × GAP_COST`.
+ *
+ *   Where it lands, exactly: with `p` per note at an octave, a bimodal attempt
+ *   is read as an octave echo once the fraction sitting an octave away passes
+ *   `(SUB_MAX_COST + p) / (2 × SUB_MAX_COST)` ≈ 58%. Under that it is a crack
+ *   in the register that played; over it, a register the user chose and then
+ *   flubbed. Something has to be the line, and this one is a statement rather
+ *   than an accident of iteration order.
+ *
+ * - {@link EARLY_GAP_COST} — a sliver added to every unsung slot *except* the
+ *   ones after the last note whistled. An attempt that stops half way through
+ *   leaves its gaps at the **end**; almost nobody skips the opening and then
+ *   sings the rest. Without it, three notes offered to a thirteen-note melody
+ *   with repeated pitches tie across a dozen placements and land somewhere in
+ *   the middle, with a fictitious transposition to go with them. It is tiny
+ *   (0.001 per skipped slot, at most 0.06 across a 64-note melody) because it
+ *   only ever has to break a tie: real duration evidence about *which* repeat
+ *   went missing is an order of magnitude larger and still wins.
+ *
  * ## Rhythm
  *
  * Timing never fails a note — verdicts come from pitch alone. Duration enters
  * only as a tie-breaker worth at most {@link DURATION_TIEBREAK_COST} = 0.02 per
- * pair, three orders below the pitch costs and far below the 0.5 of headroom in
- * the anti-cascade inequality, and only after both sequences have been
- * normalised by their own median duration so a slow echo of a fast phrase costs
- * nothing. What it buys is the genuinely ambiguous case: three identical
- * repeated notes with one of them dropped is a tie on pitch, and rhythm is the
- * only evidence left about *which* one went missing.
+ * pair, three orders below the pitch costs. What it buys is the genuinely
+ * ambiguous case: three identical repeated notes with one of them dropped is a
+ * tie on pitch, and rhythm is the only evidence left about *which* one went
+ * missing.
+ *
+ * Two things have to be true of it, and neither is free:
+ *
+ * 1. **One tempo, not two.** Both sides are put on the *same* scale — the
+ *    attempt's durations divided by the ratio of the two total lengths — rather
+ *    than each being normalised by its own median. Normalising separately means
+ *    the same physical note reads as 4.0 on one side and 1.6 on the other the
+ *    moment a note is missing, because the two medians are taken over different
+ *    lists; the tie-break then points at the wrong slot in about a quarter of
+ *    the drops it is supposed to explain. A common scale keeps the tempo
+ *    invariance (a slow echo of a fast phrase still costs nothing) and makes
+ *    the comparison mean what it says.
+ * 2. **A total budget, not just a per-pair one.** 0.02 per pair is negligible
+ *    against 2 × GAP_COST until there are a hundred pairs, at which point the
+ *    accumulated 2.4 is worth more than opening a missing/extra pair and
+ *    sliding the whole melody by one slot — which is exactly the cascade the
+ *    cost design exists to forbid. So the per-pair cost is scaled down past
+ *    {@link DURATION_TIEBREAK_PAIRS} notes, holding the total under 1.28
+ *    however long the melody is.
  */
 
 /** One note as whistled. Structurally a subset of `src/dsp`'s `Note`. */
@@ -192,6 +254,32 @@ export const SUB_MAX_COST = 1.5;
 /** Most a duration mismatch can add to one pairing. */
 export const DURATION_TIEBREAK_COST = 0.02;
 
+/**
+ * Most the register prior can add to one pairing, reached at an octave.
+ *
+ * Small enough that `SUB_MAX_COST + TRANSPOSE_PRIOR_MAX + DURATION_TIEBREAK_COST
+ * < 2 * GAP_COST` still holds — the anti-cascade guarantee is not negotiable —
+ * and large enough that a bare majority of octave-cracked notes cannot make the
+ * crack the reference. See the prior note in the module docblock for where
+ * those two bounds put it.
+ */
+export const TRANSPOSE_PRIOR_MAX = 0.25;
+/** Distance at which the register prior saturates. Past an octave, "a different
+ *  register" is already the whole story, exactly as past a whole tone "a
+ *  different note" is. */
+const TRANSPOSE_PRIOR_SEMITONES = 12;
+
+/** Added to a slot skipped while the attempt still had notes to come — see the
+ *  prior note in the module docblock. A tie-breaker, three orders below
+ *  `GAP_COST`, so an unfinished attempt leaves its gaps at the end. */
+export const EARLY_GAP_COST = 0.001;
+
+/** Pairs past which the duration tie-break is scaled down, so its total stays
+ *  bounded however long the melody is. 64 is `MAX_MELODY_NOTES`: the longest a
+ *  target is allowed to be, and therefore the length at which the tie-break is
+ *  still worth its full 0.02. */
+const DURATION_TIEBREAK_PAIRS = 64;
+
 /** Pitch distance at which the substitution cost saturates, in semitones. */
 const SUB_SATURATION_SEMITONES = 2;
 const SUB_FREE_SEMITONES = CLEAN_CENTS / 100;
@@ -217,7 +305,33 @@ export function substitutionCost(distanceSemitones: number): number {
   return SUB_MAX_COST * Math.min(1, climb);
 }
 
-/** The verdict for a slot that *was* sung, from its signed residual. */
+/**
+ * What it costs to claim the attempt was sung in a different register from the
+ * one the melody played in.
+ *
+ * Zero at the played register, rising linearly, flat from an octave onwards.
+ * Charged **per pairing**, so the evidence and the prior scale together — see
+ * the prior note in the module docblock.
+ *
+ * Exported for the same reason {@link substitutionCost} is: the inequality that
+ * keeps it a tie-breaker rather than a wall is worth sweeping in a test.
+ */
+export function transpositionPrior(transposition: number): number {
+  const distance = Math.min(Math.abs(transposition), TRANSPOSE_PRIOR_SEMITONES);
+  return (TRANSPOSE_PRIOR_MAX * distance) / TRANSPOSE_PRIOR_SEMITONES;
+}
+
+/**
+ * The verdict for a slot that *was* sung, from its signed residual.
+ *
+ * The boundaries are half-open and exact — `verdictForCents(30)` is `off`, not
+ * `clean`. Reaching them exactly *through* the aligner is another matter: a
+ * residual is `(midi + cents/100 + transposition - targetMidi) * 100`, and
+ * building 30 cents that way lands about 3e-13 below it. That is IEEE-754, not
+ * a rule, so the tests either call this function directly or stay a cent clear
+ * of the boundary on either side. Nothing downstream should depend on which way
+ * an exact boundary value falls.
+ */
 export function verdictForCents(residualCents: number): Exclude<Verdict, "missing"> {
   const distance = Math.abs(residualCents);
   if (distance < CLEAN_CENTS) return "clean";
@@ -234,21 +348,62 @@ function median(values: readonly number[]): number {
     : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-/**
- * Durations as multiples of their own sequence's median, so the two sides can
- * be compared without either one's tempo mattering. `NaN` wherever there is
- * nothing to normalise by, which {@link durationCost} then ignores.
- */
-function relativeDurations(durations: readonly number[]): number[] {
-  const usable = durations.filter((d) => Number.isFinite(d) && d > 0);
-  const scale = median(usable);
-  return durations.map((d) => (d > 0 ? d / scale : NaN));
+/** Mean of `log2(duration)` over the durations that are actually durations.
+ *  `NaN` when there are none, which {@link tempoScale} then declines to use. */
+function meanLogDuration(durations: readonly number[]): number {
+  let sum = 0;
+  let count = 0;
+  for (const seconds of durations) {
+    if (Number.isFinite(seconds) && seconds > 0) {
+      sum += Math.log2(seconds);
+      count++;
+    }
+  }
+  return count === 0 ? NaN : sum / count;
 }
 
-function durationCost(attemptRelative: number, targetRelative: number): number {
-  if (!(attemptRelative > 0) || !(targetRelative > 0)) return 0;
-  const ratio = Math.abs(Math.log2(attemptRelative / targetRelative));
-  return DURATION_TIEBREAK_COST * Math.min(1, ratio);
+/**
+ * How much slower the attempt ran than the target, as one number — the **one**
+ * scale both sides are then measured in.
+ *
+ * Durations are compared as log ratios, so in log space a tempo is a *level*
+ * and a rhythm is the *deviation from it*. Subtracting the two mean log
+ * durations therefore removes exactly the level and leaves exactly the rhythm,
+ * which is what the tie-break is trying to read.
+ *
+ * The two estimates this replaces both fail on the case the tie-break exists
+ * for. Normalising each side by its own median puts the same physical note at
+ * 4.0 on one side and 1.6 on the other the moment a note goes missing, because
+ * the medians are taken over different lists. Matching total lengths is worse
+ * still when the *long* note is the one dropped: it stretches every surviving
+ * note to cover the hole and then reports the wrong slot.
+ *
+ * `1` when either side has nothing to measure, which leaves
+ * {@link durationCost} comparing raw seconds — and it ignores non-positive
+ * durations anyway.
+ */
+function tempoScale(attempt: readonly number[], target: readonly number[]): number {
+  const sung = meanLogDuration(attempt);
+  const wanted = meanLogDuration(target);
+  return Number.isFinite(sung) && Number.isFinite(wanted) ? Math.pow(2, sung - wanted) : 1;
+}
+
+/**
+ * The tie-break's per-pair weight, scaled so its total is bounded.
+ *
+ * Past {@link DURATION_TIEBREAK_PAIRS} the per-pair cost comes down in
+ * proportion, so a two-hundred-note melody spends exactly what a sixty-four
+ * note one does. Without it the accumulated tie-break outgrows `2 * GAP_COST`
+ * and buys a missing/extra pair — the cascade the cost design forbids.
+ */
+function durationWeight(pairs: number): number {
+  return DURATION_TIEBREAK_COST * Math.min(1, DURATION_TIEBREAK_PAIRS / Math.max(1, pairs));
+}
+
+function durationCost(attemptSec: number, targetSec: number, weight: number): number {
+  if (!(attemptSec > 0) || !(targetSec > 0)) return 0;
+  const ratio = Math.abs(Math.log2(attemptSec / targetSec));
+  return weight * Math.min(1, ratio);
 }
 
 /** Back-pointer codes. */
@@ -274,8 +429,13 @@ export function alignAttempt(
   // Sub-semitone honesty: the whole point of reporting cents is that the
   // attempt is never rounded before it is measured.
   const pitches = attempt.map((note) => note.midi + note.centsOffset / 100);
-  const attemptRelative = relativeDurations(attempt.map((note) => note.durationSec));
-  const targetRelative = relativeDurations(target.map((note) => note.durSec));
+  const attemptSec = attempt.map((note) => note.durationSec);
+  const targetSec = target.map((note) => note.durSec);
+  // One scale for both sides, and one weight for every pair. See the rhythm
+  // note in the module docblock for why each of those is load-bearing.
+  const scale = tempoScale(attemptSec, targetSec);
+  const attemptScaled = attemptSec.map((seconds) => seconds / scale);
+  const weight = durationWeight(Math.min(n, m));
 
   const radius = Math.max(
     0,
@@ -297,21 +457,25 @@ export function alignAttempt(
   const width = m + 1;
   const dp = new Float64Array((n + 1) * width);
   const back = new Uint8Array((n + 1) * width);
-  let bestCost = Infinity;
-  let bestTransposition = centre;
-  let bestBack: Uint8Array | null = null;
 
-  // Candidates ordered by distance from the centring guess, so a tie — two
-  // registers that fit equally well, which happens with short symmetric
-  // phrases — resolves to the more plausible one rather than to whichever came
-  // first in an arbitrary sweep.
-  for (const transposition of candidates(centre, radius)) {
+  /**
+   * Fill the table for one candidate register and return its total cost.
+   * `back` is left holding this candidate's decisions, so a caller that wants
+   * to keep them has to copy before filling again.
+   */
+  const fill = (transposition: number): number => {
+    const prior = transpositionPrior(transposition);
+    // Every row but the last still has attempt notes to come, so a slot skipped
+    // in it is a slot skipped *over* rather than never reached — the unlikely
+    // kind of gap. See the prior note in the module docblock.
+    const early = n > 0 ? EARLY_GAP_COST : 0;
     dp[0] = 0;
     for (let j = 1; j <= m; j++) {
-      dp[j] = j * GAP_COST;
+      dp[j] = j * (GAP_COST + early);
       back[j] = CONSUME_TARGET;
     }
     for (let i = 1; i <= n; i++) {
+      const skipCost = GAP_COST + (i < n ? EARLY_GAP_COST : 0);
       dp[i * width] = i * GAP_COST;
       back[i * width] = CONSUME_ATTEMPT;
       for (let j = 1; j <= m; j++) {
@@ -322,7 +486,8 @@ export function alignAttempt(
         let best =
           dp[(i - 1) * width + (j - 1)] +
           substitutionCost(distance) +
-          durationCost(attemptRelative[i - 1], targetRelative[j - 1]);
+          durationCost(attemptScaled[i - 1], targetSec[j - 1], weight) +
+          prior;
         let code = DIAGONAL;
 
         const skipAttempt = dp[(i - 1) * width + j] + GAP_COST;
@@ -330,7 +495,7 @@ export function alignAttempt(
           best = skipAttempt;
           code = CONSUME_ATTEMPT;
         }
-        const skipTarget = dp[i * width + (j - 1)] + GAP_COST;
+        const skipTarget = dp[i * width + (j - 1)] + skipCost;
         if (skipTarget < best - EPSILON) {
           best = skipTarget;
           code = CONSUME_TARGET;
@@ -340,8 +505,20 @@ export function alignAttempt(
         back[i * width + j] = code;
       }
     }
+    return dp[n * width + m];
+  };
 
-    const cost = dp[n * width + m];
+  let bestCost = Infinity;
+  let bestTransposition = centre;
+  let bestBack: Uint8Array | null = null;
+
+  // Candidates ordered by distance from the centring guess, so a tie — two
+  // registers that fit equally well, which happens with short symmetric
+  // phrases — resolves to the more plausible one rather than to whichever came
+  // first in an arbitrary sweep. The prior above settles most of those ties on
+  // its own; the order still decides the ones it cannot reach.
+  for (const transposition of candidates(centre, radius)) {
+    const cost = fill(transposition);
     if (cost < bestCost - EPSILON) {
       bestCost = cost;
       bestTransposition = transposition;
@@ -358,10 +535,20 @@ export function alignAttempt(
   return traceback(bestBack, width, n, m, pitches, target, bestTransposition, bestCost);
 }
 
-/** The transposition search order: the centring guess, then outwards. */
+/**
+ * The transposition search order: the centring guess, then outwards — and the
+ * played register itself, always.
+ *
+ * `0` is on the ballot whatever the window, because it is the one register the
+ * app *knows* was in the air and the one {@link transpositionPrior} is measured
+ * from. It costs one more pass of a table that is already cheap, and without it
+ * a centring guess dragged more than `radius` semitones by a cracked attempt
+ * could leave the true answer unconsidered.
+ */
 function candidates(centre: number, radius: number): number[] {
   const out = [centre];
   for (let d = 1; d <= radius; d++) out.push(centre - d, centre + d);
+  if (!out.includes(0)) out.push(0);
   return out;
 }
 
