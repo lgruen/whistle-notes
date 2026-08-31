@@ -211,7 +211,63 @@
           <h2 class="practice-title" id="practice-target-name"></h2>
           <p class="practice-meta" id="practice-target-meta"></p>
           <p class="card-body" id="practice-target-next"></p>
+          <button type="button" class="btn btn-save" id="practice-target-practice">
+            Practice this
+          </button>
+
+          <!-- Everything this melody has taught the app about the whistler.
+               The rows are the point: the same cell red six times is a trouble
+               spot, a different cell each time is ordinary bad luck, and those
+               two want different practice. Hidden until there is an attempt. -->
+          <div class="card" id="practice-target-history" hidden>
+            <h3 class="card-title">Which notes keep going wrong</h3>
+            <div class="heat-row" id="practice-target-heat"></div>
+            <p class="card-body" id="practice-target-trouble" hidden></p>
+            <div class="attempt-list" id="practice-target-attempts"></div>
+          </div>
+
           <button type="button" class="ghost danger" id="practice-delete">Delete</button>
+        </section>
+
+        <!-- Melody recall, before the attempt. The one screen in the app where
+             the ear-first rule does real work: it may show a name, a length and
+             a Listen button, and nothing whatsoever about which notes are
+             coming. See src/ui/practice.ts and test/practice-ui.test.ts. -->
+        <section class="practice-screen" id="practice-recall" hidden>
+          <button type="button" class="ghost" id="practice-recall-back">← Melody</button>
+          <h2 class="practice-title" id="practice-recall-name"></h2>
+          <p class="practice-lead" id="practice-recall-hint"></p>
+          <button type="button" class="btn btn-listen" id="practice-recall-listen">
+            Listen
+          </button>
+          <p class="practice-meta" id="practice-recall-listens" hidden></p>
+          <button type="button" class="btn btn-attempt" id="practice-recall-whistle">
+            Whistle it
+          </button>
+        </section>
+
+        <!-- ...and after it. Names are allowed here: this is a report on
+             something already whistled, not a prompt for something about to be.
+             Even so, only what the user *produced* is ever named. -->
+        <section class="practice-screen" id="practice-result" hidden>
+          <button type="button" class="ghost" id="practice-result-done">← Melody</button>
+          <h2 class="practice-title">How that went</h2>
+          <canvas
+            class="roll roll-diff"
+            id="practice-result-roll"
+            aria-label="What you whistled, against what the melody wanted"
+          ></canvas>
+          <div class="vstrip" id="practice-result-strip"></div>
+          <p class="practice-meta" id="practice-result-summary"></p>
+          <p class="practice-lead" id="practice-result-takeaway"></p>
+          <div class="add-row">
+            <button type="button" class="btn btn-add" id="practice-result-retry">
+              Try again
+            </button>
+            <button type="button" class="btn btn-add" id="practice-result-close">
+              Done
+            </button>
+          </div>
         </section>
 
         <section class="practice-screen" id="practice-range" hidden>

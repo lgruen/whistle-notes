@@ -44,7 +44,13 @@
 
 import type { Alignment, TargetNote } from "./align.js";
 import type { MidiMelody } from "./midi.js";
-import { isUsableRange, rangeFromEnds, type WhistleRange } from "./range.js";
+import type { HeardNote, TrailPoint } from "./recall.js";
+import {
+  isUsableRange,
+  rangeFromEnds,
+  transposeIntoRange,
+  type WhistleRange,
+} from "./range.js";
 import {
   draftTarget,
   parseTarget,
@@ -72,7 +78,7 @@ const LIBRARY_VERSION = 1;
  * lands back on the library, and deleting the selected target cannot leave a
  * detail screen pointing at nothing.
  */
-export type PracticeScreen = "library" | "target" | "range" | "draft" | "midi";
+export type PracticeScreen = "library" | "target" | "range" | "draft" | "midi" | "recall";
 
 /** Which end of the range the user is being asked for, during the check. */
 export type RangeStep = "low" | "high";
@@ -107,6 +113,48 @@ export interface MidiPick {
   melodies: readonly MidiMelody[];
 }
 
+/**
+ * What came back from one attempt, and everything the result screen draws.
+ *
+ * Held together rather than as three fields because they are only ever true of
+ * each other: the alignment is *of* those notes, and the trail is the
+ * measurement underneath them. Splitting them would make a half-updated result
+ * — a new alignment against an old trail — representable, and it would be
+ * representable at exactly the moment the user is looking at it.
+ */
+export interface RecallAttempt {
+  /** As whistled, with the times the segmenter gave each note. */
+  notes: readonly HeardNote[];
+  /** The continuous pitch measurement under those notes. */
+  trail: readonly TrailPoint[];
+  alignment: Alignment;
+}
+
+/**
+ * One run through the recall exercise: listen, whistle, look.
+ *
+ * Never persisted, for the reason drafts are not: it is a moment, not a
+ * possession. The history it produces *is* persisted, in the stats.
+ *
+ * `notes` is the melody **as played** — already moved into the whistler's
+ * register — and it is captured once when the screen opens rather than
+ * recomputed. Everything downstream (the synth, the aligner, the interval
+ * statistics) has to agree about which notes were in the air, and a range
+ * measured again mid-session must not be able to change the answer to what the
+ * user just heard.
+ */
+export interface RecallSession {
+  targetId: string;
+  notes: readonly TargetNote[];
+  /** How many times the melody has been played this session. No cap, and no
+   *  judgement: see `listenCountText` in `recall.ts`. */
+  listens: number;
+  /** Whether the take now running is this exercise's attempt. */
+  recording: boolean;
+  /** The finished attempt, or `null` before one has been made. */
+  attempt: RecallAttempt | null;
+}
+
 export interface PracticeState {
   screen: PracticeScreen;
   /** Newest first. */
@@ -130,6 +178,8 @@ export interface PracticeState {
   draft: TargetDraft | null;
   /** A parsed MIDI file waiting to be picked from, or `null`. */
   midi: MidiPick | null;
+  /** The recall exercise now running, or `null`. */
+  recall: RecallSession | null;
   /** Whether a take is being recorded *into a draft* (rather than for the
    *  range check). Cleared the moment the notes arrive. */
   recordingTarget: boolean;
@@ -208,6 +258,7 @@ let state: PracticeState = {
   rangeDraft: draftFrom(restored.range),
   draft: null,
   midi: null,
+  recall: null,
   recordingTarget: false,
   message: "",
   storageError: null,
@@ -288,14 +339,24 @@ export function showLibrary(message = ""): void {
     // target" land in the middle of the last one.
     draft: null,
     midi: null,
+    recall: null,
     recordingTarget: false,
     message,
   });
 }
 
-export function selectTarget(id: string): void {
+export function selectTarget(id: string, message = ""): void {
   if (!state.targets.some((target) => target.id === id)) return;
-  setPracticeState({ screen: "target", selectedId: id, rangeStep: null, message: "" });
+  setPracticeState({
+    screen: "target",
+    selectedId: id,
+    rangeStep: null,
+    // An exercise belongs to the screen it is on; walking back to the melody
+    // ends it, so the next "Practice this" starts from a clean listen count
+    // rather than from someone else's half-finished attempt.
+    recall: null,
+    message,
+  });
 }
 
 /** The selected target, or `null` — including after it was deleted. */
@@ -436,6 +497,9 @@ export function removeTarget(id: string): void {
     stats,
     screen: state.selectedId === id ? "library" : state.screen,
     selectedId: state.selectedId === id ? null : state.selectedId,
+    // An exercise about a melody that no longer exists has nothing to play and
+    // nothing to score.
+    recall: state.recall?.targetId === id ? null : state.recall,
     storageError: libraryError ?? statsError,
   });
 }
@@ -476,7 +540,109 @@ export function captureRangeEnd(step: RangeStep, midi: number): boolean {
   return true;
 }
 
+/* ── Recall ───────────────────────────────────────────────────────────── */
+
+/**
+ * Open the recall exercise on a target.
+ *
+ * The melody is moved into the whistler's register **here, once**, and the
+ * result is what the synth plays and what the aligner scores against. That is
+ * the single most load-bearing line of the exercise: score against the written
+ * pitch while playing the transposed one and every attempt comes back an octave
+ * wrong, with the aligner dutifully explaining a register error the app itself
+ * introduced.
+ */
+export function beginRecall(targetId: string): void {
+  const target = state.targets.find((candidate) => candidate.id === targetId);
+  if (!target) return;
+  setPracticeState({
+    screen: "recall",
+    selectedId: targetId,
+    recall: {
+      targetId,
+      notes: transposeIntoRange(target.notes, state.range),
+      listens: 0,
+      recording: false,
+      attempt: null,
+    },
+    message: "",
+  });
+}
+
+/** Count one play-through. The screen says how many; nothing gates on it. */
+export function countRecallListen(): void {
+  const recall = state.recall;
+  if (!recall) return;
+  setPracticeState({ recall: { ...recall, listens: recall.listens + 1 }, message: "" });
+}
+
+/** Mark that the take now running is this exercise's attempt. Set before the
+ *  notes exist and cleared when they arrive, so the button that started it is
+ *  the button that stops it — the same rule the other two takes follow. */
+export function beginRecallTake(): void {
+  const recall = state.recall;
+  if (!recall) return;
+  setPracticeState({ recall: { ...recall, recording: true }, message: "" });
+}
+
+/** The attempt ended without producing one. Says why, and puts the button back. */
+export function endRecallTake(message = ""): void {
+  const recall = state.recall;
+  if (!recall) return;
+  setPracticeState({ recall: { ...recall, recording: false }, message });
+}
+
+/**
+ * An attempt arrived: score it, remember it, and show it.
+ *
+ * One patch, on purpose. The statistics and the result on screen are two views
+ * of the same event, and a state where the heatmap has heard about an attempt
+ * the diff overlay has not — or the reverse — is one the user can see.
+ */
+export function finishRecallAttempt(
+  attempt: RecallAttempt,
+  at: number = Date.now(),
+): void {
+  const recall = state.recall;
+  if (!recall) return;
+  setPracticeState({
+    recall: { ...recall, recording: false, attempt },
+    message: "",
+    ...foldAttempt(recall.targetId, recall.notes, attempt.alignment, at),
+  });
+}
+
+/** Back to the listen screen for another go at the same melody. The listen
+ *  count survives: it is about this sitting, not about this attempt. */
+export function retryRecall(): void {
+  const recall = state.recall;
+  if (!recall) return;
+  setPracticeState({ recall: { ...recall, recording: false, attempt: null }, message: "" });
+}
+
+/** Leave the exercise, back to the melody it was about. */
+export function closeRecall(): void {
+  if (state.recall) selectTarget(state.recall.targetId);
+  else showLibrary();
+}
+
 /* ── The history ──────────────────────────────────────────────────────── */
+
+/**
+ * Fold one attempt into the statistics and work out whether it stuck.
+ *
+ * Returns a patch rather than applying one, so a caller with more to say in the
+ * same breath — {@link finishRecallAttempt} — can say it in one render.
+ */
+function foldAttempt(
+  targetId: string,
+  notes: readonly TargetNote[],
+  alignment: Alignment,
+  at: number,
+): Pick<PracticeState, "stats" | "storageError"> {
+  const stats = recordAttempt(state.stats, targetId, notes, alignment, at);
+  return { stats, storageError: persistStats(stats) };
+}
 
 /**
  * Fold one finished attempt into the history and persist it.
@@ -493,6 +659,5 @@ export function recordPracticeAttempt(
   alignment: Alignment,
   at: number = Date.now(),
 ): void {
-  const stats = recordAttempt(state.stats, targetId, notes, alignment, at);
-  setPracticeState({ stats, storageError: persistStats(stats) });
+  setPracticeState(foldAttempt(targetId, notes, alignment, at));
 }

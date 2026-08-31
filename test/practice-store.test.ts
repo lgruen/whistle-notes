@@ -256,6 +256,197 @@ describe("the library", () => {
   });
 });
 
+/**
+ * The recall exercise's state machine — and the one line in it that everything
+ * downstream depends on: the melody is moved into the whistler's register
+ * *once*, and that transposed melody is what gets played, scored and counted.
+ */
+describe("the recall exercise", () => {
+  /** A whistler who lives an octave above the middle of a keyboard. */
+  const RANGE = { lowMidi: 79, highMidi: 96 };
+
+  /** An attempt at `notes`, sung `cents` off and `shift` semitones away. */
+  function attemptAt(
+    notes: readonly { midi: number }[],
+    shift = 0,
+    cents = 0,
+  ): ReturnType<typeof alignAttempt> {
+    return alignAttempt(
+      notes.map((note) => ({ midi: note.midi + shift, centsOffset: cents, durationSec: 0.4 })),
+      notes.map((note) => ({ midi: note.midi, durSec: 0.4 })),
+    );
+  }
+
+  it("moves the melody into the whistler's register, once, when the screen opens", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [60, 62, 64], 1);
+    store.addTarget(saved);
+    store.setRange(RANGE);
+    store.beginRecall(saved.id);
+
+    const recall = store.getPracticeState().recall!;
+    expect(store.getPracticeState().screen).toBe("recall");
+    expect(recall.notes.map((note) => note.midi)).toEqual([84, 86, 88]);
+    expect(recall.listens).toBe(0);
+    expect(recall.attempt).toBeNull();
+
+    // ...and a range measured again mid-session does not change what the user
+    // already heard.
+    store.setRange({ lowMidi: 60, highMidi: 72 });
+    expect(store.getPracticeState().recall!.notes.map((note) => note.midi)).toEqual([84, 86, 88]);
+  });
+
+  it("counts listens without a limit", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [84, 86], 1);
+    store.addTarget(saved);
+    store.beginRecall(saved.id);
+    for (let i = 0; i < 5; i++) store.countRecallListen();
+    expect(store.getPracticeState().recall!.listens).toBe(5);
+  });
+
+  it("does not open on a melody that is not there", async () => {
+    const store = await loadStore();
+    store.beginRecall("nonexistent");
+    expect(store.getPracticeState().recall).toBeNull();
+    expect(store.getPracticeState().screen).toBe("library");
+  });
+
+  it("records nothing when the attempt produced nothing", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [84, 86], 1);
+    store.addTarget(saved);
+    store.beginRecall(saved.id);
+    store.beginRecallTake();
+    expect(store.getPracticeState().recall!.recording).toBe(true);
+
+    store.endRecallTake("Nothing tonal in that one.");
+    expect(store.getPracticeState().recall!.recording).toBe(false);
+    expect(store.getPracticeState().recall!.attempt).toBeNull();
+    // The whole point: a take the app could not hear is not evidence about the
+    // whistler, and a phantom failure in the heatmap is worse than no data.
+    expect(store.getPracticeState().stats.targets.size).toBe(0);
+    expect(store.getPracticeState().message).toBe("Nothing tonal in that one.");
+  });
+
+  it("scores, remembers and shows an attempt in one breath", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [84, 86, 88], 1);
+    store.addTarget(saved);
+    store.beginRecall(saved.id);
+    store.beginRecallTake();
+
+    const alignment = attemptAt(saved.notes, 0, -45);
+    const seen: (number | null)[] = [];
+    store.subscribePractice((state) => {
+      // Every listener must see the two in agreement: a heatmap that has heard
+      // about an attempt the overlay has not is a disagreement the user can see.
+      seen.push(state.recall?.attempt ? (state.stats.targets.get(saved.id)?.attempts ?? 0) : null);
+    });
+    store.finishRecallAttempt({ notes: [], trail: [], alignment }, 9);
+
+    expect(seen).toEqual([1]);
+    const state = store.getPracticeState();
+    expect(state.recall!.recording).toBe(false);
+    expect(state.recall!.attempt!.alignment).toBe(alignment);
+    expect(state.stats.targets.get(saved.id)!.history[0].verdicts).toEqual([
+      "off",
+      "off",
+      "off",
+    ]);
+  });
+
+  /**
+   * The interval statistics are the thing T4's drills will read, and this is
+   * the property that makes them worth reading: they are keyed by the *step*
+   * in the melody, so the same tune practised in any register teaches the same
+   * buckets. Here the target is written around middle C, played an octave and
+   * a half higher because that is where this whistler lives, and echoed a 5th
+   * above that — and the rising whole tone is still a rising whole tone.
+   */
+  it("feeds the interval statistics from the melody as it was played", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [60, 62, 64], 1);
+    store.addTarget(saved);
+    store.setRange(RANGE);
+    store.beginRecall(saved.id);
+
+    const played = store.getPracticeState().recall!.notes;
+    expect(played.map((note) => note.midi)).toEqual([84, 86, 88]);
+    const alignment = attemptAt(played, 7, -45);
+    expect(alignment.transposition).toBe(-7);
+    store.finishRecallAttempt({ notes: [], trail: [], alignment }, 9);
+
+    const stats = store.getPracticeState().stats;
+    // Two rising whole tones, both sung 45 cents flat — and keyed on +2
+    // whatever octave and whatever register they were sung in.
+    expect([...stats.intervals.keys()]).toEqual([2]);
+    expect(stats.intervals.get(2)!.observations).toBe(2);
+    expect(stats.intervals.get(2)!.absCentsEwma).toBeCloseTo(45, 6);
+    expect(stats.intervals.get(2)!.wrongRateEwma).toBe(0);
+
+    // And it survives the session, which is what makes it a history.
+    const reloaded = await loadStore({
+      [KEY]: storage.peek(KEY) ?? "",
+      [STATS_KEY]: storage.peek(STATS_KEY) ?? "",
+    });
+    expect(reloaded.getPracticeState().stats.intervals.get(2)!.observations).toBe(2);
+  });
+
+  it("goes back for another go without forgetting the sitting", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [84, 86], 1);
+    store.addTarget(saved);
+    store.beginRecall(saved.id);
+    store.countRecallListen();
+    store.finishRecallAttempt({ notes: [], trail: [], alignment: attemptAt(saved.notes) }, 9);
+
+    store.retryRecall();
+    const recall = store.getPracticeState().recall!;
+    expect(recall.attempt).toBeNull();
+    // The listen count is about this sitting, not about this attempt.
+    expect(recall.listens).toBe(1);
+    // The attempt that was already made stays in the history.
+    expect(store.getPracticeState().stats.targets.get(saved.id)!.attempts).toBe(1);
+  });
+
+  it("ends the exercise on the melody it was about", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [84, 86], 1);
+    store.addTarget(saved);
+    store.beginRecall(saved.id);
+    store.closeRecall();
+    expect(store.getPracticeState().screen).toBe("target");
+    expect(store.getPracticeState().selectedId).toBe(saved.id);
+    expect(store.getPracticeState().recall).toBeNull();
+  });
+
+  it("cannot be left running on a melody that has been deleted", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [84, 86], 1);
+    store.addTarget(saved);
+    store.beginRecall(saved.id);
+    store.removeTarget(saved.id);
+    expect(store.getPracticeState().recall).toBeNull();
+    expect(store.getPracticeState().screen).toBe("library");
+  });
+
+  it("says so when an attempt cannot be saved, and keeps showing it", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [84, 86], 1);
+    store.addTarget(saved);
+    store.beginRecall(saved.id);
+    storage.jam();
+
+    const alignment = attemptAt(saved.notes);
+    store.finishRecallAttempt({ notes: [], trail: [], alignment }, 9);
+    // The result is on screen and correct; only its persistence failed, and the
+    // user hears about that rather than losing the screen.
+    expect(store.getPracticeState().recall!.attempt!.alignment).toBe(alignment);
+    expect(store.getPracticeState().storageError).toBe(store.STORAGE_ERROR_MESSAGE);
+  });
+});
+
 describe("the range check", () => {
   it("is not a range until both ends are in", async () => {
     const store = await loadStore();
@@ -428,8 +619,11 @@ describe("the practice island", () => {
     // `midi` and `bundled` joined the island in T2 and belong on it for the
     // same reason: the parser has to be testable against bytes built in a test
     // file rather than against a `.mid` a browser handed it, and a data file of
-    // melodies has no business knowing what a DOM is.
-    for (const name of ["align", "stats", "range", "target", "midi", "bundled"]) {
+    // melodies has no business knowing what a DOM is. `recall` joined in T3,
+    // and it is the sharpest case of all: it lays a melody out for a synth it
+    // may not import and lays a diff out on a canvas it may not touch, and both
+    // of those are arithmetic that a test can check exactly.
+    for (const name of ["align", "stats", "range", "target", "midi", "bundled", "recall"]) {
       const source = await read(name);
       for (const token of BROWSER_ONLY) {
         expect(source, `${name}.ts uses ${token}`).not.toMatch(new RegExp(`\\b${token}\\b`));

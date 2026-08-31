@@ -27,10 +27,27 @@
  * of incremental patching.
  */
 
-import { midiToName } from "../notes/format.js";
+import { formatCents, midiToName } from "../notes/format.js";
 import { BUNDLED_MELODIES } from "../practice/bundled.js";
 import { chordWarning, melodySummary, type MidiMelody } from "../practice/midi.js";
 import { isUsableRange, rangeSpanSemitones, type WhistleRange } from "../practice/range.js";
+import {
+  listenCountText,
+  ordinal,
+  overlayModel,
+  scoreText,
+  takeawayText,
+  transpositionText,
+  verdictChips,
+  type OverlayModel,
+  type VerdictChip,
+} from "../practice/recall.js";
+import {
+  slotTrouble,
+  troubleSpots,
+  type AttemptRecord,
+  type TargetTally,
+} from "../practice/stats.js";
 import {
   canShiftDraft,
   draftNoteCount,
@@ -40,7 +57,8 @@ import {
   type PracticeTarget,
   type TargetDraft,
 } from "../practice/target.js";
-import type { PracticeState, RangeStep } from "../practice/store.js";
+import type { PracticeState, RangeStep, RecallAttempt } from "../practice/store.js";
+import { drawDiffOverlay } from "./diffroll.js";
 import type { Phase } from "./state.js";
 
 export interface PracticeElements {
@@ -64,8 +82,44 @@ export interface PracticeElements {
   detailMeta: HTMLElement;
   /** Where {@link EXERCISES_COMING} goes. */
   detailNext: HTMLElement;
+  /** Starts the recall exercise on this melody. */
+  detailPractice: HTMLButtonElement;
+  /** The whole history block; hidden until there is an attempt in it. */
+  detailHistory: HTMLElement;
+  /** One bar per slot, tinted by how often it has gone wrong. */
+  detailHeat: HTMLElement;
+  /** The one sentence about the worst of them, or nothing. */
+  detailTrouble: HTMLElement;
+  /** The recent attempts, newest first, as verdict strips. */
+  detailAttempts: HTMLElement;
   detailBack: HTMLButtonElement;
   detailDelete: HTMLButtonElement;
+
+  /* The recall exercise: one screen before the attempt, one after it. Two
+     elements rather than one with a swapped body, because the ear-first rule is
+     a claim about the *first* of them and a test can only hold the app to it if
+     it is a thing of its own. */
+  recall: HTMLElement;
+  recallBack: HTMLButtonElement;
+  recallName: HTMLElement;
+  recallHint: HTMLElement;
+  /** "Listen" — and "Stop", while the melody is playing. */
+  recallListen: HTMLButtonElement;
+  recallListens: HTMLElement;
+  /** "Whistle it" — and "Stop", while the attempt is running. */
+  recallWhistle: HTMLButtonElement;
+
+  result: HTMLElement;
+  /** The back arrow at the top; the same action as {@link resultDone}, because
+   *  there is exactly one way out of a finished attempt and it should be
+   *  wherever the thumb happens to be. */
+  resultBack: HTMLButtonElement;
+  resultCanvas: HTMLCanvasElement;
+  resultStrip: HTMLElement;
+  resultSummary: HTMLElement;
+  resultTakeaway: HTMLElement;
+  resultRetry: HTMLButtonElement;
+  resultDone: HTMLButtonElement;
 
   range: HTMLElement;
   rangeHint: HTMLElement;
@@ -121,6 +175,19 @@ export interface PracticeHandlers {
   onPickMelody(id: string): void;
   onCloseMidi(): void;
 
+  /** Open the recall exercise on the selected melody. */
+  onPractice(id: string): void;
+  /** Play the target. Optional and unlimited — see the recall screen note. */
+  onListen(): void;
+  /** Stop a playback that is running. */
+  onStopListen(): void;
+  /** Start the attempt take. */
+  onAttempt(): void;
+  /** Another go at the same melody. */
+  onRetry(): void;
+  /** Leave the exercise. */
+  onCloseRecall(): void;
+
   onTrimDraft(end: "start" | "end"): void;
   /** Cut the nearer end of the kept range back to one note, by index. */
   onTrimDraftTo(index: number): void;
@@ -133,7 +200,10 @@ export interface PracticeHandlers {
 }
 
 export interface PracticeView {
-  render(state: PracticeState, phase: Phase): void;
+  /** `playing` is the synth's own state, and it is needed for the same reason
+   *  `phase` is: the Listen button must never offer to stop a playback that has
+   *  already ended, and the two facts are owned by different modules. */
+  render(state: PracticeState, phase: Phase, playing?: boolean): void;
 }
 
 /**
@@ -171,14 +241,14 @@ export function rangeStepHint(range: WhistleRange | null, step: RangeStep | null
 /**
  * What the detail screen says a target is for.
  *
- * A placeholder, and honest about being one: the exercises land in T3 and T4.
- * Describing them in terms of what the *user* does rather than what the app
- * implements keeps the promise checkable, and keeps it ear-first.
+ * Describes the exercise in terms of what the *user* does rather than what the
+ * app implements, which keeps the promise checkable and keeps it ear-first. The
+ * second sentence is still a promise: the echo drills land in T4.
  */
 export const EXERCISES_COMING =
-  "Exercises are on their way: hear this melody, then whistle it back from memory " +
-  "and see which notes drifted — plus short echo drills built from the notes you " +
-  "keep missing. Nothing to read: the app plays, you answer.";
+  "Hear this melody, then whistle it back from memory and see which notes " +
+  "drifted. Short echo drills built from the notes you keep missing are still " +
+  "to come. Nothing to read: the app plays, you answer.";
 
 /** Escape anything that goes into a string-built row. A target's name is the
  *  user's own text, and it goes straight into `innerHTML`. */
@@ -313,6 +383,192 @@ export function midiHintText(count: number): string {
   return `${count} parts in that file — tap the one that carries the tune.`;
 }
 
+/* ── Recall: before the attempt ───────────────────────────────────────── */
+
+/**
+ * The whole instruction, and the hardest copy in the app to keep honest.
+ *
+ * It has to make three things true at once. Listening is **optional and
+ * unlimited** — the difficulty knob is the user's own, and one listen is a
+ * memory exercise where five is an ear exercise, both worth doing. Nothing is
+ * *read*: no pitch, no name, no staff, because the moment the melody is on
+ * screen as text this stops being the exercise it claims to be. And the register
+ * is explicitly forgiven up front, so a beginner who echoes it high does not
+ * spend the attempt worrying about it.
+ */
+export const RECALL_HINT_FIRST =
+  "Tap Listen as many times as you like — then whistle it back from memory. " +
+  "Whatever register is comfortable is fine; the app works out the rest.";
+
+/** After at least one listen: the same rule, without repeating the lesson. */
+export const RECALL_HINT_HEARD =
+  "Listen again as often as you like, or whistle it back whenever you are ready.";
+
+export function recallHint(listens: number): string {
+  return listens === 0 ? RECALL_HINT_FIRST : RECALL_HINT_HEARD;
+}
+
+/** "Listen" the first time, "Listen again" after — and "Stop" while it plays. */
+export function listenLabel(listens: number, playing: boolean): string {
+  if (playing) return "Stop";
+  return listens === 0 ? "Listen" : "Listen again";
+}
+
+/* ── Recall: the verdict strip ────────────────────────────────────────── */
+
+/** What one chip shows: a big mark, a small line under it, and the sentence a
+ *  screen reader gets instead of the two. */
+export interface ChipText {
+  mark: string;
+  sub: string;
+  label: string;
+}
+
+/**
+ * One chip's two lines, and its accessible name.
+ *
+ * The mark answers "what happened here?" in as few characters as fit on a phone.
+ * The sub-line is the note's **position in the melody**, on every chip that has
+ * one — including the wrong and missed ones, which is not obvious and is the
+ * whole reason this is a function worth testing: the summary underneath says
+ * "the 5th note came out a semitone sharp", and a strip that dropped the number
+ * from exactly the chips it was talking about would leave the reader counting.
+ * The verdict is carried by the mark and the colour instead, and spelled out in
+ * full in the accessible name where neither of those is available.
+ *
+ * Note names appear on exactly two of the five: the note you whistled instead,
+ * and the note you added. Never the note that was wanted — see the ear-first
+ * note in `practice/recall.ts`.
+ */
+export function chipText(chip: VerdictChip): ChipText {
+  const position = chip.position === null ? "" : String(chip.position);
+  const at = chip.position === null ? "Extra note" : `Note ${chip.position}`;
+  const cents = formatCents(chip.cents ?? 0);
+  const name = chip.nameMidi === null ? null : midiToName(chip.nameMidi);
+  switch (chip.outcome) {
+    case "clean":
+      return { mark: "✓", sub: position, label: `${at}: clean` };
+    case "off":
+      return {
+        mark: `${cents}¢`,
+        sub: position,
+        label: `${at}: ${Math.abs(Math.round(chip.cents ?? 0))} cents ${
+          (chip.cents ?? 0) > 0 ? "sharp" : "flat"
+        }`,
+      };
+    case "wrong":
+      return {
+        mark: name ?? "?",
+        sub: position,
+        label: `${at}: wrong${name ? `, you whistled ${name}` : ""}`,
+      };
+    case "missing":
+      return { mark: "—", sub: position, label: `${at}: missed` };
+    default:
+      return { mark: name ?? "+", sub: "extra", label: `${at}${name ? `: ${name}` : ""}` };
+  }
+}
+
+/**
+ * The strip, as buttons.
+ *
+ * Buttons because they are the pointer into the overlay: tapping one frames its
+ * slot on the canvas, which is what makes a strip of sixty-four chips navigable
+ * on a phone at all. `data-recall-i` is the item's index in the overlay model,
+ * not its slot — an extra note has no slot to be identified by.
+ */
+export function verdictStripHtml(chips: readonly VerdictChip[]): string {
+  return chips
+    .map((chip) => {
+      const { mark, sub, label } = chipText(chip);
+      return (
+        `<button type="button" class="vchip is-${chip.outcome}" data-recall-i="${chip.index}"` +
+        ` aria-label="${escapeHtml(label)}">` +
+        `<span class="vchip-mark" aria-hidden="true">${escapeHtml(mark)}</span>` +
+        `<span class="vchip-sub" aria-hidden="true">${escapeHtml(sub)}</span>` +
+        `</button>`
+      );
+    })
+    .join("");
+}
+
+/* ── The target's history ─────────────────────────────────────────────── */
+
+/** How many past attempts the detail screen shows. The store keeps twenty; a
+ *  phone screen can show a handful before it stops being a glance. */
+export const HISTORY_ROWS = 6;
+
+/**
+ * One past attempt, as a row of coloured cells — the result screen's strip,
+ * shrunk to a line.
+ *
+ * Deliberately unlabelled and unnamed. What it is for is the *shape*: six rows
+ * with the same cell red is a trouble spot, six rows with a different cell red
+ * each time is a person having ordinary bad luck, and those two want completely
+ * different practice. No amount of summary statistics shows that as fast as six
+ * lines of colour do.
+ */
+export function attemptRowHtml(attempt: AttemptRecord): string {
+  const clean = attempt.verdicts.filter((verdict) => verdict === "clean").length;
+  const cells = attempt.verdicts
+    .map((verdict) => `<span class="vcell is-${verdict}"></span>`)
+    .join("");
+  return (
+    `<div class="attempt">` +
+    `<span class="attempt-strip">${cells}</span>` +
+    `<span class="attempt-score">${clean}/${attempt.verdicts.length}</span>` +
+    `</div>`
+  );
+}
+
+/** The last few attempts, newest first. */
+export function historyHtml(tally: TargetTally, rows: number = HISTORY_ROWS): string {
+  return tally.history.slice(0, rows).map(attemptRowHtml).join("");
+}
+
+/**
+ * The heat row: one bar per slot, opacity by how much trouble it is.
+ *
+ * Opacity rather than a colour ramp because the ramp would need a legend, and a
+ * legend is a thing to read. A slot that is fine is a faint mark; a slot that
+ * keeps going wrong is a solid one; the sentence underneath names it.
+ */
+export function heatRowHtml(tally: TargetTally): string {
+  return slotTrouble(tally)
+    .map((trouble) => {
+      const opacity = (0.1 + 0.9 * Math.min(1, Math.max(0, trouble))).toFixed(2);
+      return `<span class="heat" style="opacity:${opacity}"></span>`;
+    })
+    .join("");
+}
+
+/**
+ * The one sentence about the worst slot — or nothing at all.
+ *
+ * Nothing at all is the common and correct answer, and it is the point of the
+ * whole history: everybody flubs a note once, and an app that announced a
+ * trouble spot after a single bad attempt would be reporting noise. It takes two
+ * failures at the same slot before this says a word.
+ */
+export function troubleText(tally: TargetTally): string {
+  const worst = troubleSpots(tally)[0];
+  if (!worst) return "";
+  const what = worst.missing > worst.wrong ? "gone missing" : "come out wrong";
+  return (
+    `The ${ordinal(worst.slot + 1)} note has ${what} in ${worst.bad} of ` +
+    `${worst.attempts} attempts — that one is worth a few goes on its own.`
+  );
+}
+
+/** "6 attempts · 4 of 5 clean last time" — the history block's own heading. */
+export function historyMetaText(tally: TargetTally): string {
+  const attempts = `${tally.attempts} attempt${tally.attempts === 1 ? "" : "s"}`;
+  const last = tally.history[0];
+  if (!last) return attempts;
+  const clean = last.verdicts.filter((verdict) => verdict === "clean").length;
+  return `${attempts} · ${clean} of ${last.verdicts.length} clean last time`;
+}
+
 export function createPracticeView(
   elements: PracticeElements,
   handlers: PracticeHandlers,
@@ -349,8 +605,70 @@ export function createPracticeView(
     handlers.onDelete(id);
   });
 
+  elements.detailPractice.addEventListener("click", () => {
+    const id = elements.detailPractice.getAttribute("data-target");
+    if (id) handlers.onPractice(id);
+  });
+
   elements.rangeButton.addEventListener("click", () => handlers.onOpenRange());
   elements.rangeDone.addEventListener("click", () => handlers.onCloseRange());
+
+  /* ── The recall exercise ────────────────────────────────────────────
+   *
+   * The same running/stop rule as everywhere else in this file: whichever
+   * button opened the microphone (or the speaker) is the only way out of it.
+   */
+  elements.recallBack.addEventListener("click", () => handlers.onCloseRecall());
+  elements.resultBack.addEventListener("click", () => handlers.onCloseRecall());
+  elements.resultDone.addEventListener("click", () => handlers.onCloseRecall());
+  elements.resultRetry.addEventListener("click", () => handlers.onRetry());
+
+  elements.recallListen.addEventListener("click", () => {
+    if (elements.recallListen.dataset.running === "true") handlers.onStopListen();
+    else handlers.onListen();
+  });
+
+  elements.recallWhistle.addEventListener("click", () => {
+    if (elements.recallWhistle.dataset.running === "true") handlers.onStopCapture();
+    else handlers.onAttempt();
+  });
+
+  /**
+   * Which chip is being asked about.
+   *
+   * View state, not store state: it is a pointer at something already on
+   * screen, it means nothing to any other module, and it dies with the screen.
+   * Putting it in the store would make every tap on a chip a state change that
+   * re-renders the library.
+   */
+  let highlighted: number | null = null;
+  /** The overlay the strip and the canvas were built from. */
+  let overlay: OverlayModel | null = null;
+
+  const drawOverlay = (): void => {
+    const model = overlay;
+    const attempt = renderedAttempt;
+    if (!model || !attempt) return;
+    drawDiffOverlay(elements.resultCanvas, { model, trail: attempt.trail, highlight: highlighted });
+  };
+
+  elements.resultStrip.addEventListener("click", (event) => {
+    const raw = (event.target as HTMLElement | null)
+      ?.closest<HTMLElement>("[data-recall-i]")
+      ?.getAttribute("data-recall-i");
+    if (raw === null || raw === undefined) return;
+    const index = Number(raw);
+    // Tapping the chip that is already framed clears it, so there is a way back
+    // to the whole picture that is not "tap something else".
+    highlighted = highlighted === index ? null : index;
+    for (const chip of elements.resultStrip.querySelectorAll<HTMLElement>("[data-recall-i]")) {
+      chip.classList.toggle(
+        "is-picked",
+        highlighted !== null && Number(chip.getAttribute("data-recall-i")) === highlighted,
+      );
+    }
+    drawOverlay();
+  });
 
   // The same running/stop rule the range buttons use, for the same reason:
   // there is one microphone, so the button that opened it is the only way out.
@@ -419,17 +737,26 @@ export function createPracticeView(
 
   let renderedTargets: readonly PracticeTarget[] | null = null;
   let renderedMelodies: readonly MidiMelody[] | null = null;
+  /** The attempt the result screen is showing. Identity, not equality: the
+   *  store hands out a new object per attempt and never edits one. */
+  let renderedAttempt: RecallAttempt | null = null;
   /** What the chips on screen were built from. Rebuilding thirty spans on every
    *  keystroke in the name field would be silly. */
   let renderedChips = "";
 
   return {
-    render(state, phase) {
+    render(state, phase, playing = false) {
+      const recall = state.screen === "recall" ? state.recall : null;
       elements.library.hidden = state.screen !== "library";
       elements.detail.hidden = state.screen !== "target";
       elements.range.hidden = state.screen !== "range";
       elements.draft.hidden = state.screen !== "draft";
       elements.midi.hidden = state.screen !== "midi";
+      // One `screen`, two elements: before the attempt and after it. The first
+      // one is where the ear-first rule has to hold, and keeping it a separate
+      // element is what lets a test say so.
+      elements.recall.hidden = !recall || recall.attempt !== null;
+      elements.result.hidden = !recall || recall.attempt === null;
 
       // A take that is going to become a target. Both conditions, for the same
       // reason the range buttons check both: `recordingTarget` is practice
@@ -500,6 +827,74 @@ export function createPracticeView(
         elements.detailName.textContent = summary.name;
         elements.detailMeta.textContent = summary.detail;
         elements.detailDelete.setAttribute("data-target", selected.id);
+        elements.detailPractice.setAttribute("data-target", selected.id);
+
+        // The history block, which is also the answer to "is this melody
+        // getting easier?". Absent until there is something in it: an empty
+        // heatmap is a row of grey boxes that says nothing at all.
+        const tally = state.stats.targets.get(selected.id) ?? null;
+        elements.detailHistory.hidden = !tally || tally.attempts === 0;
+        if (tally && tally.attempts > 0) {
+          elements.detailMeta.textContent = `${summary.detail} · ${historyMetaText(tally)}`;
+          elements.detailHeat.innerHTML = heatRowHtml(tally);
+          const trouble = troubleText(tally);
+          elements.detailTrouble.textContent = trouble;
+          elements.detailTrouble.hidden = trouble === "";
+          elements.detailAttempts.innerHTML = historyHtml(tally);
+        }
+      }
+
+      if (recall) {
+        const target = state.targets.find((t) => t.id === recall.targetId) ?? null;
+        // A take is running when the phase says so *and* this screen started
+        // it, exactly as the range and record buttons decide it: `recording` is
+        // practice state, `phase` belongs to the transcriber, and a stale flag
+        // must never leave a Stop button over a closed microphone.
+        const attempting = recall.recording && phase === "recording";
+        const analysing = recall.recording && phase === "analyzing";
+
+        elements.recallName.textContent = target?.name ?? "";
+        elements.recallHint.textContent = recallHint(recall.listens);
+        const heard = listenCountText(recall.listens);
+        elements.recallListens.textContent = heard;
+        elements.recallListens.hidden = heard === "";
+
+        elements.recallListen.dataset.running = String(playing);
+        elements.recallListen.classList.toggle("is-playing", playing);
+        elements.recallListen.textContent = listenLabel(recall.listens, playing);
+        elements.recallListen.disabled = attempting || analysing;
+
+        elements.recallWhistle.dataset.running = String(attempting);
+        elements.recallWhistle.classList.toggle("is-recording", attempting);
+        elements.recallWhistle.textContent = attempting ? "Stop" : "Whistle it";
+        // Playback and the microphone are mutually exclusive throughout this
+        // app — echo cancellation is off, so a phone recording its own speaker
+        // would transcribe the melody it just played. Same rule as the dock's
+        // Record button.
+        elements.recallWhistle.disabled = analysing || playing;
+
+        if (recall.attempt && recall.attempt !== renderedAttempt) {
+          renderedAttempt = recall.attempt;
+          highlighted = null;
+          overlay = overlayModel({
+            alignment: recall.attempt.alignment,
+            attempt: recall.attempt.notes,
+            trail: recall.attempt.trail,
+          });
+          elements.resultStrip.innerHTML = verdictStripHtml(verdictChips(overlay));
+          elements.resultSummary.textContent =
+            `${scoreText(recall.attempt.alignment)}. ` +
+            transpositionText(recall.attempt.alignment.transposition);
+          elements.resultTakeaway.textContent = takeawayText(recall.attempt.alignment);
+        }
+        // Every render, not only on a new attempt: the canvas is sized by the
+        // stylesheet, so a rotation or a tab switch leaves the last bitmap
+        // stretched until something redraws it.
+        if (recall.attempt) drawOverlay();
+      } else {
+        renderedAttempt = null;
+        overlay = null;
+        highlighted = null;
       }
       // Recomputed from scratch rather than reset on a transition: the arming
       // happens in a click handler that does not re-render, so this has to be

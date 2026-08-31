@@ -1,7 +1,7 @@
 import { registerSW } from "virtual:pwa-register";
 import FFT from "fft.js";
 import "./app.css";
-import { transcribe, midiToName, type Note } from "./dsp/index.js";
+import { transcribe, midiToName, type Note, type PitchFrame } from "./dsp/index.js";
 import {
   CaptureAborted,
   CaptureError,
@@ -30,18 +30,27 @@ import {
   type MidiMelody,
 } from "./practice/midi.js";
 import { representativeMidi } from "./practice/range.js";
+import { targetPlayback } from "./practice/recall.js";
+import { alignAttempt } from "./practice/align.js";
 import {
   addTarget,
   beginDraft,
   beginRangeStep,
+  beginRecall,
+  beginRecallTake,
   beginTargetTake,
   captureRangeEnd,
+  closeRecall,
+  countRecallListen,
   discardDraft,
   editDraft,
   endRangeStep,
+  endRecallTake,
   endTargetTake,
+  finishRecallAttempt,
   getPracticeState,
   removeTarget,
+  retryRecall,
   saveDraft,
   selectTarget,
   setPracticeMessage,
@@ -64,6 +73,7 @@ import {
 } from "./practice/target.js";
 import { createControls } from "./ui/controls.js";
 import { createDebugView } from "./ui/debug.js";
+import { trailFromFrames } from "./ui/diffroll.js";
 import { createLiveView, formatClock } from "./ui/live.js";
 import { highlightNoteList, initNoteList, renderNoteList } from "./ui/notelist.js";
 import {
@@ -175,8 +185,28 @@ const practice = createPracticeView(
     detailName: element("practice-target-name"),
     detailMeta: element("practice-target-meta"),
     detailNext: element("practice-target-next"),
+    detailPractice: element<HTMLButtonElement>("practice-target-practice"),
+    detailHistory: element("practice-target-history"),
+    detailHeat: element("practice-target-heat"),
+    detailTrouble: element("practice-target-trouble"),
+    detailAttempts: element("practice-target-attempts"),
     detailBack: element<HTMLButtonElement>("practice-back"),
     detailDelete: element<HTMLButtonElement>("practice-delete"),
+    recall: element("practice-recall"),
+    recallBack: element<HTMLButtonElement>("practice-recall-back"),
+    recallName: element("practice-recall-name"),
+    recallHint: element("practice-recall-hint"),
+    recallListen: element<HTMLButtonElement>("practice-recall-listen"),
+    recallListens: element("practice-recall-listens"),
+    recallWhistle: element<HTMLButtonElement>("practice-recall-whistle"),
+    result: element("practice-result"),
+    resultBack: element<HTMLButtonElement>("practice-result-done"),
+    resultCanvas: element<HTMLCanvasElement>("practice-result-roll"),
+    resultStrip: element("practice-result-strip"),
+    resultSummary: element("practice-result-summary"),
+    resultTakeaway: element("practice-result-takeaway"),
+    resultRetry: element<HTMLButtonElement>("practice-result-retry"),
+    resultDone: element<HTMLButtonElement>("practice-result-close"),
     range: element("practice-range"),
     rangeHint: element("practice-range-hint"),
     rangeCurrent: element("practice-range-current"),
@@ -229,6 +259,24 @@ const practice = createPracticeView(
     onAddBundled: addBundledTarget,
     onPickMelody: pickMidiMelody,
     onCloseMidi: () => showLibrary(),
+
+    onPractice: beginRecall,
+    onListen: listenToTarget,
+    onStopListen: stopPlayback,
+    // The microphone first, the screen second, nothing awaited in between —
+    // the same iOS gesture rule the other two takes follow.
+    onAttempt: () => {
+      beginRecording("attempt");
+      beginRecallTake();
+    },
+    onRetry: retryRecall,
+    onCloseRecall: () => {
+      // The melody is still sounding if they left mid-listen, and a target
+      // playing over a screen that is no longer about it is a bug the user
+      // hears rather than sees.
+      stopPlayback();
+      closeRecall();
+    },
 
     onTrimDraft: (end) => reviseDraft((draft) => trimDraft(draft, end)),
     onTrimDraftTo: (index) => reviseDraft((draft) => trimDraftTo(draft, index)),
@@ -337,8 +385,47 @@ function openMelodyDraft(melody: MidiMelody, name: string): void {
   beginDraft(makeDraft("midi", cleanTargetName(name, "MIDI melody"), melody.notes, notes.join(" ")));
 }
 
+/**
+ * Play the melody the recall screen is about.
+ *
+ * Transposed by nothing: `beginRecall` already moved it into the whistler's
+ * register, and that transposed melody is what the aligner will score the
+ * attempt against. The octave toggle is about the *transcript* and is not even
+ * on screen here.
+ *
+ * No note highlighting, deliberately — `onIndex` is where the transcriber lights
+ * up a chip, and a light moving along a melody the user is about to be asked to
+ * remember is a written prompt drawn in a different medium. The voice is the
+ * stored preference; its toggle lives in the transcriber's dock, which practice
+ * mode hides along with the rest of it.
+ */
+function listenToTarget(): void {
+  const recall = getPracticeState().recall;
+  if (!recall) return;
+
+  const started = startPlayback(
+    targetPlayback(recall.notes),
+    0,
+    {
+      onIndex: () => undefined,
+      onEnd: () => setState({ playing: false, playingIndex: null }),
+    },
+    getState().voice,
+  );
+  // `startPlayback` refuses while the microphone is open, and a refusal must not
+  // leave a Stop button over a speaker that is silent.
+  if (!started) return;
+  setState({ playing: true, playingIndex: null });
+  countRecallListen();
+}
+
 function renderPractice(): void {
-  practice.render(getPracticeState(), getState().phase);
+  const state = getState();
+  // Both views of "is the synth running", for the reason the update policy uses
+  // both: the store is written by this module and the synth by its own
+  // callbacks, and a Listen button that disagrees with either is a button that
+  // stops nothing.
+  practice.render(getPracticeState(), state.phase, state.playing || isPlaying());
 }
 
 subscribePractice(renderPractice);
@@ -543,7 +630,7 @@ let lastTake: CapturedAudio | null = null;
  * analysis is scheduled, so a mode switch mid-analysis cannot redirect a take
  * that is already in flight.
  */
-type TakeIntent = "transcribe" | RangeStep | "target";
+type TakeIntent = "transcribe" | RangeStep | "target" | "attempt";
 let takeIntent: TakeIntent = "transcribe";
 
 /**
@@ -556,6 +643,7 @@ let takeIntent: TakeIntent = "transcribe";
  */
 function practiceTakeFailed(intent: Exclude<TakeIntent, "transcribe">, message: string): void {
   if (intent === "target") endTargetTake(message);
+  else if (intent === "attempt") endRecallTake(message);
   else endRangeStep(message);
 }
 
@@ -708,6 +796,7 @@ const TAKE_SUBJECTS: Record<TakeIntent, string> = {
   low: "that note",
   high: "that note",
   target: "that melody",
+  attempt: "that attempt",
 };
 
 /**
@@ -758,6 +847,51 @@ function applyTargetTake(notes: readonly Note[]): void {
       notes.map((note) => ({ midi: note.midi, durSec: note.durationSec })),
     ),
   );
+}
+
+/**
+ * Score one attempt at the melody on the recall screen.
+ *
+ * Three things have to line up here and all three are the same melody: the
+ * notes that were *played* (already moved into the whistler's register by
+ * `beginRecall`), the notes the aligner scores against, and the notes the
+ * statistics read their intervals from. They are one array — `recall.notes` —
+ * passed to the synth, to `alignAttempt` and, through `finishRecallAttempt`, to
+ * `recordAttempt`. Scoring against the written pitch while playing the
+ * transposed one would report a register error the app itself introduced; and
+ * because the intervals are keyed by *step* rather than by pitch, a melody
+ * played an octave up still teaches the same directed-interval buckets, which
+ * is what T4's drill selection reads.
+ *
+ * The frames come along too. They are the trail under the diff overlay, and
+ * they are the only layer of that picture that can distinguish a note aimed at
+ * badly from a note scooped into and never settled — which is the difference
+ * between practising aim and practising patience.
+ */
+function applyAttemptTake(notes: readonly Note[], frames: readonly PitchFrame[], tuningOffsetCents: number): void {
+  // Back to `idle` with nothing kept, as every practice take does: the
+  // transcriber is not on screen, and leaving an attempt in its result phase
+  // would mean finding it on the other tab later.
+  setState({ phase: "idle", notes: [], frames: [], playingIndex: null, message: "" });
+
+  const recall = getPracticeState().recall;
+  // The screen was left mid-analysis. Nothing to score, and nothing to say.
+  if (!recall) return;
+
+  if (notes.length === 0) {
+    // No stats: an attempt the app could not hear is not evidence about the
+    // whistler, and recording it would put a phantom failure in the heatmap.
+    endRecallTake(
+      "Nothing tonal in that one — have another go, a little louder or closer.",
+    );
+    return;
+  }
+
+  finishRecallAttempt({
+    notes,
+    trail: trailFromFrames(frames, tuningOffsetCents),
+    alignment: alignAttempt(notes, recall.notes),
+  });
 }
 
 /**
@@ -862,6 +996,8 @@ function analyze(audio: CapturedAudio, subject: string): void {
           applyResult(result.notes, result.frames, result.tuningOffsetCents);
         } else if (intent === "target") {
           applyTargetTake(result.notes);
+        } else if (intent === "attempt") {
+          applyAttemptTake(result.notes, result.frames, result.tuningOffsetCents);
         } else {
           applyRangeTake(intent, result.notes);
         }
@@ -936,6 +1072,10 @@ window.addEventListener("resize", () => {
   const state = getState();
   renderStaff(state.notes, staffElement, state.transpose, state.playingIndex);
   redrawRoll();
+  // The diff overlay is a canvas too, and it is drawn once per result — so
+  // without this it keeps a bitmap from the previous orientation until the next
+  // state change.
+  renderPractice();
 });
 
 /**

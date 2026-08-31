@@ -1,5 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
+import { alignAttempt, type Alignment } from "../src/practice/align.js";
+import type { HeardNote } from "../src/practice/recall.js";
 import { BUNDLED_MELODIES } from "../src/practice/bundled.js";
 import type { MidiMelody } from "../src/practice/midi.js";
 import {
@@ -8,21 +10,35 @@ import {
   type PracticeTarget,
   type TargetDraft,
 } from "../src/practice/target.js";
-import type { PracticeState } from "../src/practice/store.js";
-import { emptyStats } from "../src/practice/stats.js";
+import type {
+  PracticeState,
+  RecallAttempt,
+  RecallSession,
+} from "../src/practice/store.js";
+import { emptyStats, recordAttempt, type TargetTally } from "../src/practice/stats.js";
 import {
   DRAFT_HINT_IMPORTED,
   DRAFT_HINT_RECORDED,
   EXERCISES_COMING,
+  RECALL_HINT_FIRST,
+  RECALL_HINT_HEARD,
+  chipText,
   createPracticeView,
   draftChipsHtml,
   draftMetaText,
+  heatRowHtml,
+  historyHtml,
+  historyMetaText,
+  listenLabel,
   midiHintText,
   midiRowHtml,
   rangeStepHint,
   rangeSummaryText,
+  recallHint,
   starterRowHtml,
   targetRowHtml,
+  troubleText,
+  verdictStripHtml,
   type PracticeElements,
   type PracticeHandlers,
 } from "../src/ui/practice.js";
@@ -233,6 +249,12 @@ interface StubElement {
   dispatch(type: string, event?: unknown): void;
   /** Fire every click listener attached to this element. */
   click(): void;
+  /** The result screen's canvas. `null` makes `drawDiffOverlay` bail out at its
+   *  first line, which is what a test that is about the strip and the sentences
+   *  wants — the drawing itself is tested against a recording context in
+   *  `test/practice-recall.test.ts`. */
+  getContext(): null;
+  querySelectorAll(selector: string): StubElement[];
 }
 
 function stub(): StubElement {
@@ -268,6 +290,8 @@ function stub(): StubElement {
       for (const listener of [...(listeners.get(type) ?? [])]) listener(event);
     },
     click: () => element.dispatch("click", { target: null }),
+    getContext: () => null,
+    querySelectorAll: () => [],
   };
   return element;
 }
@@ -303,6 +327,11 @@ const ELEMENT_KEYS = [
   "detailName",
   "detailMeta",
   "detailNext",
+  "detailPractice",
+  "detailHistory",
+  "detailHeat",
+  "detailTrouble",
+  "detailAttempts",
   "detailBack",
   "detailDelete",
   "range",
@@ -329,6 +358,21 @@ const ELEMENT_KEYS = [
   "midiTitle",
   "midiHint",
   "midiList",
+  "recall",
+  "recallBack",
+  "recallName",
+  "recallHint",
+  "recallListen",
+  "recallListens",
+  "recallWhistle",
+  "result",
+  "resultBack",
+  "resultCanvas",
+  "resultStrip",
+  "resultSummary",
+  "resultTakeaway",
+  "resultRetry",
+  "resultDone",
   "message",
 ] as const;
 
@@ -337,7 +381,11 @@ type Screen = Record<(typeof ELEMENT_KEYS)[number], StubElement>;
 function mountPractice(): {
   el: Screen;
   handlers: { [K in keyof PracticeHandlers]: ReturnType<typeof vi.fn> };
-  render: (patch?: Partial<PracticeState>, phase?: "idle" | "recording" | "analyzing") => void;
+  render: (
+    patch?: Partial<PracticeState>,
+    phase?: "idle" | "recording" | "analyzing",
+    playing?: boolean,
+  ) => void;
 } {
   const el = Object.fromEntries(ELEMENT_KEYS.map((key) => [key, stub()])) as Screen;
   const handlers = {
@@ -360,6 +408,12 @@ function mountPractice(): {
     onRenameDraft: vi.fn(),
     onSaveDraft: vi.fn(),
     onDiscardDraft: vi.fn(),
+    onPractice: vi.fn(),
+    onListen: vi.fn(),
+    onStopListen: vi.fn(),
+    onAttempt: vi.fn(),
+    onRetry: vi.fn(),
+    onCloseRecall: vi.fn(),
   };
   const view = createPracticeView(
     el as unknown as PracticeElements,
@@ -375,6 +429,7 @@ function mountPractice(): {
     rangeDraft: { low: null, high: null },
     draft: null,
     midi: null,
+    recall: null,
     recordingTarget: false,
     message: "",
     storageError: null,
@@ -382,7 +437,8 @@ function mountPractice(): {
   return {
     el,
     handlers,
-    render: (patch = {}, phase = "idle") => view.render({ ...base, ...patch }, phase),
+    render: (patch = {}, phase = "idle", playing = false) =>
+      view.render({ ...base, ...patch }, phase, playing),
   };
 }
 
@@ -402,6 +458,67 @@ const DRAFT: TargetDraft = makeDraft("recorded", "Recorded now", [
   { midi: 72, durSec: 0.6 },
 ]);
 
+/** The melody as the recall screen plays it: already in the whistler's range. */
+const AS_PLAYED = [84, 86, 88, 91, 89].map((midi) => ({ midi, durSec: 0.4 }));
+
+/** An attempt with one note a semitone sharp and one never sung, which is
+ *  enough to exercise every kind of chip the strip can draw. */
+const WHISTLED: HeardNote[] = [84, 86, 89, 89].map((midi, i) => ({
+  midi,
+  centsOffset: 0,
+  durationSec: 0.4,
+  startSec: i * 0.5,
+  endSec: i * 0.5 + 0.4,
+}));
+
+const ATTEMPT: RecallAttempt = {
+  notes: WHISTLED,
+  trail: [],
+  alignment: alignAttempt(WHISTLED, AS_PLAYED),
+};
+
+function session(patch: Partial<RecallSession> = {}): RecallSession {
+  return {
+    targetId: TARGET.id,
+    notes: AS_PLAYED,
+    listens: 0,
+    recording: false,
+    attempt: null,
+    ...patch,
+  };
+}
+
+/** A target's history, as the store would have built it. */
+function tally(attempts: readonly Alignment[]): TargetTally {
+  let stats = emptyStats();
+  attempts.forEach((alignment, i) => {
+    stats = recordAttempt(stats, TARGET.id, AS_PLAYED, alignment, i + 1);
+  });
+  return stats.targets.get(TARGET.id)!;
+}
+
+/** An attempt at {@link AS_PLAYED} with the given cents error per slot;
+ *  `null` means the note was never sung. */
+function attemptOf(errors: readonly (number | null)[]): Alignment {
+  const notes: HeardNote[] = [];
+  let cursor = 0;
+  AS_PLAYED.forEach((note, i) => {
+    const cents = errors[i];
+    if (cents === null) return;
+    const pitch = note.midi + cents / 100;
+    const midi = Math.round(pitch);
+    notes.push({
+      midi,
+      centsOffset: (pitch - midi) * 100,
+      durationSec: 0.4,
+      startSec: cursor,
+      endSec: cursor + 0.4,
+    });
+    cursor += 0.5;
+  });
+  return alignAttempt(notes, AS_PLAYED);
+}
+
 const MELODY: MidiMelody = {
   id: "1:0",
   trackIndex: 1,
@@ -417,7 +534,7 @@ describe("the library screen", () => {
   it("shows exactly one screen at a time", () => {
     const { el, render } = mountPractice();
     const showing = (): string[] =>
-      (["library", "detail", "range", "draft", "midi"] as const).filter(
+      (["library", "detail", "range", "draft", "midi", "recall", "result"] as const).filter(
         (name) => !el[name].hidden,
       );
 
@@ -431,6 +548,11 @@ describe("the library screen", () => {
     expect(showing()).toEqual(["draft"]);
     render({ screen: "midi", midi: { fileName: "tune", melodies: [MELODY] } });
     expect(showing()).toEqual(["midi"]);
+    // One screen, two halves: before the attempt and after it.
+    render({ screen: "recall", targets: [TARGET], recall: session() });
+    expect(showing()).toEqual(["recall"]);
+    render({ screen: "recall", targets: [TARGET], recall: session({ attempt: ATTEMPT }) });
+    expect(showing()).toEqual(["result"]);
   });
 
   it("swaps the list for the empty state, and back", () => {
@@ -736,6 +858,300 @@ describe("the MIDI part picker", () => {
     expect(starterRowHtml({ id: 'a"b', name: "<b>" })).toBe(
       '<button type="button" class="starter" data-bundled="a&quot;b">&lt;b&gt;</button>',
     );
+  });
+});
+
+describe("the recall screen, before the attempt", () => {
+  /**
+   * The ear-first rule, at the one place in the app where it does real work.
+   *
+   * Everything else in practice mode merely happens not to name a pitch; this
+   * screen is holding a melody in memory *and choosing not to show it*, with
+   * the notes sitting right there in the state it was handed. A helpful future
+   * change — a preview roll, a "starts on C6" hint, a staff — would look like
+   * an improvement and would delete the exercise. So it is checked against
+   * every string the screen writes, rather than remembered.
+   */
+  it("shows the melody's name and length, and not one of its notes", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session({ listens: 3 }) });
+
+    const written = [
+      el.recallName,
+      el.recallHint,
+      el.recallListens,
+      el.recallListen,
+      el.recallWhistle,
+      el.recallBack,
+    ].flatMap((element) => [element.textContent, element.innerHTML]);
+
+    for (const text of written) {
+      expect(text, text).not.toMatch(PITCH_NAME);
+      expect(text, text).not.toMatch(INTERVAL_WORDS);
+    }
+    // Not vacuous: the screen really is showing something.
+    expect(el.recallName.textContent).toBe("Tron");
+    expect(el.recallHint.textContent).toMatch(/whistle it back/i);
+    expect(el.recallListens.textContent).toBe("Heard it 3 times.");
+  });
+
+  it("says listening is unlimited, and never grades the number", () => {
+    expect(RECALL_HINT_FIRST).toMatch(/as many times as you like/);
+    expect(RECALL_HINT_HEARD).toMatch(/as often as you like/);
+    for (const copy of [RECALL_HINT_FIRST, RECALL_HINT_HEARD, recallHint(0), recallHint(7)]) {
+      expect(copy, copy).not.toMatch(PITCH_NAME);
+      expect(copy, copy).not.toMatch(INTERVAL_WORDS);
+    }
+    // The register is forgiven up front, so nobody spends the attempt worrying
+    // about it — the aligner does not care and neither should they.
+    expect(RECALL_HINT_FIRST).toMatch(/comfortable/);
+  });
+
+  it("hides the listen count until there is one", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session() });
+    expect(el.recallListens.hidden).toBe(true);
+    render({ screen: "recall", targets: [TARGET], recall: session({ listens: 1 }) });
+    expect(el.recallListens.hidden).toBe(false);
+    expect(el.recallListens.textContent).toBe("Heard it once.");
+  });
+
+  it("plays the melody, and becomes the only way to stop it", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session() });
+    expect(el.recallListen.textContent).toBe("Listen");
+
+    el.recallListen.click();
+    expect(handlers.onListen).toHaveBeenCalledTimes(1);
+
+    render({ screen: "recall", targets: [TARGET], recall: session({ listens: 1 }) }, "idle", true);
+    expect(el.recallListen.textContent).toBe("Stop");
+    expect(el.recallListen.classes.has("is-playing")).toBe(true);
+    el.recallListen.click();
+    expect(handlers.onStopListen).toHaveBeenCalledTimes(1);
+    expect(handlers.onListen).toHaveBeenCalledTimes(1);
+
+    // ...and afterwards it offers the thing you actually want next.
+    render({ screen: "recall", targets: [TARGET], recall: session({ listens: 1 }) });
+    expect(el.recallListen.textContent).toBe("Listen again");
+    expect(listenLabel(0, false)).toBe("Listen");
+    expect(listenLabel(3, true)).toBe("Stop");
+  });
+
+  it("starts the attempt, and becomes the only way out of it", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session() });
+    expect(el.recallWhistle.textContent).toBe("Whistle it");
+
+    el.recallWhistle.click();
+    expect(handlers.onAttempt).toHaveBeenCalledTimes(1);
+
+    render(
+      { screen: "recall", targets: [TARGET], recall: session({ recording: true }) },
+      "recording",
+    );
+    expect(el.recallWhistle.textContent).toBe("Stop");
+    expect(el.recallWhistle.classes.has("is-recording")).toBe(true);
+    // One microphone: the melody cannot be replayed into it mid-take.
+    expect(el.recallListen.disabled).toBe(true);
+
+    el.recallWhistle.click();
+    expect(handlers.onStopCapture).toHaveBeenCalledTimes(1);
+    expect(handlers.onAttempt).toHaveBeenCalledTimes(1);
+  });
+
+  it("never leaves a Stop over a microphone that is already closed", () => {
+    // The same split-state bug the range and record buttons have: `recording`
+    // is practice state, `phase` belongs to the transcriber.
+    const { el, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session({ recording: true }) }, "idle");
+    expect(el.recallWhistle.textContent).toBe("Whistle it");
+    expect(el.recallWhistle.disabled).toBe(false);
+  });
+
+  it("locks both buttons while the attempt is being listened to", () => {
+    const { el, render } = mountPractice();
+    render(
+      { screen: "recall", targets: [TARGET], recall: session({ recording: true }) },
+      "analyzing",
+    );
+    expect(el.recallWhistle.disabled).toBe(true);
+    expect(el.recallListen.disabled).toBe(true);
+  });
+
+  it("will not open the microphone over its own loudspeaker", () => {
+    // Echo cancellation is off throughout this app, so a phone recording while
+    // the melody is still playing would transcribe the answer.
+    const { el, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session({ listens: 1 }) }, "idle", true);
+    expect(el.recallWhistle.disabled).toBe(true);
+  });
+
+  it("leaves the exercise from either end of the screen", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session() });
+    el.recallBack.click();
+    render({ screen: "recall", targets: [TARGET], recall: session({ attempt: ATTEMPT }) });
+    el.resultBack.click();
+    el.resultDone.click();
+    expect(handlers.onCloseRecall).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("the recall screen, after the attempt", () => {
+  /** The other side of the boundary the draft screen already pins: a name
+   *  about something already whistled is a label, not a prompt. */
+  it("names what was whistled, once there is something to name", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session({ attempt: ATTEMPT }) });
+    // The 3rd note came out as the 4th note's pitch, so the strip says so.
+    expect(el.resultStrip.innerHTML).toMatch(PITCH_NAME);
+    expect(el.resultSummary.textContent).toMatch(/notes clean/);
+    expect(el.resultTakeaway.textContent).toMatch(/note/);
+  });
+
+  it("draws one chip per note of the melody, plus anything extra", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session({ attempt: ATTEMPT }) });
+    expect(el.resultStrip.innerHTML.match(/data-recall-i=/g)).toHaveLength(AS_PLAYED.length);
+  });
+
+  it("marks the chip whose slot is framed, and unmarks it on a second tap", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session({ attempt: ATTEMPT }) });
+
+    const chip = stub();
+    chip.setAttribute("data-recall-i", "2");
+    el.resultStrip.querySelectorAll = () => [chip];
+    clickChild(el.resultStrip, "data-recall-i", "2");
+    expect(chip.classes.has("is-picked")).toBe(true);
+
+    clickChild(el.resultStrip, "data-recall-i", "2");
+    expect(chip.classes.has("is-picked")).toBe(false);
+  });
+
+  it("says what each verdict is, in as few characters as fit on a phone", () => {
+    const chip = (patch: Partial<Parameters<typeof chipText>[0]>) =>
+      chipText({ index: 0, outcome: "clean", position: 4, cents: null, nameMidi: null, ...patch });
+    expect(chip({}).mark).toBe("✓");
+    expect(chip({ outcome: "off", cents: 38 }).mark).toBe("+38¢");
+    expect(chip({ outcome: "off", cents: -38 }).mark).toBe("-38¢");
+    expect(chip({ outcome: "wrong", nameMidi: 89 }).mark).toBe("F6");
+    expect(chip({ outcome: "missing" }).mark).toBe("—");
+    expect(chip({ outcome: "extra", position: null, nameMidi: 89 }).mark).toBe("F6");
+
+    /*
+     * The number stays on every chip that has one — including the wrong and
+     * missed ones. The summary says "the 5th note came out a semitone sharp",
+     * and a strip that dropped the number from exactly the chips it was talking
+     * about would leave the reader counting chips to find it.
+     */
+    for (const outcome of ["clean", "off", "wrong", "missing"] as const) {
+      expect(chip({ outcome, cents: 40, nameMidi: 89 }).sub, outcome).toBe("4");
+    }
+    expect(chip({ outcome: "extra", position: null }).sub).toBe("extra");
+
+    // ...and the verdict word itself survives for anyone not reading colours.
+    expect(chip({}).label).toBe("Note 4: clean");
+    expect(chip({ outcome: "off", cents: -38 }).label).toBe("Note 4: 38 cents flat");
+    expect(chip({ outcome: "wrong", nameMidi: 89 }).label).toBe(
+      "Note 4: wrong, you whistled F6",
+    );
+    expect(chip({ outcome: "missing" }).label).toBe("Note 4: missed");
+    expect(chip({ outcome: "extra", position: null, nameMidi: 89 }).label).toBe(
+      "Extra note: F6",
+    );
+  });
+
+  it("cannot be turned into markup by anything it is handed", () => {
+    const html = verdictStripHtml([
+      { index: 0, outcome: "wrong", position: 1, cents: 700, nameMidi: 89 },
+    ]);
+    expect(html).toContain('data-recall-i="0"');
+    expect(html).toContain("is-wrong");
+    expect(html.match(/<button/g)).toHaveLength(1);
+  });
+});
+
+describe("a melody's history", () => {
+  const CLEAN = attemptOf([0, 0, 0, 0, 0]);
+  const WRONG_THIRD = attemptOf([0, 0, 200, 0, 0]);
+  const MISSED_THIRD = attemptOf([0, 0, null, 0, 0]);
+
+  it("stays off the screen until there is something to show", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "target", selectedId: TARGET.id, targets: [TARGET] });
+    expect(el.detailHistory.hidden).toBe(true);
+  });
+
+  it("shows the recent attempts as strips, newest first", () => {
+    const { el, render } = mountPractice();
+    let stats = emptyStats();
+    stats = recordAttempt(stats, TARGET.id, AS_PLAYED, WRONG_THIRD, 1);
+    stats = recordAttempt(stats, TARGET.id, AS_PLAYED, CLEAN, 2);
+    render({ screen: "target", selectedId: TARGET.id, targets: [TARGET], stats });
+
+    expect(el.detailHistory.hidden).toBe(false);
+    const rows = el.detailAttempts.innerHTML.split("</div>").filter((row) => row.includes("vcell"));
+    expect(rows).toHaveLength(2);
+    // Newest first: the clean attempt is the one on top.
+    expect(rows[0]).not.toContain("is-wrong");
+    expect(rows[1]).toContain("is-wrong");
+    expect(el.detailAttempts.innerHTML).toContain("5/5");
+    expect(el.detailMeta.textContent).toContain("2 attempts");
+    expect(el.detailMeta.textContent).toContain("5 of 5 clean last time");
+  });
+
+  it("draws one heat bar per note of the melody", () => {
+    const cells = heatRowHtml(tally([CLEAN, WRONG_THIRD]));
+    expect(cells.match(/class="heat"/g)).toHaveLength(AS_PLAYED.length);
+    // The slot that went wrong is the solid one.
+    const opacities = [...cells.matchAll(/opacity:([\d.]+)/g)].map((m) => Number(m[1]));
+    // Half the attempts went wrong at that slot, so it is half lit; a slot that
+    // has never been anything but clean is the faintest mark the row can draw.
+    expect(opacities[0]).toBeCloseTo(0.1, 9);
+    expect(opacities[2]).toBeCloseTo(0.55, 9);
+    const always = [...heatRowHtml(tally([WRONG_THIRD, WRONG_THIRD])).matchAll(
+      /opacity:([\d.]+)/g,
+    )].map((m) => Number(m[1]));
+    expect(always[2]).toBe(1);
+  });
+
+  /**
+   * The distinction the whole history exists for. One bad attempt is a flub and
+   * the app says nothing; the same note twice is a trouble spot and it says so.
+   * An app that announced one after a single miss would be reporting noise, and
+   * would be ignored by the time it started being right.
+   */
+  it("tells a one-off flub from a note that keeps beating you", () => {
+    expect(troubleText(tally([WRONG_THIRD, CLEAN, CLEAN, CLEAN]))).toBe("");
+    const persistent = troubleText(tally([WRONG_THIRD, CLEAN, WRONG_THIRD, CLEAN]));
+    expect(persistent).toContain("The 3rd note");
+    expect(persistent).toContain("come out wrong in 2 of 4 attempts");
+    // A slot that is skipped rather than fluffed is a different sentence,
+    // because it is a different problem: recall, not aim.
+    expect(troubleText(tally([MISSED_THIRD, MISSED_THIRD]))).toContain("gone missing");
+  });
+
+  it("counts the attempts, and how the last one went", () => {
+    expect(historyMetaText(tally([CLEAN]))).toBe("1 attempt · 5 of 5 clean last time");
+    expect(historyMetaText(tally([CLEAN, WRONG_THIRD]))).toBe(
+      "2 attempts · 4 of 5 clean last time",
+    );
+  });
+
+  it("shows only the last few attempts, however many there are", () => {
+    const many = tally(Array.from({ length: 12 }, () => CLEAN));
+    const rows = historyHtml(many).split("</div>").filter((row) => row.includes("vcell"));
+    expect(rows.length).toBeLessThanOrEqual(6);
+    expect(many.attempts).toBe(12);
+  });
+
+  it("offers the exercise, and reports which melody it is about", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "target", selectedId: TARGET.id, targets: [TARGET] });
+    el.detailPractice.click();
+    expect(handlers.onPractice).toHaveBeenCalledWith(TARGET.id);
   });
 });
 

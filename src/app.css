@@ -14,6 +14,11 @@
   --text-dim: #8b949e;
   --accent: #14b8a6;
   --accent-dim: #0f766e;
+  /* The middle verdict of the practice diff: the right note, missed by a
+     whisker. Warm rather than red on purpose — being forty cents flat is the
+     normal condition of a beginner's whistle, and colouring it as a failure
+     would leave the whole overlay screaming and saying nothing. */
+  --warn: #d29922;
   --danger: #f85149;
 
   --safe-top: env(safe-area-inset-top, 0px);
@@ -33,6 +38,10 @@
     --text-dim: #57606a;
     --accent: #0f766e;
     --accent-dim: #14b8a6;
+    /* Darkened for contrast on white: the dark theme's amber is a mid-tone that
+       vanishes against a light background, and this colour has to be legible as
+       a one-pixel chip border as well as a filled rectangle. */
+    --warn: #9a6700;
     --danger: #cf222e;
   }
 }
@@ -667,6 +676,201 @@ button {
 .ghost.danger.is-armed {
   border-color: var(--danger);
   font-weight: 700;
+}
+
+/* ── Melody recall ──────────────────────────────────────────────────────
+ *
+ * Two big buttons and nothing else to look at, because the whole exercise is
+ * "hear it, then whistle it" and anything else on the screen is something to
+ * read instead of listening.
+ */
+
+.btn-listen {
+  align-self: stretch;
+  min-height: 4rem;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  font-size: 1.15rem;
+}
+
+.btn-listen.is-playing {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+/* The loud one: this is the action the screen exists for. */
+.btn-attempt {
+  align-self: stretch;
+  min-height: 3.5rem;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 1.05rem;
+}
+
+.btn-attempt.is-recording {
+  background: var(--danger);
+  color: #fff;
+}
+
+/* Shorter than the transcriber's roll: the verdict strip underneath is half of
+   the diff and has to be on screen at the same time as the picture. */
+.roll-diff {
+  height: clamp(8rem, 22vh, 12rem);
+}
+
+/* ── The verdict strip ──────────────────────────────────────────────────
+ *
+ * One chip per note of the melody, in its order, each a tap target that frames
+ * its slot on the overlay above. Wrapping rather than scrolling: a sixty-note
+ * melody is four rows of chips, and a horizontal scroller hides exactly the
+ * notes you are looking for.
+ */
+
+.vstrip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.vchip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.75rem;
+  min-height: 2.5rem;
+  padding: 0.2rem 0.35rem;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  background: var(--surface);
+  line-height: 1.15;
+}
+
+.vchip-mark {
+  font-size: 0.9rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.vchip-sub {
+  color: var(--text-dim);
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* The verdict colours, shared with the canvas overlay through the same custom
+   properties (see ui/theme.ts). Border rather than fill, so a strip of sixty
+   chips reads as a strip rather than as a paint chart — and so the marks stay
+   legible in both themes without a second text colour per verdict. */
+.vchip.is-clean {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.vchip.is-off {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.vchip.is-wrong,
+.vchip.is-missing {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.vchip.is-extra {
+  border-color: var(--warn);
+  color: var(--warn);
+  border-style: dashed;
+}
+
+/* The chip whose slot is framed on the overlay. */
+.vchip.is-picked {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+}
+
+.vchip.is-picked .vchip-sub {
+  color: var(--bg);
+  opacity: 0.75;
+}
+
+/* ── Attempt history ────────────────────────────────────────────────────
+ *
+ * Small on purpose. This block answers one question — "is it the same note
+ * every time?" — and it answers it by shape rather than by number.
+ */
+
+.heat-row,
+.attempt-strip {
+  display: flex;
+  gap: 1px;
+  width: 100%;
+}
+
+.heat {
+  flex: 1 1 0;
+  min-width: 2px;
+  height: 0.7rem;
+  border-radius: 2px;
+  background: var(--danger);
+}
+
+.attempt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  width: 100%;
+}
+
+.attempt {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.attempt-score {
+  flex: none;
+  min-width: 2.5rem;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.vcell {
+  flex: 1 1 0;
+  min-width: 2px;
+  height: 0.55rem;
+  border-radius: 2px;
+  background: var(--text-dim);
+  opacity: 0.35;
+}
+
+.vcell.is-clean {
+  background: var(--accent);
+  opacity: 1;
+}
+
+.vcell.is-off {
+  background: var(--warn);
+  opacity: 1;
+}
+
+.vcell.is-wrong {
+  background: var(--danger);
+  opacity: 1;
+}
+
+/* A slot never sung: the one verdict drawn as an absence rather than a colour,
+   here as on the overlay. */
+.vcell.is-missing {
+  background: transparent;
+  border: 1px solid var(--danger);
+  opacity: 0.8;
 }
 
 .range-buttons {
