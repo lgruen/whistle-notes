@@ -132,6 +132,27 @@
             <div class="starter-list" id="practice-starters"></div>
           </div>
 
+          <!-- The two drills. No melody, no library, nothing to choose: the
+               shortest path from opening the app to whistling at it. Both are
+               ear-first in the strong sense — the prompt is a sound, and the
+               only names anywhere are about what came back. -->
+          <div class="card">
+            <h3 class="card-title">Drills</h3>
+            <p class="card-body">
+              Short and made up on the spot. One steadies your pitch, the other
+              works on the jumps between notes.
+            </p>
+            <div class="add-row">
+              <button type="button" class="btn btn-add" id="practice-drill-hold">
+                Hold a note
+              </button>
+              <button type="button" class="btn btn-add" id="practice-drill-echo">
+                Echo a phrase
+              </button>
+            </div>
+            <p class="card-body" id="practice-drill-note" hidden></p>
+          </div>
+
           <h3 class="practice-subtitle">Your melodies</h3>
           <div class="target-list" id="practice-targets" hidden></div>
           <p class="practice-empty" id="practice-empty">
@@ -246,9 +267,66 @@
           </button>
         </section>
 
-        <!-- ...and after it. Names are allowed here: this is a report on
-             something already whistled, not a prompt for something about to be.
-             Even so, only what the user *produced* is ever named. -->
+        <!-- Drill one: hold a note. One screen, because the feedback is live —
+             the bar under the readout is centred on the note that played, not
+             on the nearest note to whatever comes out, which is what makes it a
+             target rather than a tuner. -->
+        <section class="practice-screen" id="practice-hold" hidden>
+          <button type="button" class="ghost" id="practice-hold-back">← Practice</button>
+          <h2 class="practice-title">Hold a note</h2>
+          <p class="practice-lead" id="practice-hold-hint"></p>
+          <button type="button" class="btn btn-listen" id="practice-hold-play">
+            Hear it
+          </button>
+
+          <section class="hold-meter">
+            <div class="hold-cents" id="practice-hold-cents" aria-live="off">—</div>
+            <div class="cents" aria-hidden="true">
+              <span class="cents-center"></span>
+              <span class="cents-needle" id="practice-hold-needle"></span>
+            </div>
+            <p class="hint" id="practice-hold-meter-hint"></p>
+          </section>
+
+          <button type="button" class="btn btn-attempt" id="practice-hold-whistle">
+            Hold it
+          </button>
+          <p class="practice-lead" id="practice-hold-score" hidden></p>
+          <p class="practice-meta" id="practice-hold-takeaway" hidden></p>
+          <p class="practice-meta" id="practice-hold-trend" hidden></p>
+          <div class="add-row">
+            <button type="button" class="btn btn-add" id="practice-hold-again" hidden>
+              Same one again
+            </button>
+            <button type="button" class="btn btn-add" id="practice-hold-next" hidden>
+              Another one
+            </button>
+          </div>
+        </section>
+
+        <!-- Drill two: echo a phrase, before the attempt. Same ear-first rule
+             as the recall screen and the same shape: a hint, a Listen button
+             and nothing whatsoever about which notes are coming. -->
+        <section class="practice-screen" id="practice-echo" hidden>
+          <button type="button" class="ghost" id="practice-echo-back">← Practice</button>
+          <h2 class="practice-title">Echo a phrase</h2>
+          <p class="practice-lead" id="practice-echo-hint"></p>
+          <p class="practice-meta" id="practice-echo-meta"></p>
+          <button type="button" class="btn btn-listen" id="practice-echo-listen">
+            Listen
+          </button>
+          <p class="practice-meta" id="practice-echo-listens" hidden></p>
+          <button type="button" class="btn btn-attempt" id="practice-echo-whistle">
+            Whistle it back
+          </button>
+        </section>
+
+        <!-- The other half of both echo exercises — recall's and the phrase
+             drill's — because a diff of what you whistled against what played
+             is the same picture whichever one asked. Names are allowed here:
+             this is a report on something already whistled, not a prompt for
+             something about to be. Even so, only what the user *produced* is
+             ever named. -->
         <section class="practice-screen" id="practice-result" hidden>
           <button type="button" class="ghost" id="practice-result-done">← Melody</button>
           <h2 class="practice-title">How that went</h2>

@@ -719,6 +719,33 @@ button {
   height: clamp(8rem, 22vh, 12rem);
 }
 
+/* ── The drills ─────────────────────────────────────────────────────────
+ *
+ * The hold meter is the transcriber's cents bar with one difference that
+ * changes everything: it is centred on the note that played rather than on the
+ * nearest note to what is coming out. Its markup reuses `.cents`, so the
+ * needle, the centre line and the transform are shared — only the readout above
+ * it is new, and it is big because it is the thing being watched while both
+ * hands are busy not touching the phone.
+ */
+
+.hold-meter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  padding: 0.75rem 0;
+}
+
+.hold-cents {
+  font-size: clamp(2.5rem, 14vw, 3.5rem);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+
 /* ── The verdict strip ──────────────────────────────────────────────────
  *
  * One chip per note of the melody, in its order, each a tap target that frames

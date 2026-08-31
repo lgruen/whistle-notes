@@ -11,15 +11,27 @@ import {
   type TargetDraft,
 } from "../src/practice/target.js";
 import type {
+  EchoSession,
+  HoldSession,
   PracticeState,
   RecallAttempt,
   RecallSession,
 } from "../src/practice/store.js";
-import { emptyStats, recordAttempt, type TargetTally } from "../src/practice/stats.js";
+import {
+  emptyStats,
+  recordAttempt,
+  recordHold,
+  type TargetTally,
+} from "../src/practice/stats.js";
 import {
   DRAFT_HINT_IMPORTED,
   DRAFT_HINT_RECORDED,
-  EXERCISES_COMING,
+  DRILL_RANGE_NUDGE,
+  ECHO_HINT_FIRST,
+  ECHO_HINT_HEARD,
+  HOLD_HINT_FIRST,
+  HOLD_HINT_HEARD,
+  TARGET_EXERCISES,
   RECALL_HINT_FIRST,
   RECALL_HINT_HEARD,
   chipText,
@@ -94,7 +106,7 @@ describe("the ear-first rule", () => {
 
   it("holds over the sentences this module writes", () => {
     for (const copy of [
-      EXERCISES_COMING,
+      TARGET_EXERCISES,
       rangeStepHint(null, null),
       rangeStepHint(null, "low"),
       rangeStepHint(null, "high"),
@@ -104,6 +116,11 @@ describe("the ear-first rule", () => {
       midiHintText(0),
       midiHintText(1),
       midiHintText(4),
+      DRILL_RANGE_NUDGE,
+      HOLD_HINT_FIRST,
+      HOLD_HINT_HEARD,
+      ECHO_HINT_FIRST,
+      ECHO_HINT_HEARD,
       ...BUNDLED_MELODIES.map((melody) => melody.name),
     ]) {
       expect(copy, copy).not.toMatch(PITCH_NAME);
@@ -150,8 +167,8 @@ describe("the ear-first rule", () => {
   });
 
   it("describes the exercises by what the user does, not by what to read", () => {
-    expect(EXERCISES_COMING).toMatch(/whistle it back/);
-    expect(EXERCISES_COMING).toMatch(/Nothing to read/);
+    expect(TARGET_EXERCISES).toMatch(/whistle it back/);
+    expect(TARGET_EXERCISES).toMatch(/Nothing to read/);
   });
 });
 
@@ -323,6 +340,9 @@ const ELEMENT_KEYS = [
   "addMidiLabel",
   "addMidiInput",
   "starters",
+  "drillHold",
+  "drillEcho",
+  "drillNote",
   "detail",
   "detailName",
   "detailMeta",
@@ -365,6 +385,26 @@ const ELEMENT_KEYS = [
   "recallListen",
   "recallListens",
   "recallWhistle",
+  "hold",
+  "holdBack",
+  "holdHint",
+  "holdPlay",
+  "holdCents",
+  "holdNeedle",
+  "holdMeterHint",
+  "holdWhistle",
+  "holdScore",
+  "holdTakeaway",
+  "holdTrend",
+  "holdAgain",
+  "holdNext",
+  "echo",
+  "echoBack",
+  "echoHint",
+  "echoMeta",
+  "echoListen",
+  "echoListens",
+  "echoWhistle",
   "result",
   "resultBack",
   "resultCanvas",
@@ -414,6 +454,17 @@ function mountPractice(): {
     onAttempt: vi.fn(),
     onRetry: vi.fn(),
     onCloseRecall: vi.fn(),
+    onOpenHold: vi.fn(),
+    onOpenEcho: vi.fn(),
+    onHoldPlay: vi.fn(),
+    onHoldAttempt: vi.fn(),
+    onHoldAgain: vi.fn(),
+    onHoldNext: vi.fn(),
+    onEchoListen: vi.fn(),
+    onEchoAttempt: vi.fn(),
+    onEchoRetry: vi.fn(),
+    onEchoNext: vi.fn(),
+    onCloseDrill: vi.fn(),
   };
   const view = createPracticeView(
     el as unknown as PracticeElements,
@@ -430,6 +481,8 @@ function mountPractice(): {
     draft: null,
     midi: null,
     recall: null,
+    hold: null,
+    echo: null,
     recordingTarget: false,
     message: "",
     storageError: null,
@@ -577,7 +630,7 @@ describe("the library screen", () => {
 
   it("puts the exercises-are-coming line on the detail screen exactly once", () => {
     const { el } = mountPractice();
-    expect(el.detailNext.textContent).toBe(EXERCISES_COMING);
+    expect(el.detailNext.textContent).toBe(TARGET_EXERCISES);
   });
 });
 
@@ -1189,5 +1242,217 @@ describe("the practice status line", () => {
     render({ message: "Heard it.", storageError: "Storage is full." });
     expect(el.message.textContent).toBe("Heard it. Storage is full.");
     expect(el.message.classes.has("is-error")).toBe(true);
+  });
+});
+
+/* ── The drills ───────────────────────────────────────────────────────── */
+
+const HOLD: HoldSession = { referenceMidi: 84, plays: 0, recording: false, score: null };
+const SCORE = { medianCents: 24, wobbleCents: 11, steadySec: 2, frames: 150 };
+
+/** A generated phrase, as the drill would have made one. */
+const PHRASE = [84, 88, 86].map((midi) => ({ midi, durSec: 0.5 }));
+
+const ECHOED: HeardNote[] = [84, 88, 86].map((midi, i) => ({
+  midi,
+  centsOffset: 0,
+  durationSec: 0.5,
+  startSec: i * 0.6,
+  endSec: i * 0.6 + 0.5,
+}));
+
+function echoSession(patch: Partial<EchoSession> = {}): EchoSession {
+  return {
+    phrase: PHRASE,
+    length: 3,
+    listens: 0,
+    recording: false,
+    attempt: null,
+    ramp: "",
+    ...patch,
+  };
+}
+
+const ECHO_ATTEMPT: RecallAttempt = {
+  notes: ECHOED,
+  trail: [],
+  alignment: alignAttempt(ECHOED, PHRASE),
+};
+
+describe("the drills card", () => {
+  it("opens either drill without a melody in the library", () => {
+    const { el, handlers, render } = mountPractice();
+    render();
+    el.drillHold.click();
+    el.drillEcho.click();
+    expect(handlers.onOpenHold).toHaveBeenCalledTimes(1);
+    expect(handlers.onOpenEcho).toHaveBeenCalledTimes(1);
+  });
+
+  it("admits it is guessing at a register until one has been measured", () => {
+    const { el, render } = mountPractice();
+    render();
+    expect(el.drillNote.hidden).toBe(false);
+    expect(el.drillNote.textContent).toBe(DRILL_RANGE_NUDGE);
+    // A nudge, not a gate: the drills work either way, and requiring a
+    // measurement first would put a setup step in front of the one thing in
+    // this mode that needs no library.
+    render({ range: { lowMidi: 79, highMidi: 91 } });
+    expect(el.drillNote.hidden).toBe(true);
+  });
+});
+
+describe("the hold drill", () => {
+  it("says what to do without naming the note it is about to play", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "hold", hold: HOLD });
+
+    const written = [el.holdHint, el.holdPlay, el.holdWhistle, el.holdBack, el.holdCents]
+      .flatMap((element) => [element.textContent, element.innerHTML]);
+    for (const text of written) {
+      expect(text, text).not.toMatch(PITCH_NAME);
+      expect(text, text).not.toMatch(INTERVAL_WORDS);
+    }
+    expect(el.holdHint.textContent).toMatch(/hold/i);
+    expect(el.holdPlay.textContent).toBe("Hear it");
+  });
+
+  it("hides both ways on until there is a score to move on from", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "hold", hold: HOLD });
+    expect(el.holdScore.hidden).toBe(true);
+    expect(el.holdAgain.hidden).toBe(true);
+    expect(el.holdNext.hidden).toBe(true);
+
+    render({ screen: "hold", hold: { ...HOLD, score: SCORE } });
+    expect(el.holdScore.hidden).toBe(false);
+    expect(el.holdScore.textContent).toBe("Held it 24 cents sharp, wobble ±11 cents.");
+    expect(el.holdTakeaway.textContent).toMatch(/close/i);
+    expect(el.holdAgain.hidden).toBe(false);
+    expect(el.holdNext.hidden).toBe(false);
+  });
+
+  it("shows the running averages only once there are enough of them", () => {
+    const { el, render } = mountPractice();
+    let stats = emptyStats();
+    render({ screen: "hold", hold: HOLD, stats });
+    expect(el.holdTrend.hidden).toBe(true);
+
+    for (let i = 0; i < 5; i++) stats = recordHold(stats, 20, 12, i + 1);
+    render({ screen: "hold", hold: HOLD, stats });
+    expect(el.holdTrend.hidden).toBe(false);
+    expect(el.holdTrend.textContent).toMatch(/wobble/);
+  });
+
+  it("will not record over its own reference, or leave mid-hold", () => {
+    const { el, handlers, render } = mountPractice();
+    // While the reference is sounding there is nothing to record against: no
+    // echo cancellation anywhere in this app means the microphone would hear
+    // it.
+    render({ screen: "hold", hold: HOLD }, "idle", true);
+    expect(el.holdWhistle.disabled).toBe(true);
+    expect(el.holdPlay.textContent).toBe("Stop");
+    el.holdPlay.click();
+    expect(handlers.onStopListen).toHaveBeenCalledTimes(1);
+
+    render({ screen: "hold", hold: { ...HOLD, recording: true } }, "recording");
+    expect(el.holdWhistle.textContent).toBe("Stop");
+    expect(el.holdPlay.disabled).toBe(true);
+    // One way out of a running take, and it is the button that started it.
+    expect(el.holdBack.disabled).toBe(true);
+    el.holdWhistle.click();
+    expect(handlers.onStopCapture).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers the same note again, or a different one", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "hold", hold: { ...HOLD, score: SCORE } });
+    el.holdAgain.click();
+    el.holdNext.click();
+    expect(handlers.onHoldAgain).toHaveBeenCalledTimes(1);
+    expect(handlers.onHoldNext).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the echo drill, before the attempt", () => {
+  it("says how long the phrase is and nothing about which notes are in it", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "echo", echo: echoSession({ listens: 2 }) });
+
+    const written = [el.echoHint, el.echoMeta, el.echoListens, el.echoListen, el.echoWhistle]
+      .flatMap((element) => [element.textContent, element.innerHTML]);
+    for (const text of written) {
+      expect(text, text).not.toMatch(PITCH_NAME);
+      expect(text, text).not.toMatch(INTERVAL_WORDS);
+    }
+    expect(el.echoMeta.textContent).toBe("3 notes.");
+    expect(el.echoListens.textContent).toBe("Heard it 2 times.");
+  });
+
+  it("follows the same play-then-whistle rules the recall screen does", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "echo", echo: echoSession() });
+    expect(el.echoListen.textContent).toBe("Listen");
+    el.echoListen.click();
+    expect(handlers.onEchoListen).toHaveBeenCalledTimes(1);
+
+    render({ screen: "echo", echo: echoSession({ listens: 1 }) }, "idle", true);
+    expect(el.echoWhistle.disabled).toBe(true);
+    expect(el.echoListen.textContent).toBe("Stop");
+
+    render({ screen: "echo", echo: echoSession({ recording: true }) }, "recording");
+    expect(el.echoWhistle.textContent).toBe("Stop");
+    expect(el.echoBack.disabled).toBe(true);
+    el.echoWhistle.click();
+    expect(handlers.onStopCapture).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the result screen, shared by both echo exercises", () => {
+  it("draws a recall attempt with recall's own way out", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "recall", targets: [TARGET], recall: session({ attempt: ATTEMPT }) });
+    expect(el.result.hidden).toBe(false);
+    expect(el.recall.hidden).toBe(true);
+    expect(el.resultRetry.textContent).toBe("Try again");
+    expect(el.resultDone.textContent).toBe("Done");
+
+    el.resultRetry.click();
+    el.resultDone.click();
+    expect(handlers.onRetry).toHaveBeenCalledTimes(1);
+    expect(handlers.onCloseRecall).toHaveBeenCalledTimes(1);
+    expect(handlers.onEchoRetry).not.toHaveBeenCalled();
+  });
+
+  it("draws a drill attempt with the drill's, and says what the ramp did", () => {
+    const { el, handlers, render } = mountPractice();
+    render({
+      screen: "echo",
+      echo: echoSession({ attempt: ECHO_ATTEMPT, length: 4, ramp: "Got it — one more note next time." }),
+    });
+    expect(el.result.hidden).toBe(false);
+    expect(el.echo.hidden).toBe(true);
+    expect(el.resultRetry.textContent).toBe("Same one again");
+    expect(el.resultDone.textContent).toBe("Next one");
+    // The takeaway is still there — which jump went wrong is the point of a
+    // three-note phrase — with the ramp after it.
+    expect(el.resultTakeaway.textContent).toMatch(/one more note next time/);
+
+    el.resultRetry.click();
+    expect(handlers.onEchoRetry).toHaveBeenCalledTimes(1);
+    el.resultDone.click();
+    expect(handlers.onEchoNext).toHaveBeenCalledTimes(1);
+    el.resultBack.click();
+    expect(handlers.onCloseDrill).toHaveBeenCalledTimes(1);
+    expect(handlers.onRetry).not.toHaveBeenCalled();
+    expect(handlers.onCloseRecall).not.toHaveBeenCalled();
+  });
+
+  it("still names only what the user produced", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "echo", echo: echoSession({ attempt: ECHO_ATTEMPT }) });
+    // The strip is the same machinery recall uses, so the same rule holds: a
+    // chip names a wrong or extra note, never the note that was wanted.
+    expect(el.resultStrip.innerHTML).toContain("vchip");
   });
 });

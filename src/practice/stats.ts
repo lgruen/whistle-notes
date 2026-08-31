@@ -118,13 +118,43 @@ export interface TargetTally {
   updatedAt: number;
 }
 
+/**
+ * Everything the hold drill remembers, which is deliberately almost nothing.
+ *
+ * Two running averages and a count. A hold is a *moment* — one breath, one note
+ * — and the interesting question is "is my aim any better than it was last
+ * week", not "which note was I holding on Tuesday". Keeping a row per hold would
+ * be a second history to draw, to cap, to version and to explain, in exchange
+ * for a picture nobody asked for; keeping the two numbers costs forty bytes and
+ * answers the question.
+ *
+ * They are kept apart for the same reason {@link HoldScore} keeps them apart: a
+ * steady note in the wrong place and a note in the right place that will not sit
+ * still are different problems with different fixes, and one "accuracy" number
+ * would average them into a third thing that is neither.
+ */
+export interface HoldTally {
+  /** Holds folded in, for the lifetime. */
+  count: number;
+  /** EWMA of the *signed* median offset, in cents. Signed on purpose: a
+   *  whistler who is reliably sharp is a different case from one who is
+   *  scattered, and taking the absolute value first would erase it. */
+  offsetEwma: number;
+  /** EWMA of the wobble half-width, in cents. */
+  wobbleEwma: number;
+  /** Epoch milliseconds of the most recent hold. */
+  updatedAt: number;
+}
+
 export interface PracticeStats {
   intervals: ReadonlyMap<number, IntervalStat>;
   targets: ReadonlyMap<string, TargetTally>;
+  /** `null` until the first scored hold. */
+  holds: HoldTally | null;
 }
 
 export function emptyStats(): PracticeStats {
-  return { intervals: new Map(), targets: new Map() };
+  return { intervals: new Map(), targets: new Map(), holds: null };
 }
 
 function emptyInterval(interval: number): IntervalStat {
@@ -166,25 +196,24 @@ function ewma(previous: number, count: number, value: number): number {
 }
 
 /**
- * Record one attempt at one target.
+ * Fold one attempt's slots into the per-interval ledger.
  *
- * Returns a new {@link PracticeStats}; the input is untouched.
+ * **This is the one place directed-interval statistics are ever written**, and
+ * both exercises that produce them go through it: melody recall by way of
+ * {@link recordAttempt}, the phrase-echo drill by way of
+ * {@link recordDrillAttempt}. That matters more than it looks — the drills read
+ * those same numbers back to decide what to ask for next, so a second
+ * accumulator with its own rounding or its own idea of what a `missing` slot
+ * means would show up as a drill quietly practising the wrong thing.
  *
- * `target` is passed alongside the alignment because the alignment carries the
- * target's pitches but not the fact that two adjacent slots are a rising fourth
- * apart — the intervals are a property of the melody, and re-deriving them here
- * keeps the alignment shape free of anything only the statistics care about.
+ * The two callers differ only in what else they remember: a target has a slot
+ * history, a generated phrase has nothing to have a history *of*.
  */
-export function recordAttempt(
-  stats: PracticeStats,
-  targetId: string,
+function foldIntervals(
+  intervals: Map<number, IntervalStat>,
   target: readonly TargetNote[],
   alignment: Alignment,
-  at: number = Date.now(),
-): PracticeStats {
-  const intervals = new Map(stats.intervals);
-  const targets = new Map(stats.targets);
-
+): void {
   for (const slot of alignment.slots) {
     // Slot 0 arrives from nowhere: there is no interval into the first note of
     // a melody, so it contributes to the per-slot tally and nothing else.
@@ -218,6 +247,77 @@ export function recordAttempt(
     }
     intervals.set(interval, next);
   }
+}
+
+/**
+ * Record one attempt at a melody that came out of a generator rather than out
+ * of the library.
+ *
+ * The interval ledger is shared with {@link recordAttempt} — see
+ * {@link foldIntervals} — and nothing else is kept. Not an oversight: a phrase
+ * echo is a different phrase every time, so a per-slot tally would be a heatmap
+ * of "the third note of whatever it was", which is not a fact about anything. A
+ * library target has an identity worth accumulating against; a generated phrase
+ * has none, and inventing one (an id per drill, or one shared bucket) would grow
+ * a document nobody can read to answer a question nobody asked.
+ */
+export function recordDrillAttempt(
+  stats: PracticeStats,
+  phrase: readonly TargetNote[],
+  alignment: Alignment,
+): PracticeStats {
+  const intervals = new Map(stats.intervals);
+  foldIntervals(intervals, phrase, alignment);
+  return { ...stats, intervals };
+}
+
+/**
+ * Fold one scored hold into the running averages.
+ *
+ * The same {@link EWMA_ALPHA} the intervals use, for the same reason: this
+ * number answers "how is my aim *today*", and an average that still remembered
+ * the first hold of the first session would keep reporting a problem that has
+ * been fixed for a month.
+ */
+export function recordHold(
+  stats: PracticeStats,
+  medianCents: number,
+  wobbleCents: number,
+  at: number = Date.now(),
+): PracticeStats {
+  const previous = stats.holds;
+  const count = previous?.count ?? 0;
+  return {
+    ...stats,
+    holds: {
+      count: count + 1,
+      offsetEwma: ewma(previous?.offsetEwma ?? 0, count, medianCents),
+      wobbleEwma: ewma(previous?.wobbleEwma ?? 0, count, Math.max(0, wobbleCents)),
+      updatedAt: at,
+    },
+  };
+}
+
+/**
+ * Record one attempt at one target.
+ *
+ * Returns a new {@link PracticeStats}; the input is untouched.
+ *
+ * `target` is passed alongside the alignment because the alignment carries the
+ * target's pitches but not the fact that two adjacent slots are a rising fourth
+ * apart — the intervals are a property of the melody, and re-deriving them here
+ * keeps the alignment shape free of anything only the statistics care about.
+ */
+export function recordAttempt(
+  stats: PracticeStats,
+  targetId: string,
+  target: readonly TargetNote[],
+  alignment: Alignment,
+  at: number = Date.now(),
+): PracticeStats {
+  const intervals = new Map(stats.intervals);
+  const targets = new Map(stats.targets);
+  foldIntervals(intervals, target, alignment);
 
   const existing = targets.get(targetId);
   // A target whose note count changed is not the target this history was about
@@ -247,7 +347,7 @@ export function recordAttempt(
     updatedAt: at,
   });
 
-  return { intervals, targets };
+  return { ...stats, intervals, targets };
 }
 
 /** Drop everything remembered about one target — for when it is deleted. */
@@ -255,9 +355,10 @@ export function forgetTarget(stats: PracticeStats, targetId: string): PracticeSt
   if (!stats.targets.has(targetId)) return stats;
   const targets = new Map(stats.targets);
   targets.delete(targetId);
-  // The interval statistics deliberately survive: they are about the whistler,
-  // not about the melody that happened to reveal them.
-  return { intervals: stats.intervals, targets };
+  // The interval statistics — and the hold averages — deliberately survive:
+  // they are about the whistler, not about the melody that happened to reveal
+  // them.
+  return { ...stats, targets };
 }
 
 /**
@@ -459,6 +560,12 @@ export interface PracticeStatsJson {
   version: number;
   intervals: Record<string, IntervalJson>;
   targets: Record<string, TargetJson>;
+  /** Absent until the first scored hold, and absent in every document written
+   *  before T4. Additive, so **not** a version bump — for exactly the reason
+   *  spelled out above `history`: a bump would make a build that predates this
+   *  field throw away a year of interval statistics to avoid reading four
+   *  numbers it does not understand. */
+  holds?: HoldTally;
 }
 
 export function statsToJson(stats: PracticeStats): PracticeStatsJson {
@@ -490,7 +597,9 @@ export function statsToJson(stats: PracticeStats): PracticeStatsJson {
       })),
     };
   }
-  return { version: STATS_VERSION, intervals, targets };
+  const out: PracticeStatsJson = { version: STATS_VERSION, intervals, targets };
+  if (stats.holds) out.holds = { ...stats.holds };
+  return out;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -575,5 +684,19 @@ export function statsFromJson(raw: unknown): PracticeStats {
     });
   }
 
-  return { intervals, targets };
+  // A hold document with no holds in it is not a hold document: `count` at zero
+  // would leave the drill screen claiming an average over nothing.
+  const holdJson = record(root.holds);
+  const holdCount = holdJson ? count(holdJson.count) : 0;
+  const holds: HoldTally | null =
+    holdJson && holdCount > 0
+      ? {
+          count: holdCount,
+          offsetEwma: number(holdJson.offsetEwma),
+          wobbleEwma: Math.max(0, number(holdJson.wobbleEwma)),
+          updatedAt: count(holdJson.updatedAt),
+        }
+      : null;
+
+  return { intervals, targets, holds };
 }

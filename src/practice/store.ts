@@ -43,6 +43,17 @@
  */
 
 import type { Alignment, TargetNote } from "./align.js";
+import {
+  drillRange,
+  echoPhrase,
+  echoRampText,
+  echoSucceeded,
+  holdReference,
+  nextEchoLength,
+  ECHO_MIN_NOTES,
+  type HoldScore,
+  type Rng,
+} from "./drill.js";
 import type { MidiMelody } from "./midi.js";
 import type { HeardNote, TrailPoint } from "./recall.js";
 import {
@@ -61,6 +72,8 @@ import {
   emptyStats,
   forgetTarget,
   recordAttempt,
+  recordDrillAttempt,
+  recordHold,
   statsFromJson,
   statsToJson,
   type PracticeStats,
@@ -78,7 +91,15 @@ const LIBRARY_VERSION = 1;
  * lands back on the library, and deleting the selected target cannot leave a
  * detail screen pointing at nothing.
  */
-export type PracticeScreen = "library" | "target" | "range" | "draft" | "midi" | "recall";
+export type PracticeScreen =
+  | "library"
+  | "target"
+  | "range"
+  | "draft"
+  | "midi"
+  | "recall"
+  | "hold"
+  | "echo";
 
 /** Which end of the range the user is being asked for, during the check. */
 export type RangeStep = "low" | "high";
@@ -155,6 +176,50 @@ export interface RecallSession {
   attempt: RecallAttempt | null;
 }
 
+/**
+ * One round of the hold drill: hear a note, hold it, see the two numbers.
+ *
+ * The reference is chosen once and kept here for the same reason the recall
+ * session keeps its transposed melody: the synth, the live needle and the score
+ * all have to agree about which note was in the air, and re-rolling it — or
+ * re-deriving it from a range measured again in between — would leave the needle
+ * centred on a note the user never heard.
+ */
+export interface HoldSession {
+  /** The note being held, already in the whistler's register. */
+  referenceMidi: number;
+  /** How many times it has been played this round. Uncapped, like recall's
+   *  listen count, and for the same reason. */
+  plays: number;
+  /** Whether the take now running is this drill's hold. */
+  recording: boolean;
+  /** The finished score, or `null` before one has been made. */
+  score: HoldScore | null;
+}
+
+/**
+ * One round of the phrase-echo drill.
+ *
+ * `phrase` is generated, not chosen, and it is the only copy: it is what the
+ * synth plays, what the aligner scores against, and what the interval ledger
+ * reads its steps from — the same three-way agreement `RecallSession` needs, for
+ * the same reason.
+ *
+ * `length` is the *ramp's* current setting rather than `phrase.length`, because
+ * they differ for exactly one render: after an attempt the ramp has moved but
+ * the phrase on screen is still the one that was whistled.
+ */
+export interface EchoSession {
+  phrase: readonly TargetNote[];
+  /** How long the *next* phrase will be, 3–6. */
+  length: number;
+  listens: number;
+  recording: boolean;
+  attempt: RecallAttempt | null;
+  /** What the ramp did after the last attempt, for the line on screen. */
+  ramp: string;
+}
+
 export interface PracticeState {
   screen: PracticeScreen;
   /** Newest first. */
@@ -180,6 +245,10 @@ export interface PracticeState {
   midi: MidiPick | null;
   /** The recall exercise now running, or `null`. */
   recall: RecallSession | null;
+  /** The hold drill now running, or `null`. */
+  hold: HoldSession | null;
+  /** The phrase-echo drill now running, or `null`. */
+  echo: EchoSession | null;
   /** Whether a take is being recorded *into a draft* (rather than for the
    *  range check). Cleared the moment the notes arrive. */
   recordingTarget: boolean;
@@ -259,6 +328,8 @@ let state: PracticeState = {
   draft: null,
   midi: null,
   recall: null,
+  hold: null,
+  echo: null,
   recordingTarget: false,
   message: "",
   storageError: null,
@@ -340,6 +411,8 @@ export function showLibrary(message = ""): void {
     draft: null,
     midi: null,
     recall: null,
+    hold: null,
+    echo: null,
     recordingTarget: false,
     message,
   });
@@ -355,6 +428,8 @@ export function selectTarget(id: string, message = ""): void {
     // ends it, so the next "Practice this" starts from a clean listen count
     // rather than from someone else's half-finished attempt.
     recall: null,
+    hold: null,
+    echo: null,
     message,
   });
 }
@@ -624,6 +699,196 @@ export function retryRecall(): void {
 export function closeRecall(): void {
   if (state.recall) selectTarget(state.recall.targetId);
   else showLibrary();
+}
+
+/* ── Drill one: hold a note ───────────────────────────────────────────── */
+
+/**
+ * Open the hold drill on a fresh reference note.
+ *
+ * The register is worked out here, once, from whatever the range check knows —
+ * or from the default when it knows nothing. `rng` is a parameter with a default
+ * for the same reason `at` is throughout this file: the store is where the
+ * impure defaults live, and a test that wants a reproducible drill should not
+ * have to stub a global to get one.
+ */
+export function beginHold(rng: Rng = Math.random): void {
+  setPracticeState({
+    screen: "hold",
+    hold: {
+      referenceMidi: holdReference(drillRange(state.range), rng),
+      plays: 0,
+      recording: false,
+      score: null,
+    },
+    message: "",
+  });
+}
+
+/** Count one play of the reference. Nothing gates on it. */
+export function countHoldPlay(): void {
+  const hold = state.hold;
+  if (!hold) return;
+  setPracticeState({ hold: { ...hold, plays: hold.plays + 1 }, message: "" });
+}
+
+/** Mark that the take now running is this drill's hold — the same
+ *  set-before-the-notes-exist rule every other take in the app follows. */
+export function beginHoldTake(): void {
+  const hold = state.hold;
+  if (!hold) return;
+  setPracticeState({ hold: { ...hold, recording: true }, message: "" });
+}
+
+/** The hold ended without producing a score. Says why, and puts the button back. */
+export function endHoldTake(message = ""): void {
+  const hold = state.hold;
+  if (!hold) return;
+  setPracticeState({ hold: { ...hold, recording: false }, message });
+}
+
+/** A scored hold: show it, remember the two numbers, persist. */
+export function finishHold(score: HoldScore, at: number = Date.now()): void {
+  const hold = state.hold;
+  if (!hold) return;
+  const stats = recordHold(state.stats, score.medianCents, score.wobbleCents, at);
+  setPracticeState({
+    hold: { ...hold, recording: false, score },
+    stats,
+    storageError: persistStats(stats),
+    message: "",
+  });
+}
+
+/** Another go at the same note. The play count survives: it is about this
+ *  sitting with this reference, not about this attempt at it. */
+export function retryHold(): void {
+  const hold = state.hold;
+  if (!hold) return;
+  setPracticeState({ hold: { ...hold, recording: false, score: null }, message: "" });
+}
+
+/** A different note, and a clean slate to hear it against. */
+export function nextHold(rng: Rng = Math.random): void {
+  const hold = state.hold;
+  if (!hold) return;
+  setPracticeState({
+    hold: {
+      referenceMidi: holdReference(drillRange(state.range), rng, hold.referenceMidi),
+      plays: 0,
+      recording: false,
+      score: null,
+    },
+    message: "",
+  });
+}
+
+/* ── Drill two: echo a phrase ─────────────────────────────────────────── */
+
+/** A phrase of the given length, generated against the whistler's register and
+ *  biased by everything the history knows. One place, so the opening phrase and
+ *  every later one are made the same way. */
+function makeEchoPhrase(length: number, rng: Rng): TargetNote[] {
+  return echoPhrase(rng, { length, range: state.range, stats: state.stats });
+}
+
+/** Open the echo drill at the shortest phrase. Difficulty is earned, not
+ *  remembered: a session that starts where the last one ended would open with
+ *  six notes for someone who has not whistled since Tuesday. */
+export function beginEcho(rng: Rng = Math.random): void {
+  setPracticeState({
+    screen: "echo",
+    echo: {
+      phrase: makeEchoPhrase(ECHO_MIN_NOTES, rng),
+      length: ECHO_MIN_NOTES,
+      listens: 0,
+      recording: false,
+      attempt: null,
+      ramp: "",
+    },
+    message: "",
+  });
+}
+
+export function countEchoListen(): void {
+  const echo = state.echo;
+  if (!echo) return;
+  setPracticeState({ echo: { ...echo, listens: echo.listens + 1 }, message: "" });
+}
+
+export function beginEchoTake(): void {
+  const echo = state.echo;
+  if (!echo) return;
+  setPracticeState({ echo: { ...echo, recording: true }, message: "" });
+}
+
+export function endEchoTake(message = ""): void {
+  const echo = state.echo;
+  if (!echo) return;
+  setPracticeState({ echo: { ...echo, recording: false }, message });
+}
+
+/**
+ * An echo arrived: score it, fold its intervals into the shared ledger, and
+ * move the ramp.
+ *
+ * One patch, exactly as `finishRecallAttempt` is one patch, and for the same
+ * reason: the ramp, the statistics and the picture on screen are three views of
+ * one event.
+ *
+ * The ledger is the *interval* one, and only that — see `recordDrillAttempt`.
+ * A generated phrase has no identity to accumulate a slot history against.
+ */
+export function finishEchoAttempt(attempt: RecallAttempt): void {
+  const echo = state.echo;
+  if (!echo) return;
+  const success = echoSucceeded(attempt.alignment);
+  const length = nextEchoLength(echo.length, success);
+  const stats = recordDrillAttempt(state.stats, echo.phrase, attempt.alignment);
+  setPracticeState({
+    echo: {
+      ...echo,
+      recording: false,
+      attempt,
+      length,
+      ramp: echoRampText(echo.length, length),
+    },
+    stats,
+    storageError: persistStats(stats),
+    message: "",
+  });
+}
+
+/** The same phrase again — for when the ear got it and the mouth did not. */
+export function retryEcho(): void {
+  const echo = state.echo;
+  if (!echo) return;
+  setPracticeState({
+    echo: { ...echo, recording: false, attempt: null, listens: 0, ramp: "" },
+    message: "",
+  });
+}
+
+/** A new phrase at whatever length the ramp has arrived at. */
+export function nextEcho(rng: Rng = Math.random): void {
+  const echo = state.echo;
+  if (!echo) return;
+  setPracticeState({
+    echo: {
+      phrase: makeEchoPhrase(echo.length, rng),
+      length: echo.length,
+      listens: 0,
+      recording: false,
+      attempt: null,
+      ramp: "",
+    },
+    message: "",
+  });
+}
+
+/** Leave either drill, back to the library it was started from. */
+export function closeDrill(): void {
+  showLibrary();
 }
 
 /* ── The history ──────────────────────────────────────────────────────── */

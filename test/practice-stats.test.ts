@@ -8,6 +8,8 @@ import {
   forgetTarget,
   intervalWeakness,
   recordAttempt,
+  recordDrillAttempt,
+  recordHold,
   slotTrouble,
   statsFromJson,
   statsToJson,
@@ -499,5 +501,102 @@ describe("serialisation", () => {
       { clean: 2, off: 0, wrong: 0, missing: 0 },
       { clean: 0, off: 0, wrong: 0, missing: 0 },
     ]);
+  });
+});
+
+/**
+ * The drills write into the same ledger the recall exercise does, and read the
+ * same numbers back out to decide what to ask for next. That loop is the point
+ * of the whole adaptive design, and the way to break it quietly is to give the
+ * drills an accumulator of their own — one that rounds differently, or counts a
+ * missed slot differently, and therefore drills the wrong intervals for months
+ * without ever throwing.
+ */
+describe("the drills' entry points", () => {
+  it("folds a generated phrase into the same interval ledger a melody does", () => {
+    const phrase = melody([84, 88, 91]);
+    const attempt = attemptOf(phrase, [0, -50, 0]);
+    const drill = recordDrillAttempt(emptyStats(), phrase, attempt);
+    const target = recordAttempt(emptyStats(), "t", phrase, attempt, 1);
+    // Identical intervals, from the identical fold.
+    expect([...drill.intervals.entries()]).toEqual([...target.intervals.entries()]);
+  });
+
+  it("keeps no slot history for a phrase, because a phrase is not a melody", () => {
+    const phrase = melody([84, 88, 91]);
+    const stats = recordDrillAttempt(emptyStats(), phrase, attemptOf(phrase, [0, 0, 0]));
+    // A heatmap of "the second note of whatever it was" is not a fact about
+    // anything, and an id per drill would grow a document nobody can read.
+    expect(stats.targets.size).toBe(0);
+  });
+
+  it("does not disturb what the library has already taught it", () => {
+    const target = melody([60, 64, 67]);
+    const before = recordAttempt(emptyStats(), "t", target, attemptOf(target, [0, 0, 0]), 1);
+    const after = recordDrillAttempt(before, melody([84, 86]), attemptOf(melody([84, 86]), [0, 0]));
+    expect(after.targets.get("t")).toEqual(before.targets.get("t"));
+    expect(after.intervals.get(4)?.observations).toBe(1);
+  });
+});
+
+describe("the hold drill's two numbers", () => {
+  it("starts the averages at the first hold rather than blending up from zero", () => {
+    const stats = recordHold(emptyStats(), 30, 12, 5);
+    expect(stats.holds).toEqual({ count: 1, offsetEwma: 30, wobbleEwma: 12, updatedAt: 5 });
+  });
+
+  it("keeps the offset signed, so a reliably sharp whistler stays visible", () => {
+    let stats = emptyStats();
+    for (const cents of [30, 34, 28, 31]) stats = recordHold(stats, cents, 10, 1);
+    // An absolute value here would say the same thing about someone scattered
+    // ±30 as about someone consistently 30 sharp, and those want different
+    // advice.
+    expect(stats.holds!.offsetEwma).toBeGreaterThan(25);
+    let scattered = emptyStats();
+    for (const cents of [30, -34, 28, -31]) scattered = recordHold(scattered, cents, 10, 1);
+    expect(Math.abs(scattered.holds!.offsetEwma)).toBeLessThan(20);
+  });
+
+  it("moves towards the newest hold at the same rate the intervals do", () => {
+    const first = recordHold(emptyStats(), 0, 0, 1);
+    const second = recordHold(first, 40, 20, 2);
+    expect(second.holds!.offsetEwma).toBeCloseTo(40 * EWMA_ALPHA, 9);
+    expect(second.holds!.count).toBe(2);
+  });
+
+  it("survives a target being deleted, because it is about the whistler", () => {
+    const target = melody([60, 64]);
+    let stats = recordAttempt(emptyStats(), "t", target, attemptOf(target, [0, 0]), 1);
+    stats = recordHold(stats, 20, 8, 2);
+    const after = forgetTarget(stats, "t");
+    expect(after.targets.size).toBe(0);
+    expect(after.holds).toEqual(stats.holds);
+    expect(after.intervals.size).toBe(stats.intervals.size);
+  });
+
+  it("round-trips through storage without a version bump", () => {
+    const stats = recordHold(emptyStats(), -18.5, 9.25, 1234);
+    const json = statsToJson(stats);
+    expect(json.version).toBe(STATS_VERSION);
+    expect(statsFromJson(JSON.parse(JSON.stringify(json))).holds).toEqual(stats.holds);
+  });
+
+  it("reads a document written before holds existed, and one with junk in it", () => {
+    // The additive-field rule: an older document simply has no `holds`, and
+    // that must not cost the reader its interval statistics.
+    const old = statsToJson(emptyStats());
+    delete (old as { holds?: unknown }).holds;
+    expect(statsFromJson(old).holds).toBeNull();
+    // A hold tally with no holds in it is not a tally; claiming an average over
+    // nothing would put a sentence on screen about a session nobody had.
+    expect(
+      statsFromJson({ ...statsToJson(emptyStats()), holds: { count: 0, offsetEwma: 9 } }).holds,
+    ).toBeNull();
+    expect(
+      statsFromJson({
+        ...statsToJson(emptyStats()),
+        holds: { count: 3, offsetEwma: "sharp", wobbleEwma: -5, updatedAt: null },
+      }).holds,
+    ).toEqual({ count: 3, offsetEwma: 0, wobbleEwma: 0, updatedAt: 0 });
   });
 });

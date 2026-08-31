@@ -503,8 +503,15 @@ export function scoreText(alignment: Alignment): string {
   return parts.join(" · ");
 }
 
-/** How far off, in the unit that carries the most meaning at that distance. */
-function distanceText(cents: number): string {
+/**
+ * How far off, in the unit that carries the most meaning at that distance.
+ *
+ * Exported for the hold drill, which asks the identical question about a single
+ * sustained note — and which must ask it in the identical words, or the app
+ * would have two vocabularies for one measurement. Post-hoc by construction:
+ * every caller is describing something already whistled.
+ */
+export function distanceText(cents: number): string {
   const magnitude = Math.abs(cents);
   const direction = cents > 0 ? "sharp" : "flat";
   if (magnitude < 100) return `${Math.round(magnitude)} cents ${direction}`;

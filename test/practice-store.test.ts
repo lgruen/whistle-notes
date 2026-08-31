@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { alignAttempt } from "../src/practice/align.js";
+import { alignAttempt, type TargetNote } from "../src/practice/align.js";
+import {
+  DEFAULT_DRILL_RANGE,
+  ECHO_MIN_NOTES,
+  makeRng,
+} from "../src/practice/drill.js";
 import {
   formatTargetDuration,
   makeTarget,
@@ -72,6 +77,11 @@ async function loadStore(initial: Record<string, string> = {}): Promise<Store> {
 
 function target(name: string, midis: readonly number[], createdAt: number): PracticeTarget {
   return { ...makeTarget(name, "recorded", midis.map((midi) => ({ midi, durationSec: 0.4 })), createdAt) };
+}
+
+/** The directed steps of a phrase, for counting what a drill taught. */
+function steps(phrase: readonly TargetNote[]): number[] {
+  return phrase.slice(1).map((note, i) => note.midi - phrase[i].midi);
 }
 
 /** A library document as the store writes one. */
@@ -447,6 +457,178 @@ describe("the recall exercise", () => {
   });
 });
 
+/**
+ * The two drills and the warm-up, where the store has to hold three things
+ * together that a screen can show disagreeing: the prompt that was played, the
+ * thing it will be scored against, and the statistics it feeds.
+ */
+describe("the echo drills", () => {
+  const RANGE = { lowMidi: 79, highMidi: 91 };
+
+  /** An echo of `phrase`, sung `shift` semitones away and `cents` off. */
+  function echoOf(
+    phrase: readonly { midi: number }[],
+    shift = 0,
+    cents = 0,
+  ): { notes: never[]; trail: never[]; alignment: ReturnType<typeof alignAttempt> } {
+    return {
+      notes: [],
+      trail: [],
+      alignment: alignAttempt(
+        phrase.map((note) => ({ midi: note.midi + shift, centsOffset: cents, durationSec: 0.5 })),
+        phrase.map((note) => ({ midi: note.midi, durSec: 0.5 })),
+      ),
+    };
+  }
+
+  it("opens the hold drill on a note inside the measured register", async () => {
+    const store = await loadStore();
+    store.setRange(RANGE);
+    store.beginHold(makeRng(3));
+    const hold = store.getPracticeState().hold!;
+    expect(store.getPracticeState().screen).toBe("hold");
+    expect(hold.referenceMidi).toBeGreaterThan(RANGE.lowMidi);
+    expect(hold.referenceMidi).toBeLessThan(RANGE.highMidi);
+    expect(hold.score).toBeNull();
+    expect(hold.plays).toBe(0);
+  });
+
+  it("opens it on a guessed register when nothing has been measured", async () => {
+    const store = await loadStore();
+    store.beginHold(makeRng(3));
+    const midi = store.getPracticeState().hold!.referenceMidi;
+    expect(midi).toBeGreaterThanOrEqual(DEFAULT_DRILL_RANGE.lowMidi);
+    expect(midi).toBeLessThanOrEqual(DEFAULT_DRILL_RANGE.highMidi);
+  });
+
+  it("remembers a scored hold as two running numbers, and writes them down", async () => {
+    const store = await loadStore();
+    store.beginHold(makeRng(3));
+    store.beginHoldTake();
+    store.finishHold({ medianCents: 24, wobbleCents: 11, steadySec: 2, frames: 150 }, 7);
+
+    const state = store.getPracticeState();
+    expect(state.hold!.recording).toBe(false);
+    expect(state.hold!.score!.medianCents).toBe(24);
+    expect(state.stats.holds).toEqual({
+      count: 1,
+      offsetEwma: 24,
+      wobbleEwma: 11,
+      updatedAt: 7,
+    });
+    expect(state.storageError).toBeNull();
+    expect(JSON.parse(storage.peek(STATS_KEY)!).holds.count).toBe(1);
+  });
+
+  it("keeps the note for another go, and changes it for a new one", async () => {
+    const store = await loadStore();
+    store.beginHold(makeRng(3));
+    const first = store.getPracticeState().hold!.referenceMidi;
+    store.finishHold({ medianCents: 0, wobbleCents: 5, steadySec: 2, frames: 150 }, 1);
+
+    store.retryHold();
+    expect(store.getPracticeState().hold!.referenceMidi).toBe(first);
+    // The score goes: it was about the take before, not about this one.
+    expect(store.getPracticeState().hold!.score).toBeNull();
+
+    store.nextHold(makeRng(3));
+    expect(store.getPracticeState().hold!.referenceMidi).not.toBe(first);
+  });
+
+  it("opens the phrase drill at the shortest phrase", async () => {
+    const store = await loadStore();
+    store.setRange(RANGE);
+    store.beginEcho(makeRng(11));
+    const echo = store.getPracticeState().echo!;
+    expect(store.getPracticeState().screen).toBe("echo");
+    expect(echo.phrase).toHaveLength(ECHO_MIN_NOTES);
+    expect(echo.length).toBe(ECHO_MIN_NOTES);
+    for (const note of echo.phrase) {
+      expect(note.midi).toBeGreaterThanOrEqual(RANGE.lowMidi);
+      expect(note.midi).toBeLessThanOrEqual(RANGE.highMidi);
+    }
+  });
+
+  it("folds an echo into the interval ledger and nothing else", async () => {
+    const store = await loadStore();
+    store.beginEcho(makeRng(11));
+    const echo = store.getPracticeState().echo!;
+    store.beginEchoTake();
+    store.finishEchoAttempt(echoOf(echo.phrase));
+
+    const state = store.getPracticeState();
+    expect(state.echo!.attempt).not.toBeNull();
+    // Two steps in a three-note phrase, both now in the shared ledger.
+    expect(state.stats.intervals.size).toBe(new Set(steps(echo.phrase)).size);
+    // ...and no per-slot history: a generated phrase has no identity to keep
+    // one against.
+    expect(state.stats.targets.size).toBe(0);
+    expect(JSON.parse(storage.peek(STATS_KEY)!).targets).toEqual({});
+  });
+
+  it("moves the ramp up on a clean echo and back down on a miss", async () => {
+    const store = await loadStore();
+    store.beginEcho(makeRng(11));
+    store.finishEchoAttempt(echoOf(store.getPracticeState().echo!.phrase));
+    expect(store.getPracticeState().echo!.length).toBe(ECHO_MIN_NOTES + 1);
+    expect(store.getPracticeState().echo!.ramp).toMatch(/one more/i);
+
+    // A new phrase at the ramped length, then an echo with a wrong note in it.
+    store.nextEcho(makeRng(12));
+    const phrase = store.getPracticeState().echo!.phrase;
+    expect(phrase).toHaveLength(ECHO_MIN_NOTES + 1);
+    store.finishEchoAttempt({
+      notes: [],
+      trail: [],
+      alignment: alignAttempt(
+        phrase.map((note, i) => ({
+          midi: note.midi + (i === 1 ? 2 : 0),
+          centsOffset: 0,
+          durationSec: 0.5,
+        })),
+        phrase.map((note) => ({ midi: note.midi, durSec: 0.5 })),
+      ),
+    });
+    expect(store.getPracticeState().echo!.length).toBe(ECHO_MIN_NOTES);
+  });
+
+  it("forgives the register, exactly as the recall exercise does", async () => {
+    const store = await loadStore();
+    store.beginEcho(makeRng(11));
+    const phrase = store.getPracticeState().echo!.phrase;
+    // Echoed a 5th up: the shape is right, so the ramp moves.
+    store.finishEchoAttempt(echoOf(phrase, 7));
+    expect(store.getPracticeState().echo!.length).toBe(ECHO_MIN_NOTES + 1);
+  });
+
+  it("keeps the phrase for another go, and drops it for a new one", async () => {
+    const store = await loadStore();
+    store.beginEcho(makeRng(11));
+    const phrase = store.getPracticeState().echo!.phrase;
+    store.finishEchoAttempt(echoOf(phrase));
+
+    store.retryEcho();
+    expect(store.getPracticeState().echo!.phrase).toBe(phrase);
+    expect(store.getPracticeState().echo!.attempt).toBeNull();
+    expect(store.getPracticeState().echo!.listens).toBe(0);
+
+    store.nextEcho(makeRng(99));
+    expect(store.getPracticeState().echo!.phrase).not.toBe(phrase);
+  });
+
+  it("leaves both drills behind when the library comes back", async () => {
+    const store = await loadStore();
+    store.beginHold(makeRng(1));
+    store.closeDrill();
+    expect(store.getPracticeState().hold).toBeNull();
+    expect(store.getPracticeState().screen).toBe("library");
+
+    store.beginEcho(makeRng(1));
+    store.closeDrill();
+    expect(store.getPracticeState().echo).toBeNull();
+  });
+});
+
 describe("the range check", () => {
   it("is not a range until both ends are in", async () => {
     const store = await loadStore();
@@ -623,7 +805,20 @@ describe("the practice island", () => {
     // and it is the sharpest case of all: it lays a melody out for a synth it
     // may not import and lays a diff out on a canvas it may not touch, and both
     // of those are arithmetic that a test can check exactly.
-    for (const name of ["align", "stats", "range", "target", "midi", "bundled", "recall"]) {
+    // `drill` joined in T4, and it is the one that had to be argued for: it
+    // chooses random notes, and the obvious way to do that is `Math.random` —
+    // which would be untestable. So randomness is injected, and the impure
+    // default lives in `store.ts` where the rest of the platform does.
+    for (const name of [
+      "align",
+      "stats",
+      "range",
+      "target",
+      "midi",
+      "bundled",
+      "recall",
+      "drill",
+    ]) {
       const source = await read(name);
       for (const token of BROWSER_ONLY) {
         expect(source, `${name}.ts uses ${token}`).not.toMatch(new RegExp(`\\b${token}\\b`));

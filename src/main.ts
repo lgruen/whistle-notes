@@ -16,7 +16,7 @@ import {
   type CapturedAudio,
 } from "./audio/capture.js";
 import { AudioFileError, decodeAudioFile } from "./audio/decode.js";
-import { isPlaying, startPlayback, stopPlayback } from "./audio/synth.js";
+import { isPlaying, startPlayback, stopPlayback, type PlayableNote } from "./audio/synth.js";
 import { downloadWav, takeFilename } from "./audio/wav-export.js";
 import { a4FromOffsetCents, transposeMidi } from "./notes/format.js";
 import { bundledMelody } from "./practice/bundled.js";
@@ -32,24 +32,40 @@ import {
 import { representativeMidi } from "./practice/range.js";
 import { targetPlayback } from "./practice/recall.js";
 import { alignAttempt } from "./practice/align.js";
+import { holdPlayback, scoreHold, HOLD_REFERENCE_SEC } from "./practice/drill.js";
 import {
   addTarget,
   beginDraft,
+  beginEcho,
+  beginEchoTake,
+  beginHold,
+  beginHoldTake,
   beginRangeStep,
   beginRecall,
   beginRecallTake,
   beginTargetTake,
   captureRangeEnd,
+  closeDrill,
   closeRecall,
+  countEchoListen,
+  countHoldPlay,
   countRecallListen,
   discardDraft,
   editDraft,
+  endEchoTake,
+  endHoldTake,
   endRangeStep,
   endRecallTake,
   endTargetTake,
+  finishEchoAttempt,
+  finishHold,
   finishRecallAttempt,
   getPracticeState,
+  nextEcho,
+  nextHold,
   removeTarget,
+  retryEcho,
+  retryHold,
   retryRecall,
   saveDraft,
   selectTarget,
@@ -74,6 +90,7 @@ import {
 import { createControls } from "./ui/controls.js";
 import { createDebugView } from "./ui/debug.js";
 import { trailFromFrames } from "./ui/diffroll.js";
+import { createHoldMeter } from "./ui/holdmeter.js";
 import { createLiveView, formatClock } from "./ui/live.js";
 import { highlightNoteList, initNoteList, renderNoteList } from "./ui/notelist.js";
 import {
@@ -170,6 +187,21 @@ const controls = createControls(
 const transcribeView = element("transcribe-view");
 const practiceView = element("practice-view");
 
+/**
+ * The hold drill's live needle.
+ *
+ * Driven from an animation loop with the microphone open, and never anywhere
+ * near a store — the same hot/cold split the transcriber's live readout follows,
+ * for the same reason (see the note at the top of `ui/state.ts`). Built here
+ * rather than inside the practice view because the view's `render` is the cold
+ * path and must not be able to reach it.
+ */
+const holdMeter = createHoldMeter({
+  cents: element("practice-hold-cents"),
+  needle: element("practice-hold-needle"),
+  hint: element("practice-hold-meter-hint"),
+});
+
 const practice = createPracticeView(
   {
     library: element("practice-library"),
@@ -181,6 +213,9 @@ const practice = createPracticeView(
     addMidiLabel: element("practice-add-midi"),
     addMidiInput: element<HTMLInputElement>("practice-add-midi-input"),
     starters: element("practice-starters"),
+    drillHold: element<HTMLButtonElement>("practice-drill-hold"),
+    drillEcho: element<HTMLButtonElement>("practice-drill-echo"),
+    drillNote: element("practice-drill-note"),
     detail: element("practice-target"),
     detailName: element("practice-target-name"),
     detailMeta: element("practice-target-meta"),
@@ -199,6 +234,26 @@ const practice = createPracticeView(
     recallListen: element<HTMLButtonElement>("practice-recall-listen"),
     recallListens: element("practice-recall-listens"),
     recallWhistle: element<HTMLButtonElement>("practice-recall-whistle"),
+    hold: element("practice-hold"),
+    holdBack: element<HTMLButtonElement>("practice-hold-back"),
+    holdHint: element("practice-hold-hint"),
+    holdPlay: element<HTMLButtonElement>("practice-hold-play"),
+    holdCents: element("practice-hold-cents"),
+    holdNeedle: element("practice-hold-needle"),
+    holdMeterHint: element("practice-hold-meter-hint"),
+    holdWhistle: element<HTMLButtonElement>("practice-hold-whistle"),
+    holdScore: element("practice-hold-score"),
+    holdTakeaway: element("practice-hold-takeaway"),
+    holdTrend: element("practice-hold-trend"),
+    holdAgain: element<HTMLButtonElement>("practice-hold-again"),
+    holdNext: element<HTMLButtonElement>("practice-hold-next"),
+    echo: element("practice-echo"),
+    echoBack: element<HTMLButtonElement>("practice-echo-back"),
+    echoHint: element("practice-echo-hint"),
+    echoMeta: element("practice-echo-meta"),
+    echoListen: element<HTMLButtonElement>("practice-echo-listen"),
+    echoListens: element("practice-echo-listens"),
+    echoWhistle: element<HTMLButtonElement>("practice-echo-whistle"),
     result: element("practice-result"),
     resultBack: element<HTMLButtonElement>("practice-result-done"),
     resultCanvas: element<HTMLCanvasElement>("practice-result-roll"),
@@ -276,6 +331,40 @@ const practice = createPracticeView(
       // hears rather than sees.
       stopPlayback();
       closeRecall();
+    },
+
+    /* ── The drills ───────────────────────────────────────────────────
+     *
+     * Same three rules as every other exercise: the microphone opens first and
+     * the screen is told second (the iOS gesture rule), the button that opened
+     * it is the only way out of it, and leaving a screen silences whatever it
+     * started.
+     */
+    onOpenHold: () => beginHold(),
+    onOpenEcho: () => beginEcho(),
+    onHoldPlay: playHoldReference,
+    onHoldAttempt: () => {
+      beginRecording("hold");
+      beginHoldTake();
+    },
+    onHoldAgain: retryHold,
+    onHoldNext: () => {
+      stopPlayback();
+      nextHold();
+    },
+    onEchoListen: listenToPhrase,
+    onEchoAttempt: () => {
+      beginRecording("echo");
+      beginEchoTake();
+    },
+    onEchoRetry: retryEcho,
+    onEchoNext: () => {
+      stopPlayback();
+      nextEcho();
+    },
+    onCloseDrill: () => {
+      stopPlayback();
+      closeDrill();
     },
 
     onTrimDraft: (end) => reviseDraft((draft) => trimDraft(draft, end)),
@@ -386,25 +475,27 @@ function openMelodyDraft(melody: MidiMelody, name: string): void {
 }
 
 /**
- * Play the melody the recall screen is about.
+ * Play a prompt at the user: a melody, a generated phrase, a single reference
+ * note.
  *
- * Transposed by nothing: `beginRecall` already moved it into the whistler's
- * register, and that transposed melody is what the aligner will score the
- * attempt against. The octave toggle is about the *transcript* and is not even
- * on screen here.
+ * Transposed by nothing: whatever opened the exercise already moved it into the
+ * whistler's register, and *that* is what the aligner will score the attempt
+ * against. The octave toggle is about the *transcript* and is not even on screen
+ * here.
  *
  * No note highlighting, deliberately — `onIndex` is where the transcriber lights
  * up a chip, and a light moving along a melody the user is about to be asked to
  * remember is a written prompt drawn in a different medium. The voice is the
  * stored preference; its toggle lives in the transcriber's dock, which practice
  * mode hides along with the rest of it.
+ *
+ * `counted` runs only if the sound actually started: `startPlayback` refuses
+ * while the microphone is open, and a refusal must not leave a Stop button over
+ * a silent speaker or add a listen nobody heard.
  */
-function listenToTarget(): void {
-  const recall = getPracticeState().recall;
-  if (!recall) return;
-
+function playPrompt(notes: readonly PlayableNote[], counted: () => void): void {
   const started = startPlayback(
-    targetPlayback(recall.notes),
+    notes,
     0,
     {
       onIndex: () => undefined,
@@ -412,11 +503,27 @@ function listenToTarget(): void {
     },
     getState().voice,
   );
-  // `startPlayback` refuses while the microphone is open, and a refusal must not
-  // leave a Stop button over a speaker that is silent.
   if (!started) return;
   setState({ playing: true, playingIndex: null });
-  countRecallListen();
+  counted();
+}
+
+function listenToTarget(): void {
+  const recall = getPracticeState().recall;
+  if (recall) playPrompt(targetPlayback(recall.notes), countRecallListen);
+}
+
+function listenToPhrase(): void {
+  const echo = getPracticeState().echo;
+  if (echo) playPrompt(targetPlayback(echo.phrase), countEchoListen);
+}
+
+/** The hold drill's reference: one sustained note, then silence to hold into.
+ *  Silence because there is no echo cancellation anywhere in this app — a
+ *  reference still sounding would be measured as part of the hold. */
+function playHoldReference(): void {
+  const hold = getPracticeState().hold;
+  if (hold) playPrompt(holdPlayback(hold.referenceMidi, HOLD_REFERENCE_SEC), countHoldPlay);
 }
 
 function renderPractice(): void {
@@ -615,6 +722,32 @@ function stopLoop(): void {
   loopHandle = 0;
 }
 
+/**
+ * The hold drill's own hot loop.
+ *
+ * Separate from the one above rather than a branch inside it, because the two
+ * paint completely different things: that one draws a growing piano roll and a
+ * note *name*, this one draws a needle centred on the reference the drill just
+ * played. Sharing them would mean a loop that checks which mode it is in sixty
+ * times a second and touches elements that are not on screen.
+ */
+let holdHandle = 0;
+
+function holdLoop(): void {
+  holdHandle = requestAnimationFrame(holdLoop);
+  const hold = getPracticeState().hold;
+  if (hold) holdMeter.tick(getLiveStatus(), hold.referenceMidi);
+}
+
+function stopHoldLoop(): void {
+  if (holdHandle) cancelAnimationFrame(holdHandle);
+  holdHandle = 0;
+  // Parked rather than left showing the last reading: the number under a
+  // finished hold is the *score*, and a live needle frozen next to it would be
+  // a second, staler answer to the same question.
+  holdMeter.reset();
+}
+
 /* ── Transitions ──────────────────────────────────────────────────────── */
 
 /** The audio behind the result on screen, when it came from the microphone.
@@ -630,20 +763,22 @@ let lastTake: CapturedAudio | null = null;
  * analysis is scheduled, so a mode switch mid-analysis cannot redirect a take
  * that is already in flight.
  */
-type TakeIntent = "transcribe" | RangeStep | "target" | "attempt";
+type TakeIntent = "transcribe" | RangeStep | "target" | "attempt" | "hold" | "echo";
 let takeIntent: TakeIntent = "transcribe";
 
 /**
  * A practice take that ended badly, told to whichever screen started it.
  *
  * The transcriber's message line is not on screen in practice mode, so every
- * failure has to be routed by intent rather than dropped into `AppState`. Both
- * store calls also clear the flag the screen uses to decide whether a take is
- * running, which is what stops a failed take leaving a Stop button behind.
+ * failure has to be routed by intent rather than dropped into `AppState`. Every
+ * store call here also clears the flag the screen uses to decide whether a take
+ * is running, which is what stops a failed take leaving a Stop button behind.
  */
 function practiceTakeFailed(intent: Exclude<TakeIntent, "transcribe">, message: string): void {
   if (intent === "target") endTargetTake(message);
   else if (intent === "attempt") endRecallTake(message);
+  else if (intent === "hold") endHoldTake(message);
+  else if (intent === "echo") endEchoTake(message);
   else endRangeStep(message);
 }
 
@@ -677,11 +812,14 @@ function beginRecording(intent: TakeIntent = "transcribe"): void {
   });
   live.show("—", "Listening…");
   stopLoop();
-  // The loop's only job is to paint the live readout and the growing roll, and
-  // in practice mode neither is on screen. Skipping it costs nothing: the
-  // 60 s cap it also watches is enforced authoritatively inside the audio
-  // callback, which is why the loop can call itself a backstop.
+  stopHoldLoop();
+  // The transcriber's loop paints the live readout and the growing roll, and in
+  // practice mode neither is on screen — except in the hold drill, which has a
+  // live readout of its own and a loop to match. Skipping both costs nothing:
+  // the 60 s cap they also watch is enforced authoritatively inside the audio
+  // callback, which is why either can call itself a backstop.
   if (intent === "transcribe") loopHandle = requestAnimationFrame(loop);
+  else if (intent === "hold") holdHandle = requestAnimationFrame(holdLoop);
 
   void started.then(
     () => setState({ warning: processingWarning() }),
@@ -690,6 +828,7 @@ function beginRecording(intent: TakeIntent = "transcribe"): void {
       // must not overwrite whatever the app is doing now.
       if (error instanceof CaptureAborted) return;
       stopLoop();
+      stopHoldLoop();
       if (intent !== "transcribe") {
         // The transcriber's error phase is a screen practice mode is not
         // showing, so the news has to go where the user is looking.
@@ -768,6 +907,7 @@ setCaptureHandlers({
 function finishRecording(): void {
   if (getState().phase !== "recording") return;
   stopLoop();
+  stopHoldLoop();
 
   const take = stopRecording();
   if (!take) {
@@ -797,6 +937,8 @@ const TAKE_SUBJECTS: Record<TakeIntent, string> = {
   high: "that note",
   target: "that melody",
   attempt: "that attempt",
+  hold: "that note",
+  echo: "that phrase",
 };
 
 /**
@@ -892,6 +1034,70 @@ function applyAttemptTake(notes: readonly Note[], frames: readonly PitchFrame[],
     trail: trailFromFrames(frames, tuningOffsetCents),
     alignment: alignAttempt(notes, recall.notes),
   });
+}
+
+/**
+ * Score one echo of a generated phrase.
+ *
+ * The same three-way agreement `applyAttemptTake` depends on, with the phrase in
+ * place of the melody: `echo.phrase` is what the synth played, what the aligner
+ * scores against, and what the interval ledger reads its steps from. The
+ * *ledger* is the same one recall writes to — see `recordDrillAttempt` — which
+ * is the whole point of the drill: the numbers it teaches are the numbers it
+ * reads back when choosing the next phrase.
+ */
+function applyEchoTake(
+  notes: readonly Note[],
+  frames: readonly PitchFrame[],
+  tuningOffsetCents: number,
+): void {
+  setState({ phase: "idle", notes: [], frames: [], playingIndex: null, message: "" });
+
+  const echo = getPracticeState().echo;
+  if (!echo) return;
+
+  if (notes.length === 0) {
+    // No stats, exactly as recall does it: an attempt the app could not hear is
+    // not evidence about the whistler, and folding it in would teach the drill
+    // that a perfectly good interval is a weakness.
+    endEchoTake("Nothing tonal in that one — have another go, a little louder or closer.");
+    return;
+  }
+
+  finishEchoAttempt({
+    notes,
+    trail: trailFromFrames(frames, tuningOffsetCents),
+    alignment: alignAttempt(notes, echo.phrase),
+  });
+}
+
+/**
+ * Score one held note.
+ *
+ * Frames only: there is no melody here and no alignment to run, just one
+ * sustained tone measured against the reference that played.
+ *
+ * **The trail is built with a zero tuning offset, and that is the load-bearing
+ * line.** The segmenter measures each take's global tuning bias and takes it out
+ * before rounding — which is exactly the bias this drill exists to report. Pass
+ * `result.tuningOffsetCents` here and a whistler who sits 40 cents sharp on
+ * every note is told they are dead on, by a machine that quietly moved the
+ * target to meet them.
+ */
+function applyHoldTake(frames: readonly PitchFrame[]): void {
+  setState({ phase: "idle", notes: [], frames: [], playingIndex: null, message: "" });
+
+  const hold = getPracticeState().hold;
+  if (!hold) return;
+
+  const score = scoreHold(trailFromFrames(frames, 0), hold.referenceMidi);
+  if (!score) {
+    endHoldTake(
+      "Nothing steady in that one — whistle the note back and hold it for a moment longer.",
+    );
+    return;
+  }
+  finishHold(score);
 }
 
 /**
@@ -998,6 +1204,10 @@ function analyze(audio: CapturedAudio, subject: string): void {
           applyTargetTake(result.notes);
         } else if (intent === "attempt") {
           applyAttemptTake(result.notes, result.frames, result.tuningOffsetCents);
+        } else if (intent === "echo") {
+          applyEchoTake(result.notes, result.frames, result.tuningOffsetCents);
+        } else if (intent === "hold") {
+          applyHoldTake(result.frames);
         } else {
           applyRangeTake(intent, result.notes);
         }

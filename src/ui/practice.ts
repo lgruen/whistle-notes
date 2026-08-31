@@ -29,6 +29,13 @@
 
 import { formatCents, midiToName } from "../notes/format.js";
 import { BUNDLED_MELODIES } from "../practice/bundled.js";
+import {
+  holdHistoryText,
+  holdScoreText,
+  holdTakeaway,
+  isDefaultRange,
+  type HoldScore,
+} from "../practice/drill.js";
 import { chordWarning, melodySummary, type MidiMelody } from "../practice/midi.js";
 import { isUsableRange, rangeSpanSemitones, type WhistleRange } from "../practice/range.js";
 import {
@@ -57,7 +64,12 @@ import {
   type PracticeTarget,
   type TargetDraft,
 } from "../practice/target.js";
-import type { PracticeState, RangeStep, RecallAttempt } from "../practice/store.js";
+import type {
+  EchoSession,
+  PracticeState,
+  RangeStep,
+  RecallAttempt,
+} from "../practice/store.js";
 import { drawDiffOverlay } from "./diffroll.js";
 import type { Phase } from "./state.js";
 
@@ -77,10 +89,17 @@ export interface PracticeElements {
   /** Where the built-in melodies' buttons are written. */
   starters: HTMLElement;
 
+  /* The two echo drills, which need no melody and no library. */
+  drillHold: HTMLButtonElement;
+  drillEcho: HTMLButtonElement;
+  /** The nudge towards the range check, when the drills are running on a
+   *  guessed register. Hidden once there is a measurement. */
+  drillNote: HTMLElement;
+
   detail: HTMLElement;
   detailName: HTMLElement;
   detailMeta: HTMLElement;
-  /** Where {@link EXERCISES_COMING} goes. */
+  /** Where {@link TARGET_EXERCISES} goes. */
   detailNext: HTMLElement;
   /** Starts the recall exercise on this melody. */
   detailPractice: HTMLButtonElement;
@@ -108,6 +127,43 @@ export interface PracticeElements {
   recallListens: HTMLElement;
   /** "Whistle it" — and "Stop", while the attempt is running. */
   recallWhistle: HTMLButtonElement;
+
+  /* The hold drill: hear one note, hold it back, read two numbers. One screen
+     throughout — unlike recall, the feedback here is *live*, so there is no
+     before-and-after to split. */
+  hold: HTMLElement;
+  holdBack: HTMLButtonElement;
+  holdHint: HTMLElement;
+  /** "Hear it" — and "Stop", while the reference is sounding. */
+  holdPlay: HTMLButtonElement;
+  /** The big signed readout, written by `ui/holdmeter.ts` at frame rate. */
+  holdCents: HTMLElement;
+  /** The sled the needle rides on; centred on the reference, not on a
+   *  semitone. */
+  holdNeedle: HTMLElement;
+  /** The meter's own line: "hold it there…", "too loud". */
+  holdMeterHint: HTMLElement;
+  /** "Hold it" — and "Stop", while the take is running. */
+  holdWhistle: HTMLButtonElement;
+  /** The score, as a sentence. Hidden until there is one. */
+  holdScore: HTMLElement;
+  holdTakeaway: HTMLElement;
+  /** The running averages, once there are enough holds to mean anything. */
+  holdTrend: HTMLElement;
+  /** The two ways on: the same note again, or a new one. */
+  holdAgain: HTMLButtonElement;
+  holdNext: HTMLButtonElement;
+
+  /* The phrase-echo drill, before the attempt. Shares the result screen with
+     recall — see `resultSource` — because a diff of a whistled phrase against
+     the phrase that played is the same picture either way. */
+  echo: HTMLElement;
+  echoBack: HTMLButtonElement;
+  echoHint: HTMLElement;
+  echoMeta: HTMLElement;
+  echoListen: HTMLButtonElement;
+  echoListens: HTMLElement;
+  echoWhistle: HTMLButtonElement;
 
   result: HTMLElement;
   /** The back arrow at the top; the same action as {@link resultDone}, because
@@ -188,6 +244,28 @@ export interface PracticeHandlers {
   /** Leave the exercise. */
   onCloseRecall(): void;
 
+  /* The drills. Both open from the library and neither needs a target. */
+  onOpenHold(): void;
+  onOpenEcho(): void;
+  /** Play the reference note. */
+  onHoldPlay(): void;
+  /** Start the hold take. */
+  onHoldAttempt(): void;
+  /** The same note again. */
+  onHoldAgain(): void;
+  /** A different note. */
+  onHoldNext(): void;
+  /** Play the phrase. */
+  onEchoListen(): void;
+  /** Start the echo take. */
+  onEchoAttempt(): void;
+  /** The same phrase again. */
+  onEchoRetry(): void;
+  /** A new phrase, at whatever length the ramp has reached. */
+  onEchoNext(): void;
+  /** Leave either drill. */
+  onCloseDrill(): void;
+
   onTrimDraft(end: "start" | "end"): void;
   /** Cut the nearer end of the kept range back to one note, by index. */
   onTrimDraftTo(index: number): void;
@@ -241,14 +319,13 @@ export function rangeStepHint(range: WhistleRange | null, step: RangeStep | null
 /**
  * What the detail screen says a target is for.
  *
- * Describes the exercise in terms of what the *user* does rather than what the
- * app implements, which keeps the promise checkable and keeps it ear-first. The
- * second sentence is still a promise: the echo drills land in T4.
+ * Describes the exercises in terms of what the *user* does rather than what the
+ * app implements, which keeps the promise checkable and keeps it ear-first.
  */
-export const EXERCISES_COMING =
+export const TARGET_EXERCISES =
   "Hear this melody, then whistle it back from memory and see which notes " +
-  "drifted. Short echo drills built from the notes you keep missing are still " +
-  "to come. Nothing to read: the app plays, you answer.";
+  "drifted — or warm up by whistling along with it, with nothing counted. " +
+  "Nothing to read: the app plays, you answer.";
 
 /** Escape anything that goes into a string-built row. A target's name is the
  *  user's own text, and it goes straight into `innerHTML`. */
@@ -412,6 +489,94 @@ export function recallHint(listens: number): string {
 export function listenLabel(listens: number, playing: boolean): string {
   if (playing) return "Stop";
   return listens === 0 ? "Listen" : "Listen again";
+}
+
+/* ── The drills ───────────────────────────────────────────────────────── */
+
+/**
+ * The nudge towards the range check, or nothing.
+ *
+ * Shown rather than enforced. Requiring a measurement before the first drill
+ * would put a two-take setup step between a new user and the first thing in this
+ * mode that works without a library — and the default register is a perfectly
+ * good guess for most people. So the drills run, and the screen says what it is
+ * assuming.
+ */
+export const DRILL_RANGE_NUDGE =
+  "These will play in a middle register until you measure where you actually " +
+  "whistle — it takes two short takes.";
+
+export function drillRangeNote(range: WhistleRange | null): string {
+  return isDefaultRange(range) ? DRILL_RANGE_NUDGE : "";
+}
+
+/**
+ * The hold drill's instruction, before and after the reference has been heard.
+ *
+ * The second sentence of the first one is the entire exercise: the bar is
+ * centred on *the note that played*, not on the nearest note to whatever comes
+ * out, which is what makes it a target rather than a tuner.
+ */
+export const HOLD_HINT_FIRST =
+  "Tap Hear it, listen, then whistle that note back and hold it. The bar shows " +
+  "how far off you are while you hold — steady beats close.";
+
+/** After at least one play: the same rule without the lesson. */
+export const HOLD_HINT_HEARD =
+  "Whistle it back and hold it steady. Hear it again first if you like.";
+
+export function holdHint(plays: number): string {
+  return plays === 0 ? HOLD_HINT_FIRST : HOLD_HINT_HEARD;
+}
+
+/** "Hear it" the first time, "Hear it again" after — "Stop" while it sounds. */
+export function holdPlayLabel(plays: number, playing: boolean): string {
+  if (playing) return "Stop";
+  return plays === 0 ? "Hear it" : "Hear it again";
+}
+
+/**
+ * What the drill says about a hold, in two lines: the measurement, then the one
+ * thing worth doing about it.
+ *
+ * Both come from `practice/drill.ts` rather than being written here, because
+ * they are claims about numbers rather than about layout — and because the
+ * boundary between "12 cents sharp" and "dead on" is the kind of judgement that
+ * belongs next to the arithmetic that produced it.
+ */
+export function holdResultLines(score: HoldScore): { score: string; takeaway: string } {
+  return { score: holdScoreText(score), takeaway: holdTakeaway(score) };
+}
+
+/**
+ * The echo drill's instruction.
+ *
+ * "Made up on the spot" is load-bearing copy, not colour: it tells the user that
+ * there is nothing here to have practised or half-remembered, which is exactly
+ * what makes a wrong note in this drill mean something different from a wrong
+ * note in recall.
+ */
+export const ECHO_HINT_FIRST =
+  "A short phrase, made up on the spot. Listen, then whistle it straight back. " +
+  "Whatever register is comfortable is fine.";
+
+export const ECHO_HINT_HEARD =
+  "Listen again as often as you like, then whistle it straight back.";
+
+export function echoHint(listens: number): string {
+  return listens === 0 ? ECHO_HINT_FIRST : ECHO_HINT_HEARD;
+}
+
+/**
+ * How long the phrase is, and nothing else about it.
+ *
+ * A note count is not a prompt — it says how much there is to hold on to, the
+ * way the library says a melody is five notes long, and it is the one number
+ * that makes the difficulty ramp visible as something the user is climbing.
+ */
+export function echoMetaText(echo: EchoSession): string {
+  const count = echo.phrase.length;
+  return `${count} note${count === 1 ? "" : "s"}.`;
 }
 
 /* ── Recall: the verdict strip ────────────────────────────────────────── */
@@ -619,9 +784,6 @@ export function createPracticeView(
    * button opened the microphone (or the speaker) is the only way out of it.
    */
   elements.recallBack.addEventListener("click", () => handlers.onCloseRecall());
-  elements.resultBack.addEventListener("click", () => handlers.onCloseRecall());
-  elements.resultDone.addEventListener("click", () => handlers.onCloseRecall());
-  elements.resultRetry.addEventListener("click", () => handlers.onRetry());
 
   elements.recallListen.addEventListener("click", () => {
     if (elements.recallListen.dataset.running === "true") handlers.onStopListen();
@@ -631,6 +793,61 @@ export function createPracticeView(
   elements.recallWhistle.addEventListener("click", () => {
     if (elements.recallWhistle.dataset.running === "true") handlers.onStopCapture();
     else handlers.onAttempt();
+  });
+
+  /* ── The drills ─────────────────────────────────────────────────────
+   *
+   * Same running/stop rule as everywhere else: whichever button opened the
+   * microphone (or the speaker) is the only way out of it.
+   */
+  elements.drillHold.addEventListener("click", () => handlers.onOpenHold());
+  elements.drillEcho.addEventListener("click", () => handlers.onOpenEcho());
+
+  elements.holdBack.addEventListener("click", () => handlers.onCloseDrill());
+  elements.holdPlay.addEventListener("click", () => {
+    if (elements.holdPlay.dataset.running === "true") handlers.onStopListen();
+    else handlers.onHoldPlay();
+  });
+  elements.holdWhistle.addEventListener("click", () => {
+    if (elements.holdWhistle.dataset.running === "true") handlers.onStopCapture();
+    else handlers.onHoldAttempt();
+  });
+  elements.holdAgain.addEventListener("click", () => handlers.onHoldAgain());
+  elements.holdNext.addEventListener("click", () => handlers.onHoldNext());
+
+  elements.echoBack.addEventListener("click", () => handlers.onCloseDrill());
+  elements.echoListen.addEventListener("click", () => {
+    if (elements.echoListen.dataset.running === "true") handlers.onStopListen();
+    else handlers.onEchoListen();
+  });
+  elements.echoWhistle.addEventListener("click", () => {
+    if (elements.echoWhistle.dataset.running === "true") handlers.onStopCapture();
+    else handlers.onEchoAttempt();
+  });
+
+  /**
+   * Which exercise the result screen is showing.
+   *
+   * One screen, two sources: a diff of what you whistled against what played is
+   * the same picture whether the melody came out of the library or out of the
+   * phrase generator, and duplicating the canvas, the strip, the chip
+   * highlighting and the sentences would be two of everything to keep in step.
+   * What differs is only where the three buttons go, so that is the only thing
+   * this indirection carries.
+   */
+  let resultOwner: "recall" | "echo" | null = null;
+
+  elements.resultBack.addEventListener("click", () => {
+    if (resultOwner === "echo") handlers.onCloseDrill();
+    else handlers.onCloseRecall();
+  });
+  elements.resultDone.addEventListener("click", () => {
+    if (resultOwner === "echo") handlers.onEchoNext();
+    else handlers.onCloseRecall();
+  });
+  elements.resultRetry.addEventListener("click", () => {
+    if (resultOwner === "echo") handlers.onEchoRetry();
+    else handlers.onRetry();
   });
 
   /**
@@ -733,7 +950,7 @@ export function createPracticeView(
 
   // Written once: it is a fixed sentence, and keeping it in TypeScript rather
   // than in `index.html` is what lets a test hold the ear-first promise to it.
-  elements.detailNext.textContent = EXERCISES_COMING;
+  elements.detailNext.textContent = TARGET_EXERCISES;
 
   let renderedTargets: readonly PracticeTarget[] | null = null;
   let renderedMelodies: readonly MidiMelody[] | null = null;
@@ -747,16 +964,26 @@ export function createPracticeView(
   return {
     render(state, phase, playing = false) {
       const recall = state.screen === "recall" ? state.recall : null;
+      const echo = state.screen === "echo" ? state.echo : null;
+      const hold = state.screen === "hold" ? state.hold : null;
+      // The attempt the shared result screen is showing, and whose exercise it
+      // belongs to. Recall first only because a screen can only be one of them.
+      const shown = recall?.attempt ?? echo?.attempt ?? null;
+      resultOwner = recall?.attempt ? "recall" : echo?.attempt ? "echo" : null;
+
       elements.library.hidden = state.screen !== "library";
       elements.detail.hidden = state.screen !== "target";
       elements.range.hidden = state.screen !== "range";
       elements.draft.hidden = state.screen !== "draft";
       elements.midi.hidden = state.screen !== "midi";
+      elements.hold.hidden = hold === null;
       // One `screen`, two elements: before the attempt and after it. The first
       // one is where the ear-first rule has to hold, and keeping it a separate
-      // element is what lets a test say so.
+      // element is what lets a test say so. The echo drill splits the same way,
+      // and shares the second half.
       elements.recall.hidden = !recall || recall.attempt !== null;
-      elements.result.hidden = !recall || recall.attempt === null;
+      elements.echo.hidden = !echo || echo.attempt !== null;
+      elements.result.hidden = shown === null;
 
       // A take that is going to become a target. Both conditions, for the same
       // reason the range buttons check both: `recordingTarget` is practice
@@ -821,6 +1048,13 @@ export function createPracticeView(
         ? "Measure your range again"
         : "Measure your whistling range";
 
+      // The drills need no melody, so their card is a fixture of the library —
+      // but they do need a register, and this is where the app admits it is
+      // guessing at one.
+      const drillNote = drillRangeNote(state.range);
+      elements.drillNote.textContent = drillNote;
+      elements.drillNote.hidden = drillNote === "";
+
       const selected = state.targets.find((target) => target.id === state.selectedId) ?? null;
       if (selected) {
         const summary = targetSummary(selected);
@@ -877,25 +1111,105 @@ export function createPracticeView(
         // button that started it. Leaving mid-take would walk away from an open
         // microphone with nothing on screen that gets back to a Stop.
         elements.recallBack.disabled = attempting || analysing;
+      }
 
-        if (recall.attempt && recall.attempt !== renderedAttempt) {
-          renderedAttempt = recall.attempt;
+      /* ── The hold drill ────────────────────────────────────────────────
+       *
+       * One screen, because the feedback is live: there is no "before" to keep
+       * clean of the answer, since the answer is a bar that moves while you
+       * whistle. The score underneath appears when the take ends and is
+       * replaced, not added to, by the next one.
+       */
+      if (hold) {
+        const holding = hold.recording && phase === "recording";
+        const analysing = hold.recording && phase === "analyzing";
+
+        elements.holdHint.textContent = holdHint(hold.plays);
+        elements.holdPlay.dataset.running = String(playing);
+        elements.holdPlay.classList.toggle("is-playing", playing);
+        elements.holdPlay.textContent = holdPlayLabel(hold.plays, playing);
+        elements.holdPlay.disabled = holding || analysing;
+
+        elements.holdWhistle.dataset.running = String(holding);
+        elements.holdWhistle.classList.toggle("is-recording", holding);
+        elements.holdWhistle.textContent = holding ? "Stop" : "Hold it";
+        // The reference has to have *stopped* before the take starts: there is
+        // no echo cancellation anywhere in this app, so a note still sounding
+        // would be measured as part of the hold.
+        elements.holdWhistle.disabled = analysing || playing;
+        elements.holdBack.disabled = holding || analysing;
+
+        const lines = hold.score ? holdResultLines(hold.score) : null;
+        elements.holdScore.textContent = lines?.score ?? "";
+        elements.holdScore.hidden = lines === null;
+        elements.holdTakeaway.textContent = lines?.takeaway ?? "";
+        elements.holdTakeaway.hidden = lines === null;
+        const trend = holdHistoryText(state.stats.holds);
+        elements.holdTrend.textContent = trend;
+        elements.holdTrend.hidden = trend === "";
+        // Both ways on appear only once there is something to move on *from*,
+        // so the screen before the first hold is one instruction and two
+        // buttons.
+        elements.holdAgain.hidden = lines === null;
+        elements.holdNext.hidden = lines === null;
+        elements.holdAgain.disabled = holding || analysing;
+        elements.holdNext.disabled = holding || analysing;
+      }
+
+      /* ── The echo drill ────────────────────────────────────────────── */
+      if (echo) {
+        const attempting = echo.recording && phase === "recording";
+        const analysing = echo.recording && phase === "analyzing";
+
+        elements.echoHint.textContent = echoHint(echo.listens);
+        elements.echoMeta.textContent = echoMetaText(echo);
+        const heard = listenCountText(echo.listens);
+        elements.echoListens.textContent = heard;
+        elements.echoListens.hidden = heard === "";
+
+        elements.echoListen.dataset.running = String(playing);
+        elements.echoListen.classList.toggle("is-playing", playing);
+        elements.echoListen.textContent = listenLabel(echo.listens, playing);
+        elements.echoListen.disabled = attempting || analysing;
+
+        elements.echoWhistle.dataset.running = String(attempting);
+        elements.echoWhistle.classList.toggle("is-recording", attempting);
+        elements.echoWhistle.textContent = attempting ? "Stop" : "Whistle it back";
+        elements.echoWhistle.disabled = analysing || playing;
+        elements.echoBack.disabled = attempting || analysing;
+      }
+
+      /* ── The shared result screen ─────────────────────────────────── */
+      if (shown) {
+        if (shown !== renderedAttempt) {
+          renderedAttempt = shown;
           highlighted = null;
           overlay = overlayModel({
-            alignment: recall.attempt.alignment,
-            attempt: recall.attempt.notes,
-            trail: recall.attempt.trail,
+            alignment: shown.alignment,
+            attempt: shown.notes,
+            trail: shown.trail,
           });
           elements.resultStrip.innerHTML = verdictStripHtml(verdictChips(overlay));
           elements.resultSummary.textContent =
-            `${scoreText(recall.attempt.alignment)}. ` +
-            transpositionText(recall.attempt.alignment.transposition);
-          elements.resultTakeaway.textContent = takeawayText(recall.attempt.alignment);
+            `${scoreText(shown.alignment)}. ` + transpositionText(shown.alignment.transposition);
+          // The drill adds what the ramp just did. Not *instead* of the
+          // takeaway — which jump went wrong is the whole point of a three-note
+          // phrase — but after it, so a phrase getting longer reads as progress
+          // rather than as the app being erratic.
+          elements.resultTakeaway.textContent = [
+            takeawayText(shown.alignment),
+            resultOwner === "echo" ? echo?.ramp ?? "" : "",
+          ]
+            .filter((line) => line !== "")
+            .join(" ");
+          elements.resultRetry.textContent =
+            resultOwner === "echo" ? "Same one again" : "Try again";
+          elements.resultDone.textContent = resultOwner === "echo" ? "Next one" : "Done";
         }
         // Every render, not only on a new attempt: the canvas is sized by the
         // stylesheet, so a rotation or a tab switch leaves the last bitmap
         // stretched until something redraws it.
-        if (recall.attempt) drawOverlay();
+        drawOverlay();
       } else {
         renderedAttempt = null;
         overlay = null;
