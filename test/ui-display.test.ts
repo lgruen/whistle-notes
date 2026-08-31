@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { midiToHz, midiToName, type Note, type PitchFrame } from "../src/dsp/index.js";
+import { playbackSchedule, scheduleDuration } from "../src/audio/synth.js";
 import { formatClock } from "../src/ui/live.js";
 import { durationClass, medianDuration, sequenceText } from "../src/ui/notelist.js";
 import { rollMidiRange, rollSpanSec } from "../src/ui/pianoroll.js";
@@ -76,6 +77,43 @@ describe("the copyable sequence line", () => {
   it("marks rests, but never before the first note", () => {
     const notes = [note(84, 0, 0.3, 0.5), note(86, 0.8, 0.3, 0.2), note(88, 1.2, 0.3, 0.05)];
     expect(sequenceText(notes, 0)).toBe("C6 / D6 E6");
+  });
+});
+
+describe("playback scheduling", () => {
+  it("preserves musical gaps and compresses hesitations", () => {
+    const notes = [
+      note(72, 0, 0.4),
+      note(74, 0.6, 0.4), // 0.2 s gap: musical, kept
+      note(76, 4.0, 0.4), // 3.0 s gap: a pause for thought, compressed
+    ];
+    const schedule = playbackSchedule(notes, 0);
+    expect(schedule[0].startSec).toBeCloseTo(0, 10);
+    expect(schedule[1].startSec).toBeCloseTo(0.6, 10); // 0.4 played + 0.2 waited
+    expect(schedule[2].startSec).toBeCloseTo(1.5, 10); // ...then 0.4 + 0.5, not 3.0
+    expect(scheduleDuration(schedule)).toBeCloseTo(1.9, 10);
+  });
+
+  it("drops leading silence: the first note always starts at zero", () => {
+    expect(playbackSchedule([note(72, 12, 0.4)], 0)[0].startSec).toBe(0);
+  });
+
+  it("floors note length so a very short note is a note, not a click", () => {
+    expect(playbackSchedule([note(72, 0, 0.01)], 0)[0].durationSec).toBeCloseTo(0.09, 10);
+  });
+
+  it("plays at the display octave", () => {
+    expect(playbackSchedule([note(96, 0, 0.4)], -2)[0].midi).toBe(72);
+    expect(playbackSchedule([note(96, 0, 0.4)], 0)[0].midi).toBe(96);
+  });
+
+  it("never goes backwards, whatever the gaps", () => {
+    const notes = [note(72, 0, 0.3), note(74, 9, 0.3), note(76, 9.4, 0.3)];
+    const schedule = playbackSchedule(notes, 0);
+    for (let i = 1; i < schedule.length; i++) {
+      expect(schedule[i].startSec).toBeGreaterThanOrEqual(schedule[i - 1].startSec);
+    }
+    expect(scheduleDuration([])).toBe(0);
   });
 });
 

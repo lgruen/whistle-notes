@@ -315,6 +315,60 @@ button {
   font-size: 0.8rem;
 }
 
+/* ── Staff ──────────────────────────────────────────────────────────── */
+
+.staff {
+  padding: 0.5rem 0.25rem;
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.staff-svg {
+  display: block;
+  overflow: visible;
+}
+
+.staff-line,
+.staff-ledger {
+  stroke: var(--text-dim);
+  stroke-width: 1;
+  opacity: 0.7;
+}
+
+.staff-head {
+  fill: var(--text);
+}
+
+.staff-sharp {
+  stroke: var(--text);
+  stroke-width: 1.2;
+  stroke-linecap: round;
+}
+
+.staff-label {
+  fill: var(--text-dim);
+  font: 9px system-ui, sans-serif;
+  text-anchor: middle;
+}
+
+.staff-clef {
+  fill: var(--text-dim);
+  font: 8px system-ui, sans-serif;
+}
+
+.staff-note.is-playing .staff-head {
+  fill: var(--accent);
+}
+
+.staff-note.is-playing .staff-sharp {
+  stroke: var(--accent);
+}
+
+.staff-note.is-playing .staff-label {
+  fill: var(--accent);
+  font-weight: 700;
+}
+
 /* ── Dock ───────────────────────────────────────────────────────────── */
 
 .dock {
@@ -354,6 +408,15 @@ button {
 .btn-record.is-recording {
   background: var(--danger);
   color: #fff;
+}
+
+.btn-play {
+  flex: none;
+  min-width: 6rem;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  font-size: 1rem;
 }
 
 .footer {

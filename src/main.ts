@@ -1,7 +1,7 @@
 import { registerSW } from "virtual:pwa-register";
 import FFT from "fft.js";
 import "./app.css";
-import { transcribe, type Note } from "./dsp/index.js";
+import { transcribe, midiToName, type Note } from "./dsp/index.js";
 import {
   CaptureAborted,
   CaptureError,
@@ -12,11 +12,21 @@ import {
   startRecording,
   stopRecording,
 } from "./audio/capture.js";
+import { isPlaying, startPlayback, stopPlayback } from "./audio/synth.js";
+import { transposeMidi } from "./notes/format.js";
 import { createControls } from "./ui/controls.js";
 import { createLiveView } from "./ui/live.js";
-import { initNoteList, renderNoteList } from "./ui/notelist.js";
+import { highlightNoteList, initNoteList, renderNoteList } from "./ui/notelist.js";
 import { drawPianoRoll, resetRollRange } from "./ui/pianoroll.js";
-import { applyResult, getState, setState, setTranspose, subscribe, type AppState } from "./ui/state.js";
+import { highlightStaff, renderStaff } from "./ui/staff.js";
+import {
+  applyResult,
+  getState,
+  setState,
+  setTranspose,
+  subscribe,
+  type AppState,
+} from "./ui/state.js";
 import { invalidatePalette } from "./ui/theme.js";
 
 function element<T extends HTMLElement>(id: string): T {
@@ -27,6 +37,7 @@ function element<T extends HTMLElement>(id: string): T {
 
 const canvas = element<HTMLCanvasElement>("roll");
 const noteListElement = element("notelist");
+const staffElement = element("staff");
 
 const live = createLiveView({
   note: element("live-note"),
@@ -41,21 +52,30 @@ initNoteList(noteListElement);
 const controls = createControls(
   {
     record: element<HTMLButtonElement>("record"),
+    play: element<HTMLButtonElement>("play"),
     transpose: element("transpose"),
     message: element("message"),
   },
   {
     onRecord: beginRecording,
     onStopRecord: finishRecording,
-    onTranspose: setTranspose,
+    onPlay: beginPlayback,
+    onStopPlay: stopPlayback,
+    onTranspose: (shift) => {
+      // The synth schedules pitches up front, so a transposed melody cannot be
+      // changed mid-flight; stopping is honest and instant.
+      if (isPlaying()) stopPlayback();
+      setTranspose(shift);
+    },
   },
 );
 
-/* ── Rendering (cold path) ──────────────────────────────────────────────
+/* ── Rendering (cold path) ────────────────────────────────────────────
  *
- * Every state change re-renders, but the chip list is rebuilt only when its
- * *content* changed — there is no point re-running `innerHTML` because a phase
- * flag moved.
+ * Every state change re-renders, but the two expensive views — the chip list
+ * and the SVG staff — are rebuilt only when their *content* changed. Playback
+ * moves the highlight several times a second, and rebuilding an SVG at that
+ * rate to move one fill colour would be silly.
  */
 
 let renderedNotes: readonly Note[] | null = null;
@@ -68,6 +88,10 @@ function render(state: AppState): void {
     renderedNotes = state.notes;
     renderedTranspose = state.transpose;
     renderNoteList(noteListElement, state.notes, state.transpose);
+    renderStaff(state.notes, staffElement, state.transpose, state.playingIndex);
+  } else {
+    highlightNoteList(noteListElement, state.playingIndex);
+    highlightStaff(staffElement, state.playingIndex);
   }
 
   // While recording, the readout and the roll belong to the animation loop —
@@ -82,15 +106,16 @@ function render(state: AppState): void {
     live: false,
   });
 
+  const playing = state.playingIndex === null ? null : state.notes[state.playingIndex];
   switch (state.phase) {
     case "analyzing":
       live.show("…", "Listening back…");
       break;
     case "result":
       live.show(
-        "—",
+        playing ? midiToName(transposeMidi(playing.midi, state.transpose)) : "—",
         state.notes.length > 0
-          ? `${state.notes.length} note${state.notes.length === 1 ? "" : "s"} heard.`
+          ? `${state.notes.length} note${state.notes.length === 1 ? "" : "s"} — tap Play to hear them.`
           : "Nothing tonal in that take.",
       );
       break;
@@ -104,11 +129,11 @@ function render(state: AppState): void {
 
 subscribe(render);
 
-/* ── The hot path ──────────────────────────────────────────────────────
+/* ── The hot path ─────────────────────────────────────────────────────
  *
  * One rAF loop, alive only while the microphone is open. It reads the frame
  * buffer that `capture.ts` fills directly and writes to one text node and one
- * canvas. Nothing here calls setState — see the note in state.ts.
+ * canvas. Nothing here calls setState — see the note at the top of state.ts.
  */
 
 let loopHandle = 0;
@@ -137,7 +162,7 @@ function stopLoop(): void {
   loopHandle = 0;
 }
 
-/* ── Transitions ───────────────────────────────────────────────────── */
+/* ── Transitions ──────────────────────────────────────────────────────── */
 
 /**
  * Called straight from the Record tap, with nothing awaited first: the audio
@@ -145,7 +170,9 @@ function stopLoop(): void {
  * `await` before it would end the gesture. See `audio/capture.ts`.
  */
 function beginRecording(): void {
+  stopPlayback();
   resetRollRange();
+
   const started = startRecording();
 
   setState({
@@ -204,14 +231,28 @@ function finishRecording(): void {
   });
 }
 
-/* ── Environment ───────────────────────────────────────────────────── */
+function beginPlayback(): void {
+  const state = getState();
+  if (state.notes.length === 0) return;
+
+  startPlayback(state.notes, state.transpose, {
+    onIndex: (index) => setState({ playingIndex: index }),
+    onEnd: () => setState({ playing: false, playingIndex: null }),
+  });
+  // After `startPlayback`, which internally stops any previous run and would
+  // otherwise clear the flag we just set.
+  setState({ playing: true, playingIndex: null });
+}
+
+/* ── Environment ──────────────────────────────────────────────────────── */
 
 window.addEventListener("resize", () => {
-  // The canvas backing store is sized in device pixels from a CSS-pixel box, so
-  // it has to hear about an orientation change; the palette cache might also be
-  // stale after a theme switch.
+  // The staff's viewBox is measured in CSS pixels and the canvas backing store
+  // is sized in device pixels, so both need to hear about an orientation
+  // change; the palette cache might also be stale after a theme switch.
   invalidatePalette();
   const state = getState();
+  renderStaff(state.notes, staffElement, state.transpose, state.playingIndex);
   if (state.phase !== "recording") {
     drawPianoRoll(canvas, {
       frames: state.frames,
