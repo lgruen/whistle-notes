@@ -87,7 +87,8 @@ describe("scoops into a note", () => {
     expect(wrong, failures.join("; ")).toBeLessThanOrEqual(2);
   });
 
-  it("survives a fuzz of random melodies with random scoops", () => {
+  // 120 synthesized melodies push this well past the default 5 s on CI runners.
+  it("survives a fuzz of random melodies with random scoops", { timeout: 30_000 }, () => {
     // Isolated notes are the easy case: the interesting failure was a scoop in
     // the *middle* of a melody, where the phantom lands between two real notes
     // and looks entirely plausible. 120 seeded melodies, each note approached
