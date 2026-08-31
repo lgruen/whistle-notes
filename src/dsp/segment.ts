@@ -60,12 +60,44 @@ function medianOfTail(values: readonly number[], count: number): number {
   return median(values.length <= count ? values : values.slice(values.length - count));
 }
 
-/** Nearest-rank percentile, `p` in 0..100. */
-function percentile(values: readonly number[], p: number): number {
-  if (values.length === 0) return NaN;
-  const sorted = [...values].sort((a, b) => a - b);
-  const rank = Math.min(sorted.length - 1, Math.max(0, Math.round((p / 100) * (sorted.length - 1))));
-  return sorted[rank];
+/**
+ * Nearest-rank percentile, `p` in 0..100. **Reorders `values` in place.**
+ *
+ * Quickselect rather than a sort, and the in-place signature rather than a
+ * copy, because this is the hot loop of the whole module: stage A asks for one
+ * percentile per frame over a window of a few hundred samples, so a sort here
+ * costs more than everything else in segmentation put together. Selecting the
+ * one rank that is wanted is linear, and reusing the caller's scratch buffer
+ * keeps a per-frame allocation out of it too — measured on a 27-second take,
+ * 48 ms down to 8.
+ */
+function percentileInPlace(values: number[], p: number): number {
+  const n = values.length;
+  if (n === 0) return NaN;
+  const rank = Math.min(n - 1, Math.max(0, Math.round((p / 100) * (n - 1))));
+
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const pivot = values[(lo + hi) >> 1];
+    let i = lo;
+    let j = hi;
+    while (i <= j) {
+      while (values[i] < pivot) i++;
+      while (values[j] > pivot) j--;
+      if (i <= j) {
+        const swap = values[i];
+        values[i] = values[j];
+        values[j] = swap;
+        i++;
+        j--;
+      }
+    }
+    if (rank <= j) hi = j;
+    else if (rank >= i) lo = i;
+    else break;
+  }
+  return values[rank];
 }
 
 function clamp01(x: number): number {
@@ -152,7 +184,7 @@ function nearestPercentile(
 
     values.length = 0;
     for (let q = left; q < right; q++) values.push(level[sample[q]]);
-    out[i] = percentile(values, p);
+    out[i] = percentileInPlace(values, p);
   }
   return out;
 }
