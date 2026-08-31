@@ -49,6 +49,11 @@ export const DEFAULT_CONFIG: DspConfig = {
     // anomalously silent frame.
     noiseFloorPercentile: 20,
     noiseFloorWindowSec: 3,
+    // A shapeless frame more than 12 dB over the floor is an *event*, not the
+    // room: the same margin a note needs to start is the margin past which
+    // "background" stops being a plausible description. Wide enough that the
+    // ordinary few-dB breathing of room tone is all still evidence.
+    backgroundAboveFloorDb: 12,
     // Asymmetric by design — see VoicingConfig. Starting a note demands
     // 12 dB over the floor; holding one needs only 6.
     onsetAboveFloorDb: 12,

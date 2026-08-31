@@ -203,6 +203,41 @@ describe("segmentation", () => {
     expect(MIDIS(run(base, { gapMergeMs: 400 }))).toEqual([88, 88]);
   });
 
+  it("drops a distant blip instead of gluing it onto the previous note", () => {
+    // A 60 ms speck is below `minNoteMs` and has to go somewhere — but "absorb
+    // into a neighbour" only makes sense for a neighbour that is adjacent. This
+    // one is 600 ms of unmistakable silence away. Merging them used to hand the
+    // survivor the *blip's* pitch (F6 for a note that was whistled at E6),
+    // stretch it across the silence, and then feed the attack trim a span three
+    // quarters of which was nothing at all.
+    const signal = sequence(
+      [
+        { midi: 88, durSec: 0.3, gapSec: 0.6 },
+        { midi: 89, durSec: 0.06 },
+      ],
+      { leadInSec: 0.5, tailSec: 0.5 },
+    );
+    const notes = run(signal);
+
+    expect(NOTE_NAMES(notes)).toEqual(["E6"]);
+    expect(notes[0].startSec).toBeCloseTo(0.5, 1);
+    expect(notes[0].durationSec).toBeLessThan(0.4);
+    expect(Math.abs(notes[0].centsOffset)).toBeLessThan(15);
+  });
+
+  it("still absorbs a short note into the neighbour it is actually touching", () => {
+    // The other half of the same rule: contiguity is the test, not distance in
+    // the note list. A wobble that briefly reads a semitone off in the middle
+    // of a held note is adjacent to it, and belongs to it.
+    const signal = sequence([{ midi: 88, durSec: 0.8, vibratoCents: 45, vibratoHz: 5 }], {
+      leadInSec: 0.3,
+      tailSec: 0.3,
+    });
+    const notes = run(signal, { minNoteMs: 250 });
+    expect(NOTE_NAMES(notes)).toEqual(["E6"]);
+    expect(notes[0].durationSec).toBeGreaterThan(0.7);
+  });
+
   it("finds no notes in silence or breath", () => {
     expect(run(sequence([], { leadInSec: 2 }))).toEqual([]);
     for (const type of ["pink", "white"] as const) {

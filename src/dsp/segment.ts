@@ -23,9 +23,15 @@
 import { hzToMidiFloat, midiToHz, midiToName, nearestNote } from "./tuning.js";
 import type { DspConfig, Note, NoteFlags, PitchFrame } from "./types.js";
 
-/** Minimum number of unvoiced frames before their percentile is believed as a
- *  noise floor. Fewer than this and one unlucky frame sets the threshold. */
+/** Minimum number of background frames before their percentile is believed as
+ *  a noise floor. Fewer than this and one unlucky frame sets the threshold. */
 const MIN_FLOOR_SAMPLES = 8;
+
+/** How many times the global background estimate is refined by discarding the
+ *  samples that turned out to be too loud to be background. Two passes is
+ *  enough to walk down from a sample set containing a burst to the true floor;
+ *  more never moved the answer on any signal tried. */
+const FLOOR_REFINE_PASSES = 3;
 
 /** What one pass of segmentation concluded. */
 export interface SegmentationResult {
@@ -77,13 +83,62 @@ function spread(values: readonly number[]): number {
 // Stage A — voicing
 // ---------------------------------------------------------------------------
 
-interface Voicing {
-  /** Per frame: did it pass the level-independent tone tests? */
+export interface Voicing {
+  /** Per frame: does the spectrum look like a single pure tone? Level plays no
+   *  part in this, and neither does the warm-up. */
+  tonal: boolean[];
+  /** Per frame: `tonal` and past the microphone warm-up — eligible to be
+   *  voiced if the level agrees. */
   candidate: boolean[];
-  /** Per frame: the adaptive noise floor in dBFS that applied there. */
+  /** Per frame: the frames whose level was believed as evidence about the
+   *  background. Exposed for instrumentation. */
+  background: boolean[];
+  /** Per frame: the adaptive noise floor in dBFS that applied there.
+   *  `-Infinity` where there was no evidence for one. */
   floorDb: number[];
   /** Per frame: the final voicing decision, hysteresis included. */
   voiced: boolean[];
+}
+
+/**
+ * Estimate the level the room sits at when nobody is whistling.
+ *
+ * The subtle part is deciding *which* frames are evidence. "Not tone-shaped"
+ * is necessary but nowhere near sufficient: a cough, a door, a chair scrape and
+ * a hand over the microphone all fail the shape tests at 40 dB above the room,
+ * and letting them into the sample set drags the floor up to their level for as
+ * long as they stay inside the trailing window — which blanks the transcription
+ * *after* the event, seconds later, where nobody would think to look for the
+ * cause. The microphone warm-up is the same bug wearing a different hat: a take
+ * that starts whistling at t=0 has its opening frames excluded from voicing,
+ * and if those frames then count as "background" the floor is set to the level
+ * of the whistle itself and the whole take disappears.
+ *
+ * So background evidence has to be *quiet as well as shapeless*, which is
+ * circular — quiet relative to what? — and the way out of the circle is to
+ * iterate. Start from the naive estimate, throw away everything more than
+ * `backgroundAboveFloorDb` above it, re-estimate, repeat. Loud events are a
+ * minority of any real recording, so the first estimate is already in the right
+ * basin and the refinement only sharpens it. When it converges on nothing
+ * (a file that is wall-to-wall whistling), the honest answer is that there is
+ * no evidence for a floor at all, and the level gate stands down rather than
+ * inventing one.
+ */
+function backgroundFloor(level: number[], tonal: boolean[], cfg: DspConfig): number {
+  const v = cfg.voicing;
+  const shapeless: number[] = [];
+  for (let i = 0; i < level.length; i++) if (!tonal[i]) shapeless.push(level[i]);
+  if (shapeless.length < MIN_FLOOR_SAMPLES) return -Infinity;
+
+  let floor = percentile(shapeless, v.noiseFloorPercentile);
+  for (let pass = 0; pass < FLOOR_REFINE_PASSES; pass++) {
+    const kept = shapeless.filter((l) => l <= floor + v.backgroundAboveFloorDb);
+    if (kept.length < MIN_FLOOR_SAMPLES) break;
+    const next = percentile(kept, v.noiseFloorPercentile);
+    if (Math.abs(next - floor) < 0.01) break;
+    floor = next;
+  }
+  return floor;
 }
 
 /**
@@ -102,45 +157,78 @@ interface Voicing {
  * is what stops a note that fades as the whistler runs out of breath from
  * being chopped into a stutter of fragments, while still requiring conviction
  * before a new note is allowed to begin.
+ *
+ * The floor itself is a percentile of the *nearest* background frames rather
+ * than of a fixed trailing window. Those two agree wherever the recording has
+ * background to spare, and where it does not the window simply reaches further
+ * out instead of falling off a cliff onto a global estimate. That matters more
+ * than it sounds: a floor that jumps tens of dB between one frame and the next
+ * takes `isTrueSilence` with it, and a spurious "silence" is what turns one
+ * held note into a stutter of re-articulated ones.
  */
 function computeVoicing(frames: PitchFrame[], cfg: DspConfig, framePeriod: number): Voicing {
   const v = cfg.voicing;
   const n = frames.length;
+  const level = frames.map((f) => f.bandRmsDb);
 
-  const candidate = frames.map(
+  const tonal = frames.map(
     (f) =>
       f.hz !== null &&
       f.hz > 0 &&
-      // The microphone's first moments are not signal: gain control settles,
-      // and on some platforms the voice-processing chain is still deciding
-      // what the room sounds like.
-      f.tSec >= v.warmupSec &&
       f.clarity >= v.minClarity &&
       f.snrDb >= v.minSnrDb &&
       f.peakToSecondDb >= v.minPeakToSecondDb,
   );
+  // The microphone's first moments are not signal: gain control settles, and on
+  // some platforms the voice-processing chain is still deciding what the room
+  // sounds like. Frames in there may not become notes — but a *loud* one is not
+  // thereby evidence about the room either, which is why the warm-up is applied
+  // here and not to `tonal` above.
+  const candidate = tonal.map((t, i) => t && frames[i].tSec >= v.warmupSec);
 
-  // Everything not tone-shaped is a sample of the background.
-  const backgroundLevels: number[] = [];
-  for (let i = 0; i < n; i++) if (!candidate[i]) backgroundLevels.push(frames[i].bandRmsDb);
-  const globalFloor =
-    backgroundLevels.length >= MIN_FLOOR_SAMPLES
-      ? percentile(backgroundLevels, v.noiseFloorPercentile)
-      : // No usable background anywhere in the signal — a file that is wall to
-        // wall whistling, or three frames long. There is no evidence for a
-        // floor, so decline to gate on level rather than invent one.
-        -Infinity;
-
-  const windowFrames = Math.max(1, Math.round(v.noiseFloorWindowSec / framePeriod));
-  const floorDb = new Array<number>(n);
-  const trailing: number[] = [];
+  const globalFloor = backgroundFloor(level, tonal, cfg);
+  const background = new Array<boolean>(n).fill(false);
+  const backgroundIndices: number[] = [];
   for (let i = 0; i < n; i++) {
-    trailing.length = 0;
-    for (let j = Math.max(0, i - windowFrames); j < i; j++) {
-      if (!candidate[j]) trailing.push(frames[j].bandRmsDb);
+    if (!tonal[i] && level[i] <= globalFloor + v.backgroundAboveFloorDb) {
+      background[i] = true;
+      backgroundIndices.push(i);
     }
-    floorDb[i] =
-      trailing.length >= MIN_FLOOR_SAMPLES ? percentile(trailing, v.noiseFloorPercentile) : globalFloor;
+  }
+
+  const floorDb = new Array<number>(n).fill(-Infinity);
+  if (backgroundIndices.length >= MIN_FLOOR_SAMPLES) {
+    const windowFrames = Math.max(1, Math.round(v.noiseFloorWindowSec / framePeriod));
+    const values: number[] = [];
+    let lo = 0;
+    let hi = 0;
+    for (let i = 0; i < n; i++) {
+      // Trailing window [i - windowFrames, i), as a half-open range of
+      // positions into `backgroundIndices`. Both pointers only ever advance,
+      // so the whole loop is linear.
+      while (lo < backgroundIndices.length && backgroundIndices[lo] < i - windowFrames) lo++;
+      while (hi < backgroundIndices.length && backgroundIndices[hi] < i) hi++;
+
+      // Starved of trailing evidence, reach outwards for the nearest frames in
+      // either direction rather than swapping in a different estimator. The
+      // sample set then changes by at most one frame from here to the next, so
+      // the floor moves continuously.
+      let left = lo;
+      let right = hi;
+      let count = right - left;
+      while (count < MIN_FLOOR_SAMPLES && (left > 0 || right < backgroundIndices.length)) {
+        const distanceLeft = left > 0 ? i - backgroundIndices[left - 1] : Infinity;
+        const distanceRight =
+          right < backgroundIndices.length ? backgroundIndices[right] - i : Infinity;
+        if (distanceLeft <= distanceRight) left--;
+        else right++;
+        count++;
+      }
+
+      values.length = 0;
+      for (let p = left; p < right; p++) values.push(level[backgroundIndices[p]]);
+      floorDb[i] = percentile(values, v.noiseFloorPercentile);
+    }
   }
 
   const voiced = new Array<boolean>(n).fill(false);
@@ -159,7 +247,19 @@ function computeVoicing(frames: PitchFrame[], cfg: DspConfig, framePeriod: numbe
     }
   }
 
-  return { candidate, floorDb, voiced };
+  return { tonal, candidate, background, floorDb, voiced };
+}
+
+/**
+ * The voicing decision on its own, for instrumentation.
+ *
+ * Not part of the app-facing API — `index.ts` does not re-export it — but the
+ * adaptive floor is the one part of this pipeline whose failures are invisible
+ * in the output (they show up as notes that are simply *missing*), so the tests
+ * need to be able to look at it directly rather than inferring it.
+ */
+export function voicingTrace(frames: PitchFrame[], cfg: DspConfig, sampleRate: number): Voicing {
+  return computeVoicing(frames, cfg, cfg.analysis.hopSize / sampleRate);
 }
 
 // ---------------------------------------------------------------------------
@@ -509,16 +609,37 @@ function mergeDropouts(
   return current;
 }
 
-/** Absorb or discard notes too short to have been whistled deliberately. */
+/**
+ * Absorb or discard notes too short to have been whistled deliberately.
+ *
+ * "Absorb into a neighbour" only makes sense for a neighbour that is actually
+ * adjacent. A 60 ms blip half a second away across an unmistakable silence is
+ * not a fragment of the note before it — merging the two would stretch one note
+ * over the rest, hand the survivor the *blip's* pitch, feed the attack trim a
+ * span three quarters of which is silence, and swallow the rest in between. So
+ * the same contiguity rule that governs dropout merging governs this: close in
+ * time, and no silence in between. A blip that fails it is simply dropped,
+ * which is what "too short to have been deliberate" meant in the first place.
+ */
 function resolveShortNotes(
   notes: Measured[],
   context: FrameContext,
+  voicing: Voicing,
   cfg: DspConfig,
   framePeriod: number,
 ): Measured[] {
   const s = cfg.segment;
   const minSec = s.minNoteMs / 1000;
   const mergeSt = (2 * s.toleranceCents) / 100;
+
+  /** Are these two notes adjacent enough for one to be part of the other? */
+  const contiguous = (a: Measured, b: Measured): boolean => {
+    const [first, second] = a.startIndex < b.startIndex ? [a, b] : [b, a];
+    const gapFrames = second.startIndex - first.endIndex - 1;
+    if (gapFrames <= 0) return true;
+    if (gapFrames * framePeriod * 1000 > s.gapMergeMs) return false;
+    return !isTrueSilence(first.endIndex + 1, second.startIndex - 1, context.frames, voicing, cfg);
+  };
 
   let current = notes;
   for (;;) {
@@ -542,6 +663,7 @@ function resolveShortNotes(
     let best = -1;
     let bestDistance = Infinity;
     for (const c of candidates) {
+      if (!contiguous(current[c], target)) continue;
       const distance = Math.abs(current[c].midiFloat - target.midiFloat);
       if (distance <= mergeSt && distance < bestDistance) {
         bestDistance = distance;
@@ -696,7 +818,7 @@ export function segmentNotes(
   // G — gaps and lengths. Dropout merging runs twice: absorbing a short note
   // can leave two same-pitch neighbours newly adjacent.
   measured = mergeDropouts(measured, context, voicing, cfg, framePeriod);
-  measured = resolveShortNotes(measured, context, cfg, framePeriod);
+  measured = resolveShortNotes(measured, context, voicing, cfg, framePeriod);
   measured = mergeDropouts(measured, context, voicing, cfg, framePeriod);
 
   // H — global tuning.

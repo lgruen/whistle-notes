@@ -147,8 +147,17 @@ export interface VoicingConfig {
   minSnrDb: number;
   /** Minimum `PitchFrame.peakToSecondDb`. */
   minPeakToSecondDb: number;
-  /** Percentile of unvoiced `bandRmsDb` taken as the noise floor. */
+  /** Percentile of background `bandRmsDb` taken as the noise floor. */
   noiseFloorPercentile: number;
+  /** How far above the floor a frame that fails the shape tests may still sit
+   *  and count as *evidence about the background*, in dB.
+   *
+   *  Without this the estimate has no defence against loud shapeless events: a
+   *  cough, a door or a chair scrape fails every tone test at 40 dB over the
+   *  room, and admitting it drags the floor up to its level for as long as it
+   *  stays inside the trailing window — silencing the transcription seconds
+   *  *after* the noise, where the cause is invisible. */
+  backgroundAboveFloorDb: number;
   /** Trailing span used to estimate that floor, in seconds. Adaptive because
    *  a quiet room and a café differ by more than any fixed threshold. */
   noiseFloorWindowSec: number;
