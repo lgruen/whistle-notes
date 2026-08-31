@@ -240,7 +240,16 @@ function resetTakeState(): void {
  * statement of the tap handler, with no `await` before it.
  */
 export async function startRecording(): Promise<void> {
-  if (recording) return;
+  // Not a silent no-op, and this is defence in depth rather than politeness.
+  // There is one microphone and one take, and every screen disables its own way
+  // in while one is running — but the caller that slips through does not merely
+  // fail to start a second take: it *re-points* whatever it was going to do
+  // with the audio onto the take already in flight, so a phrase-echo attempt
+  // could be scored against a range check somebody else's screen started.
+  // Refusing loudly is the only answer that cannot be mistaken for success.
+  if (recording) {
+    throw new CaptureError("A take is already running — stop it before starting another.");
+  }
   const mine = ++session;
 
   // Before the context is published, before the first await: see resetTakeState.

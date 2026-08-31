@@ -505,6 +505,7 @@ function mountPractice(): {
     echo: null,
     follow: null,
     recordingTarget: false,
+    midiReading: false,
     message: "",
     storageError: null,
   };
@@ -1473,11 +1474,15 @@ describe("the result screen, shared by both echo exercises", () => {
     expect(el.recall.hidden).toBe(true);
     expect(el.resultRetry.textContent).toBe("Try again");
     expect(el.resultDone.textContent).toBe("Done");
+    // The back arrow goes where the button under it goes, and here that is the
+    // melody this attempt was at.
+    expect(el.resultBack.textContent).toBe("\u2190 Melody");
 
     el.resultRetry.click();
     el.resultDone.click();
+    el.resultBack.click();
     expect(handlers.onRetry).toHaveBeenCalledTimes(1);
-    expect(handlers.onCloseRecall).toHaveBeenCalledTimes(1);
+    expect(handlers.onCloseRecall).toHaveBeenCalledTimes(2);
     expect(handlers.onEchoRetry).not.toHaveBeenCalled();
   });
 
@@ -1491,6 +1496,10 @@ describe("the result screen, shared by both echo exercises", () => {
     expect(el.echo.hidden).toBe(true);
     expect(el.resultRetry.textContent).toBe("Same one again");
     expect(el.resultDone.textContent).toBe("Next one");
+    // ...and the arrow does not offer to go back to a melody: there is no
+    // melody. The phrase came out of the generator, and the way back is the
+    // library the drill was opened from.
+    expect(el.resultBack.textContent).toBe("\u2190 Drills");
     // The takeaway is still there — which jump went wrong is the point of a
     // three-note phrase — with the ramp after it.
     expect(el.resultTakeaway.textContent).toMatch(/one more note next time/);

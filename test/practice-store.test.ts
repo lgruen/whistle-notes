@@ -38,6 +38,9 @@ const STATS_KEY = "whistle-notes:practice-stats:v1";
 interface FakeStorage extends Storage {
   /** Reject every write from here on, the way a full quota does. */
   jam(): void;
+  /** Accept writes again — for one key, or for all of them. Two keys can be in
+   *  different states, which is the whole point of `refusedKeys`. */
+  unjam(key?: string): void;
   /** What is actually stored, bypassing any jam. */
   peek(key: string): string | null;
 }
@@ -45,6 +48,7 @@ interface FakeStorage extends Storage {
 function fakeStorage(initial: Record<string, string> = {}): FakeStorage {
   const map = new Map(Object.entries(initial));
   let jammed = false;
+  const allowed = new Set<string>();
   return {
     get length() {
       return map.size;
@@ -54,11 +58,16 @@ function fakeStorage(initial: Record<string, string> = {}): FakeStorage {
     key: (index: number) => [...map.keys()][index] ?? null,
     removeItem: (key: string) => void map.delete(key),
     setItem: (key: string, value: string) => {
-      if (jammed) throw new Error("QuotaExceededError");
+      if (jammed && !allowed.has(key)) throw new Error("QuotaExceededError");
       map.set(key, value);
     },
     jam: () => {
       jammed = true;
+      allowed.clear();
+    },
+    unjam: (key?: string) => {
+      if (key === undefined) jammed = false;
+      else allowed.add(key);
     },
     peek: (key: string) => map.get(key) ?? null,
   };
@@ -825,6 +834,41 @@ describe("storage that will not cooperate", () => {
     expect(parseTarget(JSON.parse(storage.peek(KEY) ?? "{}").targets[0])?.name).toBe("kept");
 
     store.clearStorageError();
+    expect(store.getPracticeState().storageError).toBeNull();
+  });
+
+  it("keeps saying so while either document is still being refused", async () => {
+    // One line on screen about two independent keys, which is the trap: a
+    // successful write of the *stats* used to clear a notice about the
+    // *library*, and after an attempt that is within seconds. The notice is
+    // about a condition — something on this device is not being saved — so it
+    // stands until nothing is failing.
+    const store = await loadStore();
+    const saved = target("Tron", [84, 86, 88], 1);
+    store.addTarget(saved);
+
+    storage.jam();
+    store.addTarget(target("lost", [86], 2));
+    expect(store.getPracticeState().storageError).toBe(store.STORAGE_ERROR_MESSAGE);
+
+    // The library is still jammed; the stats write below is the one that used
+    // to clear the line.
+    storage.unjam(STATS_KEY);
+    store.recordPracticeAttempt(
+      saved.id,
+      saved.notes,
+      alignAttempt(
+        saved.notes.map((note) => ({ midi: note.midi, centsOffset: 0, durationSec: 0.4 })),
+        saved.notes,
+      ),
+      9,
+    );
+    expect(store.getPracticeState().storageError).toBe(store.STORAGE_ERROR_MESSAGE);
+
+    // ...and it goes when the library writes again, without anybody dismissing
+    // anything.
+    storage.unjam();
+    store.addTarget(target("kept", [88], 3));
     expect(store.getPracticeState().storageError).toBeNull();
   });
 

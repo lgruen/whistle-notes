@@ -271,6 +271,16 @@ export interface PracticeState {
   /** Whether a take is being recorded *into a draft* (rather than for the
    *  range check). Cleared the moment the notes arrive. */
   recordingTarget: boolean;
+  /**
+   * Whether a MIDI file is being read right now.
+   *
+   * The read is asynchronous — `File.arrayBuffer()` — and what it produces
+   * *navigates*: to the part picker, or straight to a draft. So the file input
+   * has to be shut while one is in flight, or two taps queue two screens and
+   * the second lands on top of the first. The same flag the record button's
+   * `recordingTarget` is, for the same reason.
+   */
+  midiReading: boolean;
   /** Progress or feedback for the screen on show. */
   message: string;
   /** Set when a write was refused. Visible, and never cleared silently. */
@@ -351,6 +361,7 @@ let state: PracticeState = {
   echo: null,
   follow: null,
   recordingTarget: false,
+  midiReading: false,
   message: "",
   storageError: null,
 };
@@ -403,18 +414,36 @@ function write(key: string, document: unknown): boolean {
   }
 }
 
+/**
+ * Keys whose most recent write was refused.
+ *
+ * `storageError` is one line on screen about two independent documents, and
+ * that is the trap: a successful write of *either* key used to clear it. So a
+ * library that could not be saved was announced once and then silently
+ * un-announced by the next attempt, which writes the *stats* — and after every
+ * attempt, that is within seconds. The notice has to mean "something on this
+ * device is not being saved", so it stands until nothing is failing.
+ */
+const refusedKeys = new Set<string>();
+
+/** Write one key and return the state of *all* of them, as a sentence or
+ *  `null`. See {@link refusedKeys}. */
+function persist(key: string, document: unknown): string | null {
+  if (write(key, document)) refusedKeys.delete(key);
+  else refusedKeys.add(key);
+  return refusedKeys.size > 0 ? STORAGE_ERROR_MESSAGE : null;
+}
+
 function persistLibrary(next: Pick<PracticeState, "targets" | "range">): string | null {
-  return write(LIBRARY_KEY, {
+  return persist(LIBRARY_KEY, {
     version: LIBRARY_VERSION,
     targets: next.targets,
     range: next.range,
-  })
-    ? null
-    : STORAGE_ERROR_MESSAGE;
+  });
 }
 
 function persistStats(stats: PracticeStats): string | null {
-  return write(STATS_KEY, statsToJson(stats)) ? null : STORAGE_ERROR_MESSAGE;
+  return persist(STATS_KEY, statsToJson(stats));
 }
 
 /* ── Navigation ───────────────────────────────────────────────────────── */
@@ -477,7 +506,17 @@ export function beginRangeStep(step: RangeStep): void {
   setPracticeState({ screen: "range", rangeStep: step, message: "" });
 }
 
-export function endRangeStep(message = ""): void {
+/**
+ * One end of the range check is over without producing a note.
+ *
+ * `step` is the end it was about, and passing it is what lets a failure arrive
+ * *late* — after the user has already tapped the other end — without cancelling
+ * the take now running. Clearing `rangeStep` under a live microphone would put
+ * a Stop button back to "Low note ✓" over an open one; the message would be
+ * about a take nobody is waiting for either way.
+ */
+export function endRangeStep(message = "", step?: RangeStep): void {
+  if (step !== undefined && state.rangeStep !== null && state.rangeStep !== step) return;
   setPracticeState({ rangeStep: null, message });
 }
 
@@ -485,7 +524,15 @@ export function setPracticeMessage(message: string): void {
   setPracticeState({ message });
 }
 
-/** Acknowledge a storage failure. The only way the notice ever goes away. */
+/**
+ * Acknowledge a storage failure.
+ *
+ * Dismisses the line on screen; it comes straight back on the next refused
+ * write, because {@link refusedKeys} is what decides whether there is anything
+ * to say and this does not touch it. Deliberately so — the notice is about a
+ * condition, not about an event, and a user who has read it once should not
+ * have to keep reading it while they finish the session.
+ */
 export function clearStorageError(): void {
   if (state.storageError !== null) setPracticeState({ storageError: null });
 }
@@ -512,7 +559,13 @@ export function endTargetTake(message = ""): void {
 
 /** Open the draft screen on a melody that has just arrived. */
 export function beginDraft(draft: TargetDraft): void {
-  setPracticeState({ screen: "draft", draft, recordingTarget: false, message: "" });
+  setPracticeState({
+    screen: "draft",
+    draft,
+    recordingTarget: false,
+    midiReading: false,
+    message: "",
+  });
 }
 
 /** Replace the draft with an edited copy. Every trim, shift and keystroke. */
@@ -538,7 +591,18 @@ export function discardDraft(message = ""): void {
 
 /** Show the parts of a MIDI file that has just been read. */
 export function showMidiPicker(pick: MidiPick): void {
-  setPracticeState({ screen: "midi", midi: pick, draft: null, message: "" });
+  setPracticeState({ screen: "midi", midi: pick, draft: null, midiReading: false, message: "" });
+}
+
+/** A file has been handed to the reader. See {@link PracticeState.midiReading}. */
+export function beginMidiRead(): void {
+  setPracticeState({ midiReading: true, message: "" });
+}
+
+/** The read is over, however it went. Idempotent, because the caller cannot
+ *  always tell whether the result was still wanted by the time it arrived. */
+export function endMidiRead(message = ""): void {
+  setPracticeState({ midiReading: false, message });
 }
 
 /**
@@ -587,8 +651,10 @@ export function removeTarget(id: string): void {
   if (!state.targets.some((target) => target.id === id)) return;
   const targets = state.targets.filter((target) => target.id !== id);
   const stats = forgetTarget(state.stats, id);
-  const libraryError = persistLibrary({ targets, range: state.range });
-  const statsError = persistStats(stats);
+  // Both documents, then one answer: `persist` tracks refusals per key, so the
+  // second call already accounts for the first.
+  persistLibrary({ targets, range: state.range });
+  const storageError = persistStats(stats);
   setPracticeState({
     targets,
     stats,
@@ -598,7 +664,7 @@ export function removeTarget(id: string): void {
     // nothing to score.
     recall: state.recall?.targetId === id ? null : state.recall,
     follow: state.follow?.targetId === id ? null : state.follow,
-    storageError: libraryError ?? statsError,
+    storageError,
   });
 }
 

@@ -5,8 +5,10 @@ import {
   FOLLOW_TAIL_SEC,
   appendFollowPoint,
   followDone,
+  followGapSec,
   followModel,
 } from "../src/practice/follow.js";
+import { VOICES, voiceReleaseSec } from "../src/audio/synth.js";
 import type { TrailPoint } from "../src/practice/recall.js";
 
 /**
@@ -44,6 +46,25 @@ describe("followModel", () => {
     expect(model.spanSec).toBeCloseTo(last.endSec + FOLLOW_TAIL_SEC, 9);
     expect(followDone(last.endSec, model)).toBe(false);
     expect(followDone(model.spanSec, model)).toBe(true);
+  });
+
+  it("leaves room for the release of whichever voice is playing it", () => {
+    // 50 ms was chosen against the triangle's 30 ms release and then inherited
+    // by the supersaw's 150 — five times longer than the silence it was given,
+    // so two repeated short notes came out as one note with a bulge in it and
+    // the melody being whistled along to had a note missing.
+    for (const voice of VOICES) {
+      const release = voiceReleaseSec(voice);
+      expect(followGapSec(release), voice).toBeGreaterThanOrEqual(release);
+      expect(followGapSec(release), voice).toBeGreaterThanOrEqual(FOLLOW_GAP_SEC);
+    }
+    // The floor still holds for a voice that falls silent instantly, and a
+    // nonsense release cannot collapse the gap to nothing.
+    expect(followGapSec(0)).toBe(FOLLOW_GAP_SEC);
+    expect(followGapSec(Number.NaN)).toBe(FOLLOW_GAP_SEC);
+    // ...and it is the gap the layout actually uses.
+    const wide = followModel([{ midi: 84, durSec: 0.1 }, { midi: 84, durSec: 0.1 }], followGapSec(0.15));
+    expect(wide.notes[1].startSec - wide.notes[0].endSec).toBeCloseTo(0.15, 9);
   });
 
   it("gives the plot air above and below, and never zooms in past an octave", () => {

@@ -227,15 +227,35 @@ type TakeIntent =
   | "transcribe" | RangeStep | "target" | "attempt" | "hold" | "echo" | "follow";
 ```
 
-It is **read once, when the analysis is scheduled**, so a mode switch or a fresh
-tap mid-analysis cannot redirect a take already in flight. Every failure path
-(start refused, session interrupted, no audio captured, segmenter crash) routes
-by intent through `practiceTakeFailed`, because the transcriber's message line is
-not on screen in practice mode — and each of those store calls also clears the
-flag the screen uses to decide whether a Stop button belongs over an open
-microphone. If you add a new kind of take, add an arm here; do not fork the
-record path — and add a `TAKE_SUBJECTS` entry, which is exhaustive over the
-intents so a new one has to say what it is about.
+The variable answers exactly one question — **what is the microphone open for
+right now** — and it is *passed down* from the two functions that end a take
+(`finishRecording` and the interruption handler) rather than read further along.
+`analyze` takes an `intent` parameter for that reason: two frames pass between
+the call and the work, and reading the module variable there routed an imported
+file by whatever the last take had been. The first import after any practice
+take overwrote the measured range, or wrote a practice-history row about a
+melody nobody whistled, or vanished into a screen that was not showing.
+
+Every failure path (start refused, session interrupted, no audio captured,
+segmenter crash) routes by intent through `practiceTakeFailed`, because the
+transcriber's message line is not on screen in practice mode — and each of those
+store calls also clears the flag the screen uses to decide whether a Stop button
+belongs over an open microphone. Its last arm narrows to `RangeStep` through an
+annotation, so a seventh intent added without an arm of its own fails to compile
+rather than being reported as a failed range check forever. If you add a new
+kind of take, add an arm here; do not fork the record path — and add a
+`TAKE_SUBJECTS` entry, which is exhaustive over the intents so a new one has to
+say what it is about.
+
+**One take, three refusals.** There is one microphone, and a second take started
+over a running one would not start a second take — it would re-point the new
+intent onto the audio already being captured, so an echo drill's attempt could
+be scored against somebody's range check. So: every screen disables its own way
+in while a take runs (including the library and the detail screen, which are
+still on screen while an exercise opened from them records), `beginRecording`
+returns early if one is running, and `startRecording` throws rather than
+returning quietly. `test/main-routing.test.ts` drives the real wiring against
+stubbed globals and holds all of it.
 
 `"follow"` is the one arm that never reaches `analyze`: `finishRecording` drops
 its samples outright, because the warm-up scores nothing and a minute of FFTs
@@ -266,6 +286,20 @@ Adding the per-attempt history to the stats document **did not bump its
 version**, deliberately: the field is additive, a build that predates it ignores
 it, and a bump would have made that build discard the lifetime counts as well.
 Losing the recent rows is a disappointment; losing a year of practice is not.
+
+`storageError` is one line about two documents, so it tracks which *keys* are
+refusing (`refusedKeys`) rather than being set and cleared per write. Otherwise
+a library that could not be saved was announced once and then un-announced by
+the next stats write — which, after an attempt, is within seconds.
+
+**Known limitation: two tabs are last-writer-wins.** Each store loads its
+documents once at import and writes whole documents thereafter, so a second tab
+open on the same profile overwrites the first tab's practice history with its
+own — silently, and with no `storage` listener to notice. It is a single-user
+practice app on a phone, where a second tab is not a normal thing to have, and
+the fix (listen for `storage`, reload, merge two histories that both advanced)
+is a merge policy rather than a listener. Written down rather than fixed; if it
+ever *is* fixed, the merge is the hard half.
 
 ### `src/practice/` is an island too
 

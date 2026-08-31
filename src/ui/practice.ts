@@ -36,7 +36,7 @@ import {
   isDefaultRange,
   type HoldScore,
 } from "../practice/drill.js";
-import { followModel } from "../practice/follow.js";
+import { followGapSec, followModel } from "../practice/follow.js";
 import { chordWarning, melodySummary, type MidiMelody } from "../practice/midi.js";
 import { isUsableRange, rangeSpanSemitones, type WhistleRange } from "../practice/range.js";
 import {
@@ -72,7 +72,7 @@ import type {
   RangeStep,
   RecallAttempt,
 } from "../practice/store.js";
-import type { Voice } from "../audio/synth.js";
+import { voiceReleaseSec, type Voice } from "../audio/synth.js";
 import { VOICE_LABELS, otherVoice } from "./controls.js";
 import { drawDiffOverlay } from "./diffroll.js";
 import { drawFollowRoll } from "./followroll.js";
@@ -827,8 +827,27 @@ export function createPracticeView(
    */
   let armedDelete: string | null = null;
 
+  /**
+   * Whether a take is running or being analysed, as of the last render.
+   *
+   * The one-way-out rule every exercise screen already follows — while a take
+   * runs, the button that started it is the only enabled control — applies to
+   * the library and the detail screen too, and it did not used to. Walking off
+   * to the hold drill mid-take left an open microphone with no Stop anywhere on
+   * screen; tapping "Whistle it" on a target re-pointed the take in flight onto
+   * the recall exercise; and starting a *second* take during the analysing
+   * window stranded it behind `finishRecording`'s phase gate.
+   *
+   * Kept here as well as on the buttons because the two list-shaped controls —
+   * the target list and the starter melodies — are delegated, so their rows
+   * come and go and a disabled attribute alone is a thing to remember to set on
+   * every row every render. This is the check that cannot be forgotten.
+   */
+  let busy = false;
+
   // Delegated, because the list is rebuilt on every library change.
   elements.targetList.addEventListener("click", (event) => {
+    if (busy) return;
     const button = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-target]");
     const id = button?.getAttribute("data-target");
     if (id) handlers.onSelect(id);
@@ -1003,6 +1022,7 @@ export function createPracticeView(
   // a constant of this build.
   elements.starters.innerHTML = BUNDLED_MELODIES.map(starterRowHtml).join("");
   elements.starters.addEventListener("click", (event) => {
+    if (busy) return;
     const id = (event.target as HTMLElement | null)
       ?.closest<HTMLElement>("[data-bundled]")
       ?.getAttribute("data-bundled");
@@ -1084,20 +1104,47 @@ export function createPracticeView(
       elements.echo.hidden = !echo || echo.attempt !== null;
       elements.result.hidden = shown === null;
 
-      // A take that is going to become a target. Both conditions, for the same
-      // reason the range buttons check both: `recordingTarget` is practice
-      // state and `phase` belongs to the transcriber, and a stale flag must
-      // never leave a Stop button over a closed microphone.
+      /**
+       * A take is running — anywhere in the app, for anything.
+       *
+       * Not `state.recordingTarget && phase === …`: the library and the detail
+       * screen are still on screen while an exercise the user opened *from*
+       * them is recording, and every way off them either abandons an open
+       * microphone or points the take in flight at something else. So the whole
+       * of both screens is shut while any take runs, and the one control that
+       * owns the take stays live — which on the library is Record one, now
+       * reading Stop.
+       */
+      busy = phase === "recording" || phase === "analyzing";
+      // Both conditions, for the same reason the range buttons check both:
+      // `recordingTarget` is practice state and `phase` belongs to the
+      // transcriber, and a stale flag must never leave a Stop button over a
+      // closed microphone.
       const recordingDraft = state.recordingTarget && phase === "recording";
       const analysingDraft = state.recordingTarget && phase === "analyzing";
       elements.addRecord.dataset.running = String(recordingDraft);
       elements.addRecord.classList.toggle("is-recording", recordingDraft);
       elements.addRecord.textContent = recordingDraft ? "Stop" : "Record one";
-      elements.addRecord.disabled = analysingDraft;
+      elements.addRecord.disabled = analysingDraft || (busy && !recordingDraft);
       // A file picked mid-take would land on a draft screen the running
-      // microphone is about to replace.
-      elements.addMidiLabel.hidden = recordingDraft || analysingDraft;
-      elements.addMidiInput.disabled = recordingDraft || analysingDraft;
+      // microphone is about to replace — and a second file picked while the
+      // first is still being read would queue a second screen behind the first.
+      elements.addMidiLabel.hidden = busy || state.midiReading;
+      elements.addMidiInput.disabled = busy || state.midiReading;
+
+      // The rest of the library, and the detail screen: no way out of a running
+      // take except the button that started it.
+      elements.rangeButton.disabled = busy;
+      elements.drillHold.disabled = busy;
+      elements.drillEcho.disabled = busy;
+      elements.detailPractice.disabled = busy;
+      elements.detailFollow.disabled = busy;
+      elements.detailBack.disabled = busy;
+      elements.detailDelete.disabled = busy;
+      // The starter melodies are written once; the target list is rebuilt
+      // below, and both are swept after it so a row that has just appeared
+      // cannot arrive enabled.
+      for (const button of elements.starters.querySelectorAll("button")) button.disabled = busy;
 
       if (state.draft) {
         const draft = state.draft;
@@ -1138,6 +1185,7 @@ export function createPracticeView(
         renderedTargets = state.targets;
         elements.targetList.innerHTML = state.targets.map(targetRowHtml).join("");
       }
+      for (const button of elements.targetList.querySelectorAll("button")) button.disabled = busy;
       elements.targetList.hidden = state.targets.length === 0;
       elements.empty.hidden = state.targets.length > 0;
       const summaryText = rangeSummaryText(state.range);
@@ -1316,7 +1364,10 @@ export function createPracticeView(
         // tapped and stays there after it finishes.
         if (!follow.running) {
           drawFollowRoll(elements.followCanvas, {
-            model: followModel(follow.notes),
+            // The same layout the synth will be given when Start is tapped:
+            // one model for both, or the roll and the melody disagree about
+            // where a note is. See `followGapSec`.
+            model: followModel(follow.notes, followGapSec(voiceReleaseSec(voice))),
             trail: [],
             elapsedSec: null,
           });
@@ -1358,6 +1409,10 @@ export function createPracticeView(
           elements.resultRetry.textContent =
             resultOwner === "echo" ? "Same one again" : "Try again";
           elements.resultDone.textContent = resultOwner === "echo" ? "Next one" : "Done";
+          // The back arrow goes where the button under it goes, so it has to
+          // say so: there is no melody behind an echo drill's result — it came
+          // out of the phrase generator and the way back is the library.
+          elements.resultBack.textContent = resultOwner === "echo" ? "← Drills" : "← Melody";
         }
         // Every render, not only on a new attempt: the canvas is sized by the
         // stylesheet, so a rotation or a tab switch leaves the last bitmap

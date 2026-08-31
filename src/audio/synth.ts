@@ -142,6 +142,20 @@ const SUPERSAW_TRIM = 0.8;
 const SUPERSAW_RELEASE_SEC = 0.15;
 
 /**
+ * How long this voice takes to fall silent, in seconds.
+ *
+ * Exported because a caller laying notes out on a timeline has to know it. The
+ * release lives *inside* a note of ordinary length (see above), so a melody
+ * with room in it never needs to think about this — but a caller choosing the
+ * silence between two notes is choosing whether a repeated note re-articulates,
+ * and that answer is five times longer for the supersaw than for the triangle.
+ * Reading the constant is the only way to be right for both.
+ */
+export function voiceReleaseSec(voice: Voice): number {
+  return voice === "supersaw" ? SUPERSAW_RELEASE_SEC : RELEASE_SEC;
+}
+
+/**
  * One gentle lowpass for the whole playback.
  *
  * Seven saws put a great deal of energy above the tenth harmonic, and on a

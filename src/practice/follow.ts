@@ -52,11 +52,28 @@ import {
  * Silence between one note and the next, as the warm-up plays it.
  *
  * Shorter than recall's 80 ms: this melody is meant to be whistled *along with*
- * rather than remembered, so it should read as a line rather than as a list. It
- * still has to be long enough for the synth's 30 ms release to close, or two
- * repeated notes are one long note — the same trap `TARGET_GAP_SEC` documents.
+ * rather than remembered, so it should read as a line rather than as a list.
+ * The floor, though, not the answer — see {@link followGapSec}.
  */
 export const FOLLOW_GAP_SEC = 0.05;
+
+/**
+ * The gap this warm-up needs, given how long the voice playing it takes to fall
+ * silent.
+ *
+ * 50 ms was chosen against the triangle's 30 ms release and then quietly
+ * inherited by the supersaw's 150 ms — five times longer than the silence it
+ * was given. Two repeated short notes then came out as one note with a bulge in
+ * it, and the melody somebody was whistling along to had a note missing. The
+ * release sits *inside* a note of ordinary length, so this only ever bites the
+ * short ones; a warm-up made of short notes is exactly what a MIDI import is.
+ *
+ * A parameter rather than an import, because this island may not reach into
+ * `src/audio`. `voiceReleaseSec` there is the number to pass.
+ */
+export function followGapSec(releaseSec: number): number {
+  return Math.max(FOLLOW_GAP_SEC, Number.isFinite(releaseSec) ? releaseSec : 0);
+}
 
 /**
  * How long the roll keeps running after the last note has finished.

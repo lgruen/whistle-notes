@@ -28,6 +28,7 @@ import {
   startPlayback,
   startPlaybackOverMicrophone,
   stopPlayback,
+  voiceReleaseSec,
   type PlayableNote,
 } from "./audio/synth.js";
 import { downloadWav, takeFilename } from "./audio/wav-export.js";
@@ -46,10 +47,11 @@ import { representativeMidi } from "./practice/range.js";
 import { targetPlayback, type TrailPoint } from "./practice/recall.js";
 import { alignAttempt, undoTuningCorrection } from "./practice/align.js";
 import { holdPlayback, scoreHold, HOLD_REFERENCE_SEC } from "./practice/drill.js";
-import { appendFollowPoint, followDone, followModel } from "./practice/follow.js";
+import { appendFollowPoint, followDone, followGapSec, followModel } from "./practice/follow.js";
 import {
   addTarget,
   beginDraft,
+  beginMidiRead,
   beginEcho,
   beginEchoTake,
   beginFollow,
@@ -68,6 +70,7 @@ import {
   countRecallListen,
   discardDraft,
   editDraft,
+  endMidiRead,
   endEchoTake,
   endHoldTake,
   endRangeStep,
@@ -325,9 +328,10 @@ const practice = createPracticeView(
       // Recording first, and marking the screen second. iOS only unlocks an
       // AudioContext created in the synchronous part of a gesture handler, and
       // `beginRecording` is where that happens — so nothing goes in front of
-      // it, not even a render. See `audio/capture.ts`.
-      beginRecording(step);
-      beginRangeStep(step);
+      // it, not even a render. See `audio/capture.ts`. Its answer is whether a
+      // take actually started: a screen that marks itself as recording when
+      // one did not leaves a Stop button over somebody else's microphone.
+      if (beginRecording(step)) beginRangeStep(step);
     },
     onStopCapture: finishRecording,
     onCloseRange: () => showLibrary(),
@@ -335,8 +339,7 @@ const practice = createPracticeView(
     // Same ordering rule as the range take: the microphone first, the screen
     // second, nothing awaited in between.
     onRecordTarget: () => {
-      beginRecording("target");
-      beginTargetTake();
+      if (beginRecording("target")) beginTargetTake();
     },
     onMidiFile: importMidiFile,
     onAddBundled: addBundledTarget,
@@ -349,8 +352,7 @@ const practice = createPracticeView(
     // The microphone first, the screen second, nothing awaited in between —
     // the same iOS gesture rule the other two takes follow.
     onAttempt: () => {
-      beginRecording("attempt");
-      beginRecallTake();
+      if (beginRecording("attempt")) beginRecallTake();
     },
     onRetry: retryRecall,
     onCloseRecall: () => {
@@ -372,8 +374,7 @@ const practice = createPracticeView(
     onOpenEcho: () => beginEcho(),
     onHoldPlay: playHoldReference,
     onHoldAttempt: () => {
-      beginRecording("hold");
-      beginHoldTake();
+      if (beginRecording("hold")) beginHoldTake();
     },
     onHoldAgain: retryHold,
     onHoldNext: () => {
@@ -382,8 +383,7 @@ const practice = createPracticeView(
     },
     onEchoListen: listenToPhrase,
     onEchoAttempt: () => {
-      beginRecording("echo");
-      beginEchoTake();
+      if (beginRecording("echo")) beginEchoTake();
     },
     onEchoRetry: retryEcho,
     onEchoNext: () => {
@@ -459,11 +459,37 @@ function midiFileLabel(fileName: string): string {
  * A file with exactly one part skips the picker: choosing from a list of one is
  * a tap that asks a question with no answer.
  */
+/**
+ * Which MIDI read is the current one.
+ *
+ * The read is asynchronous and what it produces *navigates* — to the part
+ * picker, or straight into a draft — so a result that arrives after the user
+ * has gone somewhere else must be dropped rather than dragging them back. It is
+ * the only path in the app that can move the screen without a tap, and it was
+ * also the only way `recordingTarget` could be cleared out from under a running
+ * take.
+ */
+let midiRead = 0;
+
 function importMidiFile(file: File): void {
   if (file.size > MAX_MIDI_BYTES) {
     setPracticeMessage("That file is far larger than any melody needs to be.");
     return;
   }
+  const mine = ++midiRead;
+  beginMidiRead();
+
+  /** Whether this read's answer is still the one the user is waiting for. */
+  const wanted = (): boolean => {
+    const phase = getState().phase;
+    return (
+      mine === midiRead &&
+      getPracticeState().screen === "library" &&
+      phase !== "recording" &&
+      phase !== "analyzing"
+    );
+  };
+
   void file.arrayBuffer().then(
     (bytes) => {
       let melodies: MidiMelody[];
@@ -471,15 +497,17 @@ function importMidiFile(file: File): void {
         melodies = midiMelodies(parseMidi(new Uint8Array(bytes)));
       } catch (error) {
         console.error("[midi] could not read the file", error);
-        setPracticeMessage(
+        if (!wanted()) return endMidiRead();
+        endMidiRead(
           error instanceof MidiError
             ? error.message
             : "That file could not be read as a MIDI file.",
         );
         return;
       }
+      if (!wanted()) return endMidiRead();
       if (melodies.length === 0) {
-        setPracticeMessage("There are no notes in that MIDI file.");
+        endMidiRead("There are no notes in that MIDI file.");
         return;
       }
       const label = midiFileLabel(file.name);
@@ -491,7 +519,7 @@ function importMidiFile(file: File): void {
     },
     (error: unknown) => {
       console.error("[midi] could not open the file", error);
-      setPracticeMessage("That file could not be opened on this device.");
+      endMidiRead(wanted() ? "That file could not be opened on this device." : "");
     },
   );
 }
@@ -589,8 +617,10 @@ function startFollowAlong(): void {
   // The microphone first and synchronously — the iOS gesture rule every take in
   // this app follows — and only then the melody, because `beginRecording` stops
   // any playback on its way in.
-  beginRecording("follow");
-  const model = followModel(follow.notes);
+  if (!beginRecording("follow")) return;
+  // The gap has to clear the release of the voice that is about to play it, or
+  // two repeated short notes are one note — see `followGapSec`.
+  const model = followModel(follow.notes, followGapSec(voiceReleaseSec(getState().voice)));
   const started = startPlaybackOverMicrophone(
     model.notes,
     {
@@ -918,9 +948,16 @@ let lastTake: CapturedAudio | null = null;
  *
  * Both modes record through the same module and the same phase machine, so the
  * one thing that differs — where the notes go afterwards — is carried here
- * rather than by duplicating the start/stop/transcribe path. Read once when the
- * analysis is scheduled, so a mode switch mid-analysis cannot redirect a take
- * that is already in flight.
+ * rather than by duplicating the start/stop/transcribe path.
+ *
+ * This variable answers one question and one only: **what is the microphone
+ * open for right now.** It is written by `beginRecording` and read by the two
+ * functions that end a running take (`finishRecording` and the interruption
+ * handler), which pass it *down* as an argument from there. Nothing further
+ * along reads it — {@link analyze} takes an intent parameter — because the
+ * value here goes stale the moment a take finishes, and a stale intent read
+ * late is not a subtle bug: it is an imported file overwriting a measured
+ * range, or writing a row of practice history about a melody nobody whistled.
  */
 type TakeIntent =
   | "transcribe"
@@ -950,7 +987,14 @@ function practiceTakeFailed(intent: Exclude<TakeIntent, "transcribe">, message: 
   else if (intent === "follow") {
     stopFollowAlong();
     setPracticeMessage(message);
-  } else endRangeStep(message);
+  } else {
+    // Named rather than left to the `else`, so `tsc` has to agree that the only
+    // thing left is a range step. A seventh intent added above without an arm
+    // here would otherwise be reported, silently and forever, as a failed range
+    // check — on a screen that is not showing.
+    const step: RangeStep = intent;
+    endRangeStep(message, step);
+  }
 }
 
 /**
@@ -963,7 +1007,14 @@ function practiceTakeFailed(intent: Exclude<TakeIntent, "transcribe">, message: 
  * time, and pretending otherwise would mean two views disagreeing about which
  * audio the app is holding.
  */
-function beginRecording(intent: TakeIntent = "transcribe"): void {
+function beginRecording(intent: TakeIntent = "transcribe"): boolean {
+  // There is one microphone, and starting a second take would not start a
+  // second take: it would re-point this intent onto the audio already being
+  // captured, so an echo drill's attempt could be scored against a range check.
+  // Every screen disables its own way in while a take runs (and `startRecording`
+  // refuses outright), which makes this the third of three answers to the same
+  // question — and the only one that runs before any state is touched.
+  if (isRecording() || getState().phase === "recording") return false;
   takeIntent = intent;
   stopPlayback();
   resetRollRange();
@@ -1021,6 +1072,7 @@ function beginRecording(intent: TakeIntent = "transcribe"): void {
       });
     },
   );
+  return true;
 }
 
 /*
@@ -1114,7 +1166,8 @@ function finishRecording(): void {
   // starts.
   lastTake = take;
   setState({ phase: "analyzing", message: "", hasRecording: true });
-  analyze(take, TAKE_SUBJECTS[takeIntent]);
+  // The intent goes with the audio, from here. See the note on `takeIntent`.
+  analyze(take, takeIntent, TAKE_SUBJECTS[takeIntent]);
 }
 
 /** What a failed analysis is *about*, per intent — the one word that makes an
@@ -1329,7 +1382,7 @@ function applyRangeTake(step: RangeStep, notes: readonly Note[]): void {
 
   const midi = representativeMidi(notes);
   if (midi === null) {
-    endRangeStep("Nothing tonal in that one — hold a single steady note and try again.");
+    endRangeStep("Nothing tonal in that one — hold a single steady note and try again.", step);
     return;
   }
   const complete = captureRangeEnd(step, midi);
@@ -1379,7 +1432,10 @@ function beginImport(file: File): void {
             `only the first ${MAX_RECORD_SEC} seconds were transcribed.`,
         });
       }
-      analyze(decoded, "that file");
+      // Always a transcription, whatever the last take through the microphone
+      // was for. An import is a file the transcriber was handed; it is not
+      // anybody's practice attempt.
+      analyze(decoded, "transcribe", "that file");
     },
     (error: unknown) => {
       console.error("[import] failed", error);
@@ -1402,11 +1458,16 @@ function beginImport(file: File): void {
  * back…" state never reaches the screen and the app looks frozen instead of
  * busy. rAF gets us to just before a paint, and the timeout puts the work in
  * the task *after* it.
+ *
+ * **`intent` is a parameter, not something read off the module.** Two frames
+ * pass between the call and the work, and the whole point of an intent is to
+ * say what *this* audio is for — so it travels with the audio. Reading it late
+ * used to mean an imported file was routed by whatever the last take had been:
+ * the first import after any practice take overwrote the measured range, or
+ * wrote a row of practice history about a melody nobody whistled, or vanished
+ * into a screen that was not showing.
  */
-function analyze(audio: CapturedAudio, subject: string): void {
-  // Read now, not in the callback: a mode switch or a fresh tap between the two
-  // must not redirect a take that is already in flight.
-  const intent = takeIntent;
+function analyze(audio: CapturedAudio, intent: TakeIntent, subject: string): void {
   requestAnimationFrame(() => {
     setTimeout(() => {
       try {
