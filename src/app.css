@@ -87,12 +87,20 @@ button {
   top: var(--safe-top);
   z-index: 2;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
   gap: 0.5rem;
   padding: 0.5rem 0.75rem;
   background: var(--bg);
   border-bottom: 1px solid var(--surface);
+}
+
+/* The brand and the octave toggle, exactly as they were before the header
+   gained a second row. */
+.header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
 }
 
 .brand {
@@ -126,6 +134,45 @@ button {
   background: var(--accent);
   color: var(--bg);
   font-weight: 700;
+}
+
+/* The mode switch. A full-width segmented control on its own row, because
+   brand + tabs + octave do not fit across a 360 px phone and shrinking the
+   brand to make them fit would change the transcriber's own header. */
+.modes {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface);
+  border-radius: 999px;
+}
+
+.modes button {
+  flex: 1;
+  min-height: 2rem;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.modes button.is-active {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+/* A tab is disabled only while the microphone or the analyser is busy, and
+   only the *other* one — see `setMode` in ui/state.ts. */
+.modes button:disabled {
+  opacity: 0.4;
+}
+
+/* The two halves of the app. `contents` so the switched-in view's children are
+   direct flex items of `.app` and neither mode pays a wrapper's layout. */
+.view {
+  display: contents;
 }
 
 /* ── Live readout (the hot path's only DOM) ─────────────────────────── */
@@ -414,6 +461,135 @@ button {
   font-weight: 700;
 }
 
+/* ── Practice ───────────────────────────────────────────────────────── */
+
+.practice-screen {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.6rem;
+}
+
+.practice-title {
+  margin: 0;
+  font-size: 1.25rem;
+  letter-spacing: -0.01em;
+}
+
+.practice-subtitle {
+  margin: 0.4rem 0 0;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+.practice-lead,
+.practice-meta,
+.practice-empty {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+.practice-empty {
+  padding: 0.9rem 0.75rem;
+  border: 1px dashed var(--surface);
+  border-radius: var(--radius);
+  text-align: center;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.card-title {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.card-body {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+
+.target-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* Rows are buttons: the whole row is the tap target, which is the only size
+   that works one-handed. Name over detail, and the detail never names a pitch
+   — see the ear-first note in ui/practice.ts. */
+.target {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  min-height: 3.25rem;
+  padding: 0.55rem 0.75rem;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--surface);
+  text-align: left;
+}
+
+.target-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.target-detail {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+
+.ghost.danger {
+  align-self: flex-start;
+  border-color: transparent;
+  color: var(--danger);
+}
+
+.ghost.danger.is-armed {
+  border-color: var(--danger);
+  font-weight: 700;
+}
+
+.range-buttons {
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* In the flow rather than in the dock: these actions belong to one screen, and
+   the dock is the transcriber's. */
+.btn-range {
+  flex: 1;
+  min-height: 3rem;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  font-size: 0.9rem;
+}
+
+.btn-range.is-done {
+  border-color: var(--accent-dim);
+  color: var(--text-dim);
+}
+
+.btn-range.is-recording {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
 /* ── Dock ───────────────────────────────────────────────────────────── */
 
 .dock {
@@ -496,6 +672,18 @@ button {
   opacity: 0;
   font-size: 0;
   cursor: pointer;
+}
+
+/* Practice mode's actions belong to whichever screen is showing, not to a
+   global bar, so the dock goes — and so does the space the body reserves for
+   it, or the page would end in a fixed strip of nothing. Both rules come after
+   the ones they override and beat them on specificity. */
+body[data-mode="practice"] .dock {
+  display: none;
+}
+
+body[data-mode="practice"] {
+  padding-bottom: calc(0.75rem + var(--safe-bottom));
 }
 
 /* ── Debug affordances ──────────────────────────────────────────────── */

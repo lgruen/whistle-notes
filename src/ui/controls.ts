@@ -17,10 +17,18 @@
  *    which is precisely where a user whose microphone was denied, missing or
  *    hijacked ends up. Without that, "no microphone" would be a dead end.
  * 4. **The status line is two lines.** See {@link statusLines}.
+ * 5. **The mode tabs lose to a running take.** Both modes drive the same
+ *    capture module, so switching mid-record would abandon an open microphone
+ *    with nothing on screen that gets back to a Stop. The store refuses it
+ *    (`setMode`); this file is where that refusal becomes visible, as a
+ *    disabled tab rather than a tap that does nothing.
  */
 
 import { OCTAVE_SHIFTS } from "../notes/format.js";
-import type { AppState } from "./state.js";
+// Type-only, deliberately. A value import from `state.js` would make every
+// importer of this module instantiate the store — which reads `localStorage`
+// at module scope — as a side effect of wanting a button.
+import type { AppState, Mode } from "./state.js";
 
 export interface ControlElements {
   record: HTMLButtonElement;
@@ -33,10 +41,13 @@ export interface ControlElements {
   save: HTMLButtonElement;
   /** Container of the octave buttons, each carrying `data-transpose`. */
   transpose: HTMLElement;
+  /** Container of the mode tabs, each carrying `data-mode`. */
+  modes: HTMLElement;
   message: HTMLElement;
 }
 
 export interface ControlHandlers {
+  onMode(mode: Mode): void;
   onRecord(): void;
   onStopRecord(): void;
   onPlay(): void;
@@ -128,12 +139,46 @@ export function createControls(
     if (OCTAVE_SHIFTS.includes(shift)) handlers.onTranspose(shift);
   });
 
+  // Unlike the octave toggle, this needs no membership check of its own: the
+  // attribute is a string we wrote in `index.html` rather than a number parsed
+  // out of one, and `setMode` rejects anything it does not recognise anyway.
+  elements.modes.addEventListener("click", (event) => {
+    const target = (event.target as HTMLElement | null)?.closest("[data-mode]");
+    const mode = target?.getAttribute("data-mode");
+    if (mode) handlers.onMode(mode as Mode);
+  });
+
   return {
     render(state) {
       phase = state.phase;
       playing = state.playing;
 
       const recordingNow = state.phase === "recording";
+
+      // The tabs first: everything below them describes the transcriber, and
+      // in practice mode most of it is not on screen to describe.
+      const busyWithAudio = recordingNow || state.phase === "analyzing";
+      for (const button of elements.modes.querySelectorAll<HTMLButtonElement>("[data-mode]")) {
+        const active = button.getAttribute("data-mode") === state.mode;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", String(active));
+        button.disabled = busyWithAudio && !active;
+      }
+
+      // The octave toggle transposes the *transcript*, and in practice mode
+      // there is no transcript on screen for it to be about. It is the one
+      // transcriber control that lives outside the switched view, so it is the
+      // one this function has to hide by hand; the dock goes with the mode in
+      // the stylesheet, and everything else is inside `#transcribe-view`.
+      elements.transpose.hidden = state.mode !== "transcribe";
+      if (state.mode !== "transcribe") {
+        // Practice mode carries its own buttons inside its own screens,
+        // because its actions are per-screen ("whistle a comfortably low
+        // note") rather than global the way Record and Import are. Nothing
+        // below this line is on screen, so nothing below it needs deciding.
+        elements.importInput.disabled = true;
+        return;
+      }
       elements.record.textContent = recordingNow ? "Stop" : "Record";
       elements.record.classList.toggle("is-recording", recordingNow);
       elements.record.disabled = state.phase === "analyzing" || state.playing;
@@ -143,11 +188,10 @@ export function createControls(
       elements.play.disabled = !playable && !state.playing;
       elements.play.hidden = !playable && !state.playing;
 
-      // Busy means the microphone is open or the analyser is running; every
-      // other phase — including `error` — can accept a file.
-      const busy = recordingNow || state.phase === "analyzing";
-      elements.importLabel.hidden = busy;
-      elements.importInput.disabled = busy;
+      // `busyWithAudio` means the microphone is open or the analyser is
+      // running; every other phase — including `error` — can accept a file.
+      elements.importLabel.hidden = busyWithAudio;
+      elements.importInput.disabled = busyWithAudio;
 
       // Only offered for a live take: an imported file is already a file, and
       // handing it back would be a button that achieves nothing.

@@ -26,62 +26,124 @@
          scrolling middle, everything that acts lives in the fixed dock at the
          bottom where a thumb actually reaches. -->
     <header class="header">
-      <span class="brand">Whistle&nbsp;Notes</span>
-      <!-- Display octave. Whistling sits one to two octaves above the treble
-           staff, so this is nearly always -1 or -2; it changes what is drawn
-           and played, never what was heard. -->
-      <div class="octave" id="transpose" role="group" aria-label="Display octave">
-        <button type="button" data-transpose="0" aria-pressed="false">0</button>
-        <button type="button" data-transpose="-1" aria-pressed="false">−1</button>
-        <button type="button" data-transpose="-2" aria-pressed="false">−2</button>
+      <div class="header-row">
+        <span class="brand">Whistle&nbsp;Notes</span>
+        <!-- Display octave. Whistling sits one to two octaves above the treble
+             staff, so this is nearly always -1 or -2; it changes what is drawn
+             and played, never what was heard. Hidden in Practice mode, where
+             there is no transcript for it to be about. -->
+        <div class="octave" id="transpose" role="group" aria-label="Display octave">
+          <button type="button" data-transpose="0" aria-pressed="false">0</button>
+          <button type="button" data-transpose="-1" aria-pressed="false">−1</button>
+          <button type="button" data-transpose="-2" aria-pressed="false">−2</button>
+        </div>
+      </div>
+      <!-- Its own row rather than a third control alongside the two above: on a
+           360 px phone brand + tabs + octave do not fit, and truncating the
+           brand to buy room would change the transcriber's own header. -->
+      <div class="modes" id="modes" role="group" aria-label="Mode">
+        <button type="button" data-mode="transcribe" aria-pressed="true">Transcribe</button>
+        <button type="button" data-mode="practice" aria-pressed="false">Practice</button>
       </div>
     </header>
 
     <main class="app">
-      <section class="live">
-        <div class="live-note" id="live-note" aria-live="off">—</div>
-        <div class="cents" aria-hidden="true">
-          <span class="cents-center"></span>
-          <span class="cents-needle" id="live-needle"></span>
+      <!-- `display: contents`, so everything inside stays a direct flex item of
+           `.app` and the transcriber's layout is exactly what it was before
+           this wrapper existed. `[hidden]` beats it, which is what makes the
+           mode switch work at all. -->
+      <div class="view" id="transcribe-view">
+        <section class="live">
+          <div class="live-note" id="live-note" aria-live="off">—</div>
+          <div class="cents" aria-hidden="true">
+            <span class="cents-center"></span>
+            <span class="cents-needle" id="live-needle"></span>
+          </div>
+          <div class="meter" aria-hidden="true">
+            <span class="meter-fill" id="live-level"></span>
+          </div>
+          <p class="hint" id="live-hint">Tap Record and whistle a melody.</p>
+          <p class="clock" id="live-time"></p>
+        </section>
+
+        <p class="message" id="message" hidden></p>
+        <!-- "You whistled a quarter-tone sharp all the way through, and here is
+             the A that implies" — shown only when the segmenter actually had to
+             correct for it. -->
+        <p class="tuning" id="tuning" hidden></p>
+
+        <canvas class="roll" id="roll" aria-label="Pitch over time"></canvas>
+        <div class="notes" id="notelist" hidden></div>
+        <div class="staff" id="staff" hidden></div>
+
+        <!-- Both of these are for whoever is *fixing* the app, so both are
+             deliberately quiet. Saving the take turns a real-world failure into
+             a file the offline harness can sweep; the panel answers "what did
+             this device actually do?", which is the question a laptop cannot. -->
+        <div class="tools">
+          <button type="button" class="ghost" id="save-wav" hidden>
+            Save recording (.wav)
+          </button>
+          <details class="debug" id="debug">
+            <summary>Debug</summary>
+            <dl class="debug-list">
+              <dt>Mic</dt>
+              <dd id="debug-audio">—</dd>
+              <dt>Frame</dt>
+              <dd id="debug-live">—</dd>
+              <dt>Result</dt>
+              <dd id="debug-result">—</dd>
+              <dt>Build</dt>
+              <dd id="debug-build">—</dd>
+            </dl>
+          </details>
         </div>
-        <div class="meter" aria-hidden="true">
-          <span class="meter-fill" id="live-level"></span>
-        </div>
-        <p class="hint" id="live-hint">Tap Record and whistle a melody.</p>
-        <p class="clock" id="live-time"></p>
-      </section>
+      </div>
 
-      <p class="message" id="message" hidden></p>
-      <!-- "You whistled a quarter-tone sharp all the way through, and here is
-           the A that implies" — shown only when the segmenter actually had to
-           correct for it. -->
-      <p class="tuning" id="tuning" hidden></p>
+      <!-- Practice mode. Ear-first: nothing on these screens writes out a note
+           the user is about to whistle. See src/ui/practice.ts. -->
+      <div class="view" id="practice-view" hidden>
+        <section class="practice-screen" id="practice-library">
+          <h2 class="practice-title">Practice</h2>
+          <p class="practice-lead">
+            By ear, always: the app plays, you whistle back, and it tells you
+            which notes drifted.
+          </p>
 
-      <canvas class="roll" id="roll" aria-label="Pitch over time"></canvas>
-      <div class="notes" id="notelist" hidden></div>
-      <div class="staff" id="staff" hidden></div>
+          <div class="card">
+            <h3 class="card-title">Your whistling range</h3>
+            <p class="card-body" id="practice-range-summary"></p>
+            <button type="button" class="ghost" id="practice-range-open"></button>
+          </div>
 
-      <!-- Both of these are for whoever is *fixing* the app, so both are
-           deliberately quiet. Saving the take turns a real-world failure into
-           a file the offline harness can sweep; the panel answers "what did
-           this device actually do?", which is the question a laptop cannot. -->
-      <div class="tools">
-        <button type="button" class="ghost" id="save-wav" hidden>
-          Save recording (.wav)
-        </button>
-        <details class="debug" id="debug">
-          <summary>Debug</summary>
-          <dl class="debug-list">
-            <dt>Mic</dt>
-            <dd id="debug-audio">—</dd>
-            <dt>Frame</dt>
-            <dd id="debug-live">—</dd>
-            <dt>Result</dt>
-            <dd id="debug-result">—</dd>
-            <dt>Build</dt>
-            <dd id="debug-build">—</dd>
-          </dl>
-        </details>
+          <h3 class="practice-subtitle">Targets</h3>
+          <div class="target-list" id="practice-targets" hidden></div>
+          <p class="practice-empty" id="practice-empty">
+            No targets yet. Recording your own, importing a MIDI file and a set
+            of built-in melodies are all coming next.
+          </p>
+        </section>
+
+        <section class="practice-screen" id="practice-target" hidden>
+          <button type="button" class="ghost" id="practice-back">← Targets</button>
+          <h2 class="practice-title" id="practice-target-name"></h2>
+          <p class="practice-meta" id="practice-target-meta"></p>
+          <p class="card-body" id="practice-target-next"></p>
+          <button type="button" class="ghost danger" id="practice-delete">Delete</button>
+        </section>
+
+        <section class="practice-screen" id="practice-range" hidden>
+          <button type="button" class="ghost" id="practice-range-done">← Practice</button>
+          <h2 class="practice-title">Your whistling range</h2>
+          <p class="practice-lead" id="practice-range-hint"></p>
+          <div class="range-buttons">
+            <button type="button" class="btn btn-range" id="practice-range-low"></button>
+            <button type="button" class="btn btn-range" id="practice-range-high"></button>
+          </div>
+          <p class="practice-meta" id="practice-range-current"></p>
+        </section>
+
+        <p class="message" id="practice-message" hidden></p>
       </div>
 
       <footer class="footer">

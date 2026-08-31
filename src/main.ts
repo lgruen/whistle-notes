@@ -19,6 +19,20 @@ import { AudioFileError, decodeAudioFile } from "./audio/decode.js";
 import { isPlaying, startPlayback, stopPlayback } from "./audio/synth.js";
 import { downloadWav, takeFilename } from "./audio/wav-export.js";
 import { a4FromOffsetCents, transposeMidi } from "./notes/format.js";
+import { representativeMidi } from "./practice/range.js";
+import {
+  beginRangeStep,
+  captureRangeEnd,
+  endRangeStep,
+  getPracticeState,
+  removeTarget,
+  selectTarget,
+  setPracticeMessage,
+  showLibrary,
+  showRangeCheck,
+  subscribePractice,
+  type RangeStep,
+} from "./practice/store.js";
 import { createControls } from "./ui/controls.js";
 import { createDebugView } from "./ui/debug.js";
 import { createLiveView, formatClock } from "./ui/live.js";
@@ -29,10 +43,12 @@ import {
   resetRollRange,
   setRollRedraw,
 } from "./ui/pianoroll.js";
+import { createPracticeView } from "./ui/practice.js";
 import { highlightStaff, renderStaff } from "./ui/staff.js";
 import {
   applyResult,
   getState,
+  setMode,
   setState,
   setTranspose,
   subscribe,
@@ -78,9 +94,11 @@ const controls = createControls(
     importInput: element<HTMLInputElement>("import-input"),
     save: element<HTMLButtonElement>("save-wav"),
     transpose: element("transpose"),
+    modes: element("modes"),
     message: element("message"),
   },
   {
+    onMode: switchMode,
     onRecord: beginRecording,
     onStopRecord: finishRecording,
     onPlay: beginPlayback,
@@ -95,6 +113,71 @@ const controls = createControls(
     },
   },
 );
+
+/* ── Practice mode ────────────────────────────────────────────────────
+ *
+ * A second store and a second view, switched by the header tabs. The two modes
+ * share the app store's `phase` and therefore the microphone: `capture.ts` is a
+ * singleton, and routing every take through the same phase machine is what
+ * makes it impossible for the two halves of the app to open it at once.
+ */
+
+const transcribeView = element("transcribe-view");
+const practiceView = element("practice-view");
+
+const practice = createPracticeView(
+  {
+    library: element("practice-library"),
+    targetList: element("practice-targets"),
+    empty: element("practice-empty"),
+    rangeSummary: element("practice-range-summary"),
+    rangeButton: element<HTMLButtonElement>("practice-range-open"),
+    detail: element("practice-target"),
+    detailName: element("practice-target-name"),
+    detailMeta: element("practice-target-meta"),
+    detailNext: element("practice-target-next"),
+    detailBack: element<HTMLButtonElement>("practice-back"),
+    detailDelete: element<HTMLButtonElement>("practice-delete"),
+    range: element("practice-range"),
+    rangeHint: element("practice-range-hint"),
+    rangeCurrent: element("practice-range-current"),
+    rangeLow: element<HTMLButtonElement>("practice-range-low"),
+    rangeHigh: element<HTMLButtonElement>("practice-range-high"),
+    rangeDone: element<HTMLButtonElement>("practice-range-done"),
+    message: element("practice-message"),
+  },
+  {
+    onSelect: selectTarget,
+    onBack: () => showLibrary(),
+    onDelete: removeTarget,
+    onOpenRange: showRangeCheck,
+    onCaptureRange: (step) => {
+      // Recording first, and marking the screen second. iOS only unlocks an
+      // AudioContext created in the synchronous part of a gesture handler, and
+      // `beginRecording` is where that happens — so nothing goes in front of
+      // it, not even a render. See `audio/capture.ts`.
+      beginRecording(step);
+      beginRangeStep(step);
+    },
+    onStopCapture: finishRecording,
+    onCloseRange: () => showLibrary(),
+  },
+);
+
+function renderPractice(): void {
+  practice.render(getPracticeState(), getState().phase);
+}
+
+subscribePractice(renderPractice);
+
+/** Leave a mode. Playback is stopped on the way out: the synth is playing the
+ *  transcript, and a transcript that is no longer on screen has no business
+ *  still making noise. */
+function switchMode(mode: AppState["mode"]): void {
+  if (getState().mode === mode) return;
+  if (isPlaying()) stopPlayback();
+  setMode(mode);
+}
 
 /* ── Rendering (cold path) ────────────────────────────────────────────
  *
@@ -163,8 +246,33 @@ function redrawRoll(): void {
 // state change. See `setRollRedraw` in ui/pianoroll.ts.
 setRollRedraw(redrawRoll);
 
+let renderedMode: AppState["mode"] | null = null;
+
 function render(state: AppState): void {
+  const modeChanged = state.mode !== renderedMode;
+  renderedMode = state.mode;
+
+  // `data-mode` is what the stylesheet uses to take the dock — and the space
+  // the body reserves for it — away in practice mode.
+  document.body.dataset.mode = state.mode;
+  transcribeView.hidden = state.mode !== "transcribe";
+  practiceView.hidden = state.mode !== "practice";
+
   controls.render(state);
+  renderPractice();
+
+  if (state.mode !== "transcribe") return;
+
+  if (modeChanged) {
+    // Everything in this view was laid out at zero size while it was hidden,
+    // so nothing below can be trusted to be still valid: the canvas's cached
+    // size is stale, and the staff's viewBox was measured against no width at
+    // all. Forcing both is a handful of milliseconds, once per tab tap.
+    invalidateRollSize();
+    renderedNotes = null;
+    renderedTranspose = NaN;
+  }
+
   renderTuning(state);
   debug.render(state);
 
@@ -254,11 +362,29 @@ function stopLoop(): void {
 let lastTake: CapturedAudio | null = null;
 
 /**
+ * What the take now running is *for*.
+ *
+ * Both modes record through the same module and the same phase machine, so the
+ * one thing that differs — where the notes go afterwards — is carried here
+ * rather than by duplicating the start/stop/transcribe path. Read once when the
+ * analysis is scheduled, so a mode switch mid-analysis cannot redirect a take
+ * that is already in flight.
+ */
+type TakeIntent = "transcribe" | RangeStep;
+let takeIntent: TakeIntent = "transcribe";
+
+/**
  * Called straight from the Record tap, with nothing awaited first: the audio
  * context inside `startRecording` only unlocks inside the gesture, and an
  * `await` before it would end the gesture. See `audio/capture.ts`.
+ *
+ * A range take clears the transcript on screen exactly like any other
+ * recording, because it *is* one: this app has one microphone and one take at a
+ * time, and pretending otherwise would mean two views disagreeing about which
+ * audio the app is holding.
  */
-function beginRecording(): void {
+function beginRecording(intent: TakeIntent = "transcribe"): void {
+  takeIntent = intent;
   stopPlayback();
   resetRollRange();
   lastTake = null;
@@ -277,7 +403,11 @@ function beginRecording(): void {
   });
   live.show("—", "Listening…");
   stopLoop();
-  loopHandle = requestAnimationFrame(loop);
+  // The loop's only job is to paint the live readout and the growing roll, and
+  // in practice mode neither is on screen. Skipping it costs nothing: the
+  // 60 s cap it also watches is enforced authoritatively inside the audio
+  // callback, which is why the loop can call itself a backstop.
+  if (intent === "transcribe") loopHandle = requestAnimationFrame(loop);
 
   void started.then(
     () => setState({ warning: processingWarning() }),
@@ -286,6 +416,17 @@ function beginRecording(): void {
       // must not overwrite whatever the app is doing now.
       if (error instanceof CaptureAborted) return;
       stopLoop();
+      if (intent !== "transcribe") {
+        // The transcriber's error phase is a screen practice mode is not
+        // showing, so the news has to go where the user is looking.
+        setState({ phase: "idle", warning: null });
+        endRangeStep(
+          error instanceof CaptureError
+            ? error.message
+            : "Could not start recording on this device.",
+        );
+        return;
+      }
       setState({
         phase: "error",
         message:
@@ -314,7 +455,19 @@ setCaptureHandlers({
     // single most useful line there is when a take comes back empty on a
     // phone, and an interruption is no reason to throw it away.
     const processing = getState().warning;
+    const wasRangeTake = takeIntent !== "transcribe";
     finishRecording();
+
+    if (wasRangeTake) {
+      // The transcriber's status line is not on screen in practice mode, so
+      // the news goes to the screen that is. When there *is* audio the
+      // analysis that follows will report on it and this stays quiet rather
+      // than writing a line the result immediately replaces.
+      if (!getState().hasRecording) {
+        setPracticeMessage("That take was interrupted before any audio arrived.");
+      }
+      return;
+    }
 
     // `hasRecording` is the honest question, and the two answers need
     // different sentences. A take that captured nothing lands on idle with no
@@ -348,6 +501,7 @@ function finishRecording(): void {
     // beats transcribing an empty buffer into a confident "no notes found"
     // about audio that was never recorded.
     setState({ phase: "idle", message: "", warning: null });
+    if (takeIntent !== "transcribe") endRangeStep("That take captured no audio.");
     return;
   }
   // Held so the debug export has something to save. One take at a time: at the
@@ -355,7 +509,34 @@ function finishRecording(): void {
   // starts.
   lastTake = take;
   setState({ phase: "analyzing", message: "", hasRecording: true });
-  analyze(take, "that take");
+  analyze(take, takeIntent === "transcribe" ? "that take" : "that note");
+}
+
+/**
+ * Turn one short "hold a comfortable note" take into half a range.
+ *
+ * The pipeline is the transcriber's, unchanged — same `transcribe()`, same
+ * segmentation, same everything — because a note held for two seconds is
+ * exactly the case it is best at, and building a second, simpler pitch path for
+ * it would be a second thing to keep honest for no gain.
+ */
+function applyRangeTake(step: RangeStep, notes: readonly Note[]): void {
+  // Back to `idle` rather than `result`: practice mode is not showing a
+  // transcript, and leaving the app in `result` would mean switching back to
+  // the transcriber to find a one-note "transcription" of a range check.
+  setState({ phase: "idle", notes: [], frames: [], playingIndex: null, message: "" });
+
+  const midi = representativeMidi(notes);
+  if (midi === null) {
+    endRangeStep("Nothing tonal in that one — hold a single steady note and try again.");
+    return;
+  }
+  const complete = captureRangeEnd(step, midi);
+  setPracticeMessage(
+    complete
+      ? `Heard ${midiToName(midi)}.`
+      : `Heard ${midiToName(midi)} — now the other end.`,
+  );
 }
 
 /**
@@ -422,13 +603,25 @@ function beginImport(file: File): void {
  * the task *after* it.
  */
 function analyze(audio: CapturedAudio, subject: string): void {
+  // Read now, not in the callback: a mode switch or a fresh tap between the two
+  // must not redirect a take that is already in flight.
+  const intent = takeIntent;
   requestAnimationFrame(() => {
     setTimeout(() => {
       try {
         const result = transcribe(audio.samples, audio.sampleRate);
-        applyResult(result.notes, result.frames, result.tuningOffsetCents);
+        if (intent === "transcribe") {
+          applyResult(result.notes, result.frames, result.tuningOffsetCents);
+        } else {
+          applyRangeTake(intent, result.notes);
+        }
       } catch (error) {
         console.error("[transcribe] failed", error);
+        if (intent !== "transcribe") {
+          setState({ phase: "idle", notes: [], frames: [] });
+          endRangeStep("Something went wrong listening to that note. Try it again.");
+          return;
+        }
         // A take that crashed the segmenter is the most valuable recording this
         // app will ever hold, and it is the one nobody can whistle again. Save
         // stays on screen in the error phase (see `ui/controls.ts`), so the way

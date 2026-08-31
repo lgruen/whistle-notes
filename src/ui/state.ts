@@ -35,7 +35,21 @@ import { OCTAVE_SHIFTS, suggestOctaveShift } from "../notes/format.js";
  */
 export type Phase = "idle" | "recording" | "analyzing" | "result" | "error";
 
+/**
+ * Which half of the app is on screen.
+ *
+ * `transcribe` is everything that existed before Practice mode and behaves
+ * exactly as it did. `practice` is the trainer. They share the store because
+ * they share the microphone: a range take in practice mode goes through the
+ * very same `phase` machine and the very same capture module, which is what
+ * stops the two from ever being able to open the microphone at once.
+ */
+export type Mode = "transcribe" | "practice";
+
+export const MODES: readonly Mode[] = ["transcribe", "practice"];
+
 export interface AppState {
+  mode: Mode;
   phase: Phase;
   /** The transcription. Always **true** pitch — see `transpose`. */
   notes: readonly Note[];
@@ -68,6 +82,19 @@ export interface AppState {
 }
 
 const TRANSPOSE_KEY = "whistle-notes:transpose";
+const MODE_KEY = "whistle-notes:mode";
+
+/** The mode the last visit ended in. Someone who is practising is practising
+ *  across sessions, and landing them back on the transcriber every time would
+ *  make the tab a chore rather than a switch. */
+function loadMode(): Mode {
+  try {
+    const raw = localStorage.getItem(MODE_KEY);
+    return MODES.includes(raw as Mode) ? (raw as Mode) : "transcribe";
+  } catch {
+    return "transcribe";
+  }
+}
 
 /** The stored octave preference, or `null` when there isn't a usable one.
  *  localStorage throws outright in some privacy modes, so every access is
@@ -86,6 +113,7 @@ function loadTranspose(): number | null {
 const restoredTranspose = loadTranspose();
 
 let state: AppState = {
+  mode: loadMode(),
   phase: "idle",
   notes: [],
   frames: [],
@@ -144,6 +172,28 @@ export function setTranspose(shift: number): void {
     // Persistence is a nicety; the toggle still works for this session.
   }
   setState({ transpose: shift });
+}
+
+/**
+ * Switch modes, and remember it for next time.
+ *
+ * Refuses while the microphone or the analyser is busy. Not a nicety: both
+ * modes drive the same capture module, and walking away from a running take by
+ * tapping a tab would leave the microphone open with nothing on screen that
+ * gets back to a Stop. The tab is disabled in those phases too — this is the
+ * rule, that is the affordance.
+ */
+export function setMode(mode: Mode): void {
+  // The authority on what a mode is, so callers reading a DOM attribute do not
+  // each need their own copy of the list.
+  if (!MODES.includes(mode) || state.mode === mode) return;
+  if (state.phase === "recording" || state.phase === "analyzing") return;
+  try {
+    localStorage.setItem(MODE_KEY, mode);
+  } catch {
+    // Persistence is a nicety; the switch still works for this session.
+  }
+  setState({ mode });
 }
 
 /**

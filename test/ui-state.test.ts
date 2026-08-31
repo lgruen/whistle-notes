@@ -112,6 +112,67 @@ describe("the octave default", () => {
   });
 });
 
+/**
+ * The mode switch has exactly one rule that is not a one-liner, and it is a
+ * safety rule rather than a preference: both modes drive the same capture
+ * module, so a tab tap during a take would walk away from an open microphone
+ * with nothing on screen that gets back to a Stop.
+ */
+describe("the mode switch", () => {
+  it("starts on the transcriber and remembers where it was left", async () => {
+    expect((await loadStore()).getState().mode).toBe("transcribe");
+    expect((await loadStore({ "whistle-notes:mode": "practice" })).getState().mode).toBe(
+      "practice",
+    );
+    // A mode this build does not have is not a mode.
+    expect((await loadStore({ "whistle-notes:mode": "drills" })).getState().mode).toBe(
+      "transcribe",
+    );
+  });
+
+  it("persists a switch, and refuses one it does not recognise", async () => {
+    const store = await loadStore();
+    store.setMode("practice");
+    expect(store.getState().mode).toBe("practice");
+    expect((await loadStore({ "whistle-notes:mode": "practice" })).getState().mode).toBe(
+      "practice",
+    );
+
+    const fresh = await loadStore();
+    fresh.setMode("sightread" as never);
+    expect(fresh.getState().mode).toBe("transcribe");
+  });
+
+  it("loses to a running microphone", async () => {
+    const store = await loadStore();
+    for (const phase of ["recording", "analyzing"] as const) {
+      store.setState({ mode: "transcribe", phase });
+      store.setMode("practice");
+      expect(store.getState().mode, phase).toBe("transcribe");
+    }
+    // ...and is free the moment the take is over.
+    store.setState({ phase: "result" });
+    store.setMode("practice");
+    expect(store.getState().mode).toBe("practice");
+  });
+
+  it("survives a localStorage that throws", async () => {
+    vi.resetModules();
+    vi.stubGlobal("localStorage", {
+      getItem: () => {
+        throw new Error("denied");
+      },
+      setItem: () => {
+        throw new Error("denied");
+      },
+    });
+    const store: Store = await import("../src/ui/state.js");
+    expect(store.getState().mode).toBe("transcribe");
+    expect(() => store.setMode("practice")).not.toThrow();
+    expect(store.getState().mode).toBe("practice");
+  });
+});
+
 describe("the take's tuning offset", () => {
   it("reaches the state, so the result view can mention it", async () => {
     const store = await loadStore();
