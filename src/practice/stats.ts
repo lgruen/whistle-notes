@@ -34,7 +34,7 @@
  * treat practice stats the way `src/ui/state.ts` treats everything else.
  */
 
-import { OFF_CENTS, type Alignment, type TargetNote } from "./align.js";
+import { OFF_CENTS, type Alignment, type TargetNote, type Verdict } from "./align.js";
 
 /**
  * EWMA weight on the newest observation.
@@ -72,13 +72,48 @@ export interface SlotTally {
   missing: number;
 }
 
+/**
+ * One attempt, kept whole.
+ *
+ * The tallies below are sums, and a sum cannot answer "was that a bad day or a
+ * bad note?" — three wrong notes scattered across ten attempts and three wrong
+ * notes in one disastrous attempt add up identically. So each attempt also
+ * survives as its own row: the verdicts in order, which is exactly what the
+ * result screen's strip draws, small enough that twenty of them fit in a corner
+ * of the detail screen and the shape of the last week is visible at a glance.
+ */
+export interface AttemptRecord {
+  /** Epoch milliseconds. */
+  at: number;
+  /** Semitones the attempt sat from the target it was scored against. */
+  transposition: number;
+  /** One per target slot, in order. */
+  verdicts: Verdict[];
+  /** Notes sung that answered to no slot. */
+  extras: number;
+}
+
+/**
+ * How many attempts are kept per target.
+ *
+ * Twenty is where two things meet: it is more history than anyone reads at once
+ * (the screen shows a handful), and it is few enough that a phone practising
+ * daily for a year still writes a couple of kilobytes per target rather than a
+ * megabyte. Beyond it the lifetime counts in {@link TargetTally} are the memory.
+ */
+export const MAX_ATTEMPT_HISTORY = 20;
+
 export interface TargetTally {
-  /** Attempts folded in. */
+  /** Attempts folded in. Not bounded by {@link MAX_ATTEMPT_HISTORY}: the counts
+   *  are for the lifetime, the history is only the recent past. */
   attempts: number;
   /** One entry per target slot, in order. */
   slots: SlotTally[];
   /** Notes sung that answered to no slot, across all attempts. */
   extras: number;
+  /** The most recent attempts, **newest first**, capped at
+   *  {@link MAX_ATTEMPT_HISTORY}. `history[0]` is the one just made. */
+  history: AttemptRecord[];
   /** Epoch milliseconds of the most recent attempt. */
   updatedAt: number;
 }
@@ -108,6 +143,16 @@ function emptyInterval(interval: number): IntervalStat {
 
 function emptySlot(): SlotTally {
   return { clean: 0, off: 0, wrong: 0, missing: 0 };
+}
+
+/** One attempt as the history keeps it. */
+function attemptRecord(alignment: Alignment, at: number): AttemptRecord {
+  return {
+    at,
+    transposition: alignment.transposition,
+    verdicts: alignment.slots.map((slot) => slot.verdict),
+    extras: alignment.extras.length,
+  };
 }
 
 /**
@@ -191,6 +236,14 @@ export function recordAttempt(
     attempts: (reusable?.attempts ?? 0) + 1,
     slots,
     extras: (reusable?.extras ?? 0) + alignment.extras.length,
+    // Newest first, and dropped from the far end: the history is about the
+    // recent past, and a row whose verdict list is the wrong length for the
+    // melody on screen would draw a strip pointing at the wrong notes — which
+    // is why it is reset alongside the tallies rather than kept.
+    history: [
+      attemptRecord(alignment, at),
+      ...(reusable?.history ?? []).slice(0, MAX_ATTEMPT_HISTORY - 1),
+    ],
     updatedAt: at,
   });
 
@@ -224,6 +277,63 @@ export function slotTrouble(tally: TargetTally): number[] {
     const score = (slot.wrong + 0.7 * slot.missing + 0.35 * slot.off) / total;
     return Math.min(1, score);
   });
+}
+
+/** One slot of one melody that keeps going wrong. */
+export interface TroubleSpot {
+  /** Index into the target. */
+  slot: number;
+  /** Attempts that reached this slot at all. */
+  attempts: number;
+  /** Wrong plus missing — the two failures that are not about aim. */
+  bad: number;
+  wrong: number;
+  missing: number;
+  off: number;
+  /** {@link slotTrouble}'s score for this slot, 0..1. */
+  trouble: number;
+}
+
+export interface TroubleOptions {
+  /** Below this many attempts at the slot there is nothing to conclude. */
+  minAttempts?: number;
+  /**
+   * Below this many failures it is a flub, not a trouble spot.
+   *
+   * The default of 2 is the entire point of keeping a history. Everybody misses
+   * a note once; an app that announced a trouble spot after a single bad
+   * attempt would be reporting noise, and the user would learn to ignore it
+   * exactly when it started being right.
+   */
+  minBad?: number;
+}
+
+/**
+ * The slots of one melody that are genuinely a problem, worst first.
+ *
+ * Deterministic on ties (earlier slot wins), so a screen redrawn twice says the
+ * same thing twice.
+ */
+export function troubleSpots(
+  tally: TargetTally,
+  options: TroubleOptions = {},
+): TroubleSpot[] {
+  const minAttempts = options.minAttempts ?? 2;
+  const minBad = options.minBad ?? 2;
+  const trouble = slotTrouble(tally);
+
+  return tally.slots
+    .map((slot, index) => ({
+      slot: index,
+      attempts: slot.clean + slot.off + slot.wrong + slot.missing,
+      bad: slot.wrong + slot.missing,
+      wrong: slot.wrong,
+      missing: slot.missing,
+      off: slot.off,
+      trouble: trouble[index],
+    }))
+    .filter((spot) => spot.attempts >= minAttempts && spot.bad >= minBad)
+    .sort((a, b) => b.trouble - a.trouble || b.bad - a.bad || a.slot - b.slot);
 }
 
 /**
@@ -282,6 +392,42 @@ export function weakestIntervals(
 
 export const STATS_VERSION = 1;
 
+/**
+ * Verdicts as single characters, because a history is the one part of this
+ * document that is *not* small.
+ *
+ * Twenty attempts at a sixty-four-note melody is 1280 verdicts; as JSON strings
+ * in an array that is eleven kilobytes per target, as `"ccow-cc…"` it is one and
+ * a half — and it is still readable by eye in a storage inspector, which was the
+ * reason the rest of this document spells its fields out. The dash is `missing`
+ * on purpose: a gap in the melody looks like a gap in the string.
+ */
+const VERDICT_CODES: Record<Verdict, string> = {
+  clean: "c",
+  off: "o",
+  wrong: "w",
+  missing: "-",
+};
+
+const CODE_VERDICTS: Record<string, Verdict> = {
+  c: "clean",
+  o: "off",
+  w: "wrong",
+  "-": "missing",
+};
+
+function verdictsToCode(verdicts: readonly Verdict[]): string {
+  return verdicts.map((verdict) => VERDICT_CODES[verdict] ?? "-").join("");
+}
+
+function verdictsFromCode(raw: unknown): Verdict[] {
+  if (typeof raw !== "string") return [];
+  // An unrecognised character means a verdict some other version of this app
+  // knew about. `missing` is the honest reading: something happened at that
+  // slot and it was not a clean note.
+  return [...raw].map((character) => CODE_VERDICTS[character] ?? "missing");
+}
+
 interface IntervalJson {
   observations: number;
   clean: number;
@@ -293,11 +439,20 @@ interface IntervalJson {
   wrongRateEwma: number;
 }
 
+interface AttemptJson {
+  at: number;
+  transposition: number;
+  extras: number;
+  /** See {@link VERDICT_CODES}. */
+  verdicts: string;
+}
+
 interface TargetJson {
   attempts: number;
   extras: number;
   updatedAt: number;
   slots: SlotTally[];
+  history: AttemptJson[];
 }
 
 export interface PracticeStatsJson {
@@ -327,6 +482,12 @@ export function statsToJson(stats: PracticeStats): PracticeStatsJson {
       extras: tally.extras,
       updatedAt: tally.updatedAt,
       slots: tally.slots.map((slot) => ({ ...slot })),
+      history: tally.history.map((attempt) => ({
+        at: attempt.at,
+        transposition: attempt.transposition,
+        extras: attempt.extras,
+        verdicts: verdictsToCode(attempt.verdicts),
+      })),
     };
   }
   return { version: STATS_VERSION, intervals, targets };
@@ -386,11 +547,31 @@ export function statsFromJson(raw: unknown): PracticeStats {
         missing: count(parsed?.missing),
       };
     });
+    // Absent in documents written before the history existed, and that is
+    // deliberately not a version bump: an older build reading a newer document
+    // simply ignores this field, where a bump would have made it discard the
+    // whole practice history instead. Losing the recent rows is a
+    // disappointment; losing the lifetime counts is a year of practice.
+    const history: AttemptRecord[] = [];
+    if (Array.isArray(entry.history)) {
+      for (const raw of entry.history.slice(0, MAX_ATTEMPT_HISTORY)) {
+        const attempt = record(raw);
+        if (!attempt) continue;
+        history.push({
+          at: count(attempt.at),
+          transposition: Math.round(number(attempt.transposition)),
+          extras: count(attempt.extras),
+          verdicts: verdictsFromCode(attempt.verdicts),
+        });
+      }
+    }
+
     targets.set(id, {
       attempts: count(entry.attempts),
       extras: count(entry.extras),
       updatedAt: count(entry.updatedAt),
       slots,
+      history,
     });
   }
 

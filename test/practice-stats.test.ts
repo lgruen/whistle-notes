@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { alignAttempt, type Alignment, type TargetNote } from "../src/practice/align.js";
 import {
   EWMA_ALPHA,
+  MAX_ATTEMPT_HISTORY,
   STATS_VERSION,
   emptyStats,
   forgetTarget,
@@ -10,6 +11,7 @@ import {
   slotTrouble,
   statsFromJson,
   statsToJson,
+  troubleSpots,
   weakestIntervals,
   type PracticeStats,
 } from "../src/practice/stats.js";
@@ -199,6 +201,7 @@ describe("the trouble heatmap", () => {
       attempts: 4,
       extras: 0,
       updatedAt: 0,
+      history: [],
       slots: [
         { clean: 4, off: 0, wrong: 0, missing: 0 },
         { clean: 0, off: 4, wrong: 0, missing: 0 },
@@ -230,15 +233,101 @@ describe("the trouble heatmap", () => {
   });
 
   it("says nothing about a slot with no history", () => {
-    expect(slotTrouble({ attempts: 0, slots: [], extras: 0, updatedAt: 0 })).toEqual([]);
+    expect(slotTrouble({ attempts: 0, slots: [], extras: 0, updatedAt: 0, history: [] })).toEqual(
+      [],
+    );
     expect(
       slotTrouble({
         attempts: 0,
         slots: [{ clean: 0, off: 0, wrong: 0, missing: 0 }],
         extras: 0,
         updatedAt: 0,
+        history: [],
       }),
     ).toEqual([0]);
+  });
+});
+
+/**
+ * The history is what a sum cannot be.
+ *
+ * Three wrong notes spread over ten attempts and three wrong notes in one
+ * disastrous attempt add up to the same tally, and they are completely
+ * different facts about a whistler. Keeping each attempt whole is the only way
+ * the screen can tell them apart — and keeping it *bounded* is what stops a
+ * year of daily practice from filling a phone's storage quota with it.
+ */
+describe("the attempt history", () => {
+  it("keeps each attempt whole, newest first", () => {
+    let stats = recordAttempt(emptyStats(), "t", TRIAD, attemptOf(TRIAD, [0, 900, 0, 0, 0]), 5);
+    stats = recordAttempt(stats, "t", TRIAD, attemptOf(TRIAD, [0, 0, null, 0, 0]), 9);
+    const history = stats.targets.get("t")!.history;
+
+    expect(history).toHaveLength(2);
+    expect(history[0].at).toBe(9);
+    expect(history[0].verdicts).toEqual(["clean", "clean", "missing", "clean", "clean"]);
+    expect(history[1].at).toBe(5);
+    expect(history[1].verdicts).toEqual(["clean", "wrong", "clean", "clean", "clean"]);
+  });
+
+  it("remembers the register each attempt came out in", () => {
+    // Whistled a 5th above, cleanly. The verdicts say nothing went wrong, so
+    // the transposition is the only record that it was sung somewhere else.
+    const shifted = TRIAD.map((note) => ({ ...note, midi: note.midi + 7 }));
+    const attempt = alignAttempt(
+      shifted.map((note) => ({ midi: note.midi, centsOffset: 0, durationSec: 0.4 })),
+      TRIAD,
+    );
+    const stats = recordAttempt(emptyStats(), "t", TRIAD, attempt, 1);
+    expect(stats.targets.get("t")!.history[0].transposition).toBe(-7);
+  });
+
+  it("stops at a fixed number of rows while the lifetime counts go on", () => {
+    let stats = emptyStats();
+    for (let i = 0; i < MAX_ATTEMPT_HISTORY + 7; i++) {
+      stats = recordAttempt(stats, "t", TRIAD, attemptOf(TRIAD, [0, 0, 0, 0, 0]), i);
+    }
+    const tally = stats.targets.get("t")!;
+    expect(tally.history).toHaveLength(MAX_ATTEMPT_HISTORY);
+    // The ones kept are the recent ones...
+    expect(tally.history[0].at).toBe(MAX_ATTEMPT_HISTORY + 6);
+    // ...and the count is not bounded by the rows.
+    expect(tally.attempts).toBe(MAX_ATTEMPT_HISTORY + 7);
+  });
+
+  /** The same rule the slot tallies follow, and for the same reason: slot 4 of
+   *  a five-note melody and slot 4 of a three-note one are different places, so
+   *  a strip drawn from the old rows would point at the wrong notes. */
+  it("starts over when the melody it is about changes length", () => {
+    const stats = recordAttempt(emptyStats(), "t", TRIAD, attemptOf(TRIAD, [0, 900, 0, 0, 0]), 1);
+    const shorter = melody([60, 64, 67]);
+    const after = recordAttempt(stats, "t", shorter, attemptOf(shorter, [0, 0, 0]), 2);
+    expect(after.targets.get("t")!.history).toHaveLength(1);
+    expect(after.targets.get("t")!.history[0].verdicts).toHaveLength(3);
+    expect(after.targets.get("t")!.attempts).toBe(1);
+  });
+
+  it("ranks a note that keeps beating you above one that was fluffed once", () => {
+    let stats = emptyStats();
+    stats = recordAttempt(stats, "t", TRIAD, attemptOf(TRIAD, [0, 900, 0, 900, 0]), 1);
+    stats = recordAttempt(stats, "t", TRIAD, attemptOf(TRIAD, [0, 900, 0, 0, 0]), 2);
+    stats = recordAttempt(stats, "t", TRIAD, attemptOf(TRIAD, [0, 900, 0, 0, 0]), 3);
+
+    const spots = troubleSpots(stats.targets.get("t")!);
+    // Slot 1 went wrong three times out of three; slot 3 once out of three, and
+    // once is a flub rather than a trouble spot.
+    expect(spots.map((spot) => spot.slot)).toEqual([1]);
+    expect(spots[0].bad).toBe(3);
+    expect(spots[0].attempts).toBe(3);
+
+    // Lower the bar and the flub shows up, which is what makes the default a
+    // judgement rather than a limitation.
+    expect(troubleSpots(stats.targets.get("t")!, { minBad: 1 }).map((s) => s.slot)).toEqual([1, 3]);
+  });
+
+  it("says nothing at all about a melody tried once", () => {
+    const stats = recordAttempt(emptyStats(), "t", TRIAD, attemptOf(TRIAD, [0, 900, 900, 0, 0]), 1);
+    expect(troubleSpots(stats.targets.get("t")!)).toEqual([]);
   });
 });
 
@@ -287,6 +376,65 @@ describe("serialisation", () => {
       [...before.intervals.keys()].sort((a, b) => a - b),
     );
     expect(after.targets.get("t")).toEqual(before.targets.get("t"));
+  });
+
+  it("stores the verdicts as one character each, and reads them back", () => {
+    const json = statsToJson(populated());
+    // Compact because it is the one part of this document that is not small,
+    // and still readable by eye: a gap in the melody looks like a gap.
+    expect(json.targets.t.history[0].verdicts).toBe("ccccc");
+    // A wrong note and a dropped one, and the aligner is free to decide which
+    // of two equally-far slots the stray pitch answered — this pins the
+    // encoding, not that choice.
+    expect(json.targets.t.history[1].verdicts).toMatch(/^co[-w][-w]c$/);
+    expect(statsFromJson(json).targets.get("t")!.history).toEqual(
+      populated().targets.get("t")!.history,
+    );
+  });
+
+  /**
+   * Adding the history did *not* bump the version, and that is the deliberate
+   * half of the decision: a build that predates it simply ignores the field,
+   * where a bump would have made it throw away the lifetime counts as well.
+   */
+  it("reads a document written before the history existed", () => {
+    const json = statsToJson(populated());
+    const older = {
+      ...json,
+      targets: { t: { ...json.targets.t, history: undefined } },
+    };
+    const stats = statsFromJson(JSON.parse(JSON.stringify(older)));
+    expect(stats.targets.get("t")!.attempts).toBe(2);
+    expect(stats.targets.get("t")!.history).toEqual([]);
+  });
+
+  it("refuses a history that has been tampered with, one row at a time", () => {
+    const stats = statsFromJson({
+      version: 1,
+      intervals: {},
+      targets: {
+        t: {
+          attempts: 3,
+          extras: 0,
+          updatedAt: 1,
+          slots: [{ clean: 1, off: 0, wrong: 0, missing: 0 }],
+          history: [
+            { at: 2, transposition: 0.7, extras: -1, verdicts: "cx-" },
+            "not an attempt",
+            { at: "soon", transposition: null, extras: 0, verdicts: 42 },
+          ],
+        },
+      },
+    });
+    const history = stats.targets.get("t")!.history;
+    expect(history).toHaveLength(2);
+    // An unknown verdict character is read as `missing`: something happened
+    // there and it was not a clean note.
+    expect(history[0].verdicts).toEqual(["clean", "missing", "missing"]);
+    expect(history[0].transposition).toBe(1);
+    expect(history[0].extras).toBe(0);
+    expect(history[1].verdicts).toEqual([]);
+    expect(history[1].at).toBe(0);
   });
 
   it("stamps a version, and refuses to guess at another one", () => {
