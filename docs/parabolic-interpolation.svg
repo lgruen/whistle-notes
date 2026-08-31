@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 310" width="620" height="310" role="img" aria-label="Parabolic interpolation of a spectral peak" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Parabolic interpolation of a spectral peak</title>
+<text x="52" y="14" font-size="12" fill="#79818c" font-weight="600">Three bins decide the frequency</text>
+<text x="52" y="28" font-size="9.5" fill="#79818c" opacity="0.9">8192-point transform at 48 kHz: one bin is 5.86 Hz wide.</text>
+<text x="52" y="40" font-size="9.5" fill="#79818c" opacity="0.9">Zero padding samples the mainlobe 4× more densely, so the three points near its apex lie on a parabola.</text>
+<text x="604" y="28" font-size="9.5" fill="#79818c" text-anchor="end" opacity="0.9">true tone: 1122.07 Hz</text>
+<line x1="52" y1="46" x2="604" y2="46" stroke="#8b949e" stroke-width="0.6" stroke-opacity="0.2"/>
+<text x="46" y="49" font-size="8.5" fill="#79818c" text-anchor="end" opacity="0.8">0 dB</text>
+<line x1="52" y1="97.5" x2="604" y2="97.5" stroke="#8b949e" stroke-width="0.6" stroke-opacity="0.2"/>
+<text x="46" y="100.5" font-size="8.5" fill="#79818c" text-anchor="end" opacity="0.8">-4 dB</text>
+<line x1="52" y1="149" x2="604" y2="149" stroke="#8b949e" stroke-width="0.6" stroke-opacity="0.2"/>
+<text x="46" y="152" font-size="8.5" fill="#79818c" text-anchor="end" opacity="0.8">-8 dB</text>
+<line x1="52" y1="200.5" x2="604" y2="200.5" stroke="#8b949e" stroke-width="0.6" stroke-opacity="0.2"/>
+<text x="46" y="203.5" font-size="8.5" fill="#79818c" text-anchor="end" opacity="0.8">-12 dB</text>
+<line x1="52" y1="252" x2="604" y2="252" stroke="#8b949e" stroke-width="0.6" stroke-opacity="0.2"/>
+<text x="46" y="255" font-size="8.5" fill="#79818c" text-anchor="end" opacity="0.8">-16 dB</text>
+<line x1="52" y1="252" x2="52" y2="145.23" stroke="#8b949e" stroke-width="1.2" stroke-opacity="0.45"/>
+<line x1="107.2" y1="252" x2="107.2" y2="103.13" stroke="#8b949e" stroke-width="1.2" stroke-opacity="0.45"/>
+<line x1="162.4" y1="252" x2="162.4" y2="73.79" stroke="#8b949e" stroke-width="1.2" stroke-opacity="0.45"/>
+<line x1="217.6" y1="252" x2="217.6" y2="55.11" stroke="#8b949e" stroke-width="1.2" stroke-opacity="0.45"/>
+<line x1="272.8" y1="252" x2="272.8" y2="46" stroke="#4183d7" stroke-width="2" stroke-opacity="0.85"/>
+<line x1="328" y1="252" x2="328" y2="46" stroke="#4183d7" stroke-width="2" stroke-opacity="0.85"/>
+<line x1="383.2" y1="252" x2="383.2" y2="55.11" stroke="#4183d7" stroke-width="2" stroke-opacity="0.85"/>
+<line x1="438.4" y1="252" x2="438.4" y2="73.79" stroke="#8b949e" stroke-width="1.2" stroke-opacity="0.45"/>
+<line x1="493.6" y1="252" x2="493.6" y2="103.13" stroke="#8b949e" stroke-width="1.2" stroke-opacity="0.45"/>
+<line x1="548.8" y1="252" x2="548.8" y2="145.23" stroke="#8b949e" stroke-width="1.2" stroke-opacity="0.45"/>
+<line x1="604" y1="252" x2="604" y2="204.4" stroke="#8b949e" stroke-width="1.2" stroke-opacity="0.45"/>
+<circle cx="52" cy="145.23" r="2" fill="#8b949e" fill-opacity="0.55"/>
+<circle cx="107.2" cy="103.13" r="2" fill="#8b949e" fill-opacity="0.55"/>
+<circle cx="162.4" cy="73.79" r="2" fill="#8b949e" fill-opacity="0.55"/>
+<circle cx="217.6" cy="55.11" r="2" fill="#8b949e" fill-opacity="0.55"/>
+<circle cx="272.8" cy="46" r="3" fill="#4183d7" fill-opacity="1"/>
+<circle cx="328" cy="46" r="3" fill="#4183d7" fill-opacity="1"/>
+<circle cx="383.2" cy="55.11" r="3" fill="#4183d7" fill-opacity="1"/>
+<circle cx="438.4" cy="73.79" r="2" fill="#8b949e" fill-opacity="0.55"/>
+<circle cx="493.6" cy="103.13" r="2" fill="#8b949e" fill-opacity="0.55"/>
+<circle cx="548.8" cy="145.23" r="2" fill="#8b949e" fill-opacity="0.55"/>
+<circle cx="604" cy="204.4" r="2" fill="#8b949e" fill-opacity="0.55"/>
+<polyline points="253.48,48.15 255.96,47.81 258.45,47.49 260.93,47.19 263.42,46.91 265.9,46.64 268.38,46.39 270.87,46.16 273.35,45.95 275.84,45.76 278.32,45.59 280.8,45.44 283.29,45.3 285.77,45.18 288.26,45.08 290.74,45 293.22,44.94 295.71,44.89 298.19,44.87 300.68,44.86 303.16,44.87 305.64,44.9 308.13,44.95 310.61,45.02 313.1,45.1 315.58,45.21 318.06,45.33 320.55,45.47 323.03,45.63 325.52,45.8 328,46 330.48,46.21 332.97,46.45 335.45,46.7 337.94,46.97 340.42,47.26 342.9,47.56 345.39,47.89 347.87,48.23 350.36,48.59 352.84,48.97 355.32,49.37 357.81,49.79 360.29,50.22 362.78,50.68 365.26,51.15 367.74,51.64 370.23,52.15 372.71,52.68 375.2,53.22 377.68,53.79 380.16,54.37 382.65,54.97 385.13,55.59 387.62,56.23 390.1,56.89 392.58,57.56 395.07,58.25 397.55,58.97 400.04,59.7 402.52,60.45" fill="none" stroke="#dd6b34" stroke-width="1.8" stroke-linecap="round"/>
+<text x="272.8" y="269" font-size="9" fill="#4183d7" text-anchor="middle">k−1</text>
+<text x="328" y="269" font-size="9" fill="#4183d7" text-anchor="middle">k</text>
+<text x="383.2" y="269" font-size="9" fill="#4183d7" text-anchor="middle">k+1</text>
+<path d="M 324 260 L 332 260 L 328 252 Z" fill="#4183d7"/>
+<line x1="300.4" y1="44.86" x2="300.4" y2="286" stroke="#dd6b34" stroke-width="1.4" stroke-opacity="0.9"/>
+<circle cx="300.4" cy="44.86" r="3.4" fill="#dd6b34"/>
+<text x="336" y="285" font-size="9.5" fill="#4183d7">highest bin: 1125.0 Hz (4.5 cents off)</text>
+<text x="294.4" y="299" font-size="9.5" fill="#dd6b34" text-anchor="end">parabola vertex: 1122.07 Hz (0.00 cents off)</text>
+</svg>
