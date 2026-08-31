@@ -36,6 +36,20 @@ function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
+/**
+ * Blank out module specifiers before looking for globals.
+ *
+ * `src/dsp/window.ts` is a legitimate module name — a spectral pipeline has to
+ * have an analysis window somewhere — but `from "./window.js"` puts the bare
+ * word `window` next to a non-word character, which the globals regex below
+ * cannot tell apart from a reference to the browser's `window` object. A module
+ * *path* is not a global reference, and paths already have their own rule two
+ * tests down, so exempting them here loses no coverage.
+ */
+function stripModuleSpecifiers(source: string): string {
+  return source.replace(/from\s+['"][^'"]*['"]/g, "from ''");
+}
+
 const FORBIDDEN_GLOBALS =
   /\b(window|document|navigator|globalThis|localStorage|sessionStorage|AudioContext|OfflineAudioContext|AudioWorklet|AudioWorkletNode|AudioWorkletProcessor|MediaStream|requestAnimationFrame|fetch|XMLHttpRequest)\b|require\s*\(|from\s+['"]node:|import\s*\(\s*['"]node:/;
 
@@ -66,6 +80,12 @@ describe("src/dsp purity", () => {
     expect(FORBIDDEN_GLOBALS.test(stripComments("const el = document.body;"))).toBe(true);
     expect(FORBIDDEN_GLOBALS.test(stripComments("if (typeof window !== 'undefined') {}"))).toBe(true);
     expect(FORBIDDEN_GLOBALS.test(stripComments('import { readFileSync } from "node:fs";'))).toBe(true);
+    // ...and the specifier stripper must not become a way to smuggle one in.
+    expect(FORBIDDEN_IMPORTS.test('import { x } from "../ui/staff.js";')).toBe(true);
+    expect(FORBIDDEN_GLOBALS.test(stripModuleSpecifiers("const el = window.x;"))).toBe(true);
+    expect(FORBIDDEN_GLOBALS.test(stripModuleSpecifiers('import { hannWindow } from "./window.js";'))).toBe(
+      false,
+    );
     expect(FORBIDDEN_GLOBALS.test(stripComments("const x = require('fft.js');"))).toBe(true);
     expect(FORBIDDEN_GLOBALS.test(stripComments("new AudioContext()"))).toBe(true);
     expect(FORBIDDEN_IMPORTS.test('import { x } from "../notes/format.js";')).toBe(true);
@@ -80,7 +100,7 @@ describe("src/dsp purity", () => {
   it.each(files.map((f) => [relative(SRC_DIR, f), f]))(
     "%s touches no browser or Node globals",
     (_name, file) => {
-      const match = FORBIDDEN_GLOBALS.exec(stripComments(readFileSync(file, "utf8")));
+      const match = FORBIDDEN_GLOBALS.exec(stripModuleSpecifiers(stripComments(readFileSync(file, "utf8"))));
       expect(match?.[0] ?? null).toBeNull();
     },
   );

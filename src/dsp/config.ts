@@ -66,13 +66,32 @@ export const DEFAULT_CONFIG: DspConfig = {
   },
 
   segment: {
-    // 12 semitones/second: far faster than vibrato or drift, far slower than
-    // a note change, so it cleanly isolates deliberate glides and scoops.
-    glideSlopeStPerSec: 12,
+    // 18 semitones/second. The plan proposed 12 on the reasoning that vibrato
+    // is much slower than a glide; measurement says otherwise. A sinusoidal
+    // vibrato of ±c cents at f Hz peaks at 2π·f·c/100 semitones per second, so
+    // the ±60 cents at 5 Hz that a human actually produces peaks at 18.8 —
+    // faster than a one-semitone glide taken over 120 ms. The two populations
+    // genuinely overlap, and the cost of guessing wrong is asymmetric: marking
+    // vibrato as "transitional" strips the middle out of the oscillation and
+    // leaves a bimodal set of extremes whose median is unstable (measured:
+    // 46 cents of error on a ±60-cent vibrato, and a wrong note at ±80).
+    // 18 sits just above human vibrato and well below any real portamento
+    // (measured on the reference recording: 95th percentile 13.9 st/s, 99th
+    // 20.9, genuine scoops 30–36). The transcription of that recording is
+    // identical for anything from 12 to 24, so this is not a fitted constant.
+    glideSlopeStPerSec: 18,
     // 60 cents — a bit over half a semitone. The "wobble snap" knob.
     toleranceCents: 60,
     refMedianLength: 15,
-    confirmFrames: 3,
+    // 7 frames ≈ 75 ms at the default hop, which is deliberately close to
+    // `minNoteMs`: committing a note on less evidence than the shortest note
+    // we are willing to report would be incoherent. Measured, not guessed —
+    // the plan started at 3 frames (32 ms) and synthetic vibrato of ±60 cents
+    // at 5 Hz then split into twelve notes, because a 5 Hz vibrato dwells
+    // ~40 ms near each extreme and three frames of "agreement" at the top of a
+    // wobble look exactly like a new note. Human vibrato is the constraint
+    // here, and it sets the floor at roughly 60 ms.
+    confirmFrames: 7,
     driftCapSemitones: 1.5,
     // Whistlers scoop into notes. Dropping the first quarter of a long note
     // keeps the approach out of the pitch estimate.
