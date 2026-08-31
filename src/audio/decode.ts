@@ -97,12 +97,14 @@ export const MAX_COMPRESSED_BYTES = Math.floor(
 );
 
 /**
- * Cap for an uncompressed file, which is a different question entirely.
+ * Ceiling for an uncompressed file, which is a different question entirely.
  *
- * RIFF/WAVE and AIFF carry raw PCM, so their expansion factor is known and
- * small — 16-bit mono decodes to 2× its size, and the mono copy makes 4×
- * (before resampling; 44.1 → 48 kHz adds another 9%). At 32 MB that is ~160 MB
- * peak, comfortably inside the budget.
+ * A PCM file's expansion factor is *knowable* — 16-bit mono at 48 kHz decodes
+ * to 2× its size, and the mono copy makes 4×, so 32 MB is ~128 MB peak and
+ * comfortably inside the budget. Knowable is not the same as fixed, though: the
+ * same 32 MB of 16-bit mono at 8 kHz is six times as many seconds and six times
+ * the peak. So this is the ceiling, not the cap — {@link uncompressedByteLimit}
+ * computes the file's own and takes the lower of the two.
  *
  * This tier is not a nicety. This app's own Save button writes 16-bit mono WAV,
  * and a 60 s take is 5.8 MB of it — so a single low cap would have made the
@@ -111,9 +113,21 @@ export const MAX_COMPRESSED_BYTES = Math.floor(
  */
 export const MAX_UNCOMPRESSED_BYTES = 32 * 1024 * 1024;
 
-/** Bytes of a file we look at to decide which cap applies. Twelve is enough
- *  for every container header below. */
-export const HEADER_SNIFF_BYTES = 12;
+/** Bytes of the container magic: `RIFF....WAVE`, `FORM....AIFF`. */
+const CONTAINER_MAGIC_BYTES = 12;
+
+/**
+ * Bytes of a file we look at to decide which cap applies.
+ *
+ * Twelve would do for the magic, and the magic is not enough: the *format*
+ * chunk behind it is what says whether those bytes expand by four or by a
+ * thousand (see {@link uncompressedByteLimit}). It normally starts at byte 12,
+ * but nothing requires that — writers put `JUNK` padding, `LIST` metadata or a
+ * `bext` broadcast chunk in front of it — so this reads far enough to walk past
+ * a few of them. One `Blob.slice`, four kilobytes; if the chunk is not in
+ * there, the file falls to the small cap, which is the safe direction.
+ */
+export const HEADER_SNIFF_BYTES = 4096;
 
 /**
  * Whether these leading bytes are an uncompressed PCM container.
@@ -121,8 +135,7 @@ export const HEADER_SNIFF_BYTES = 12;
  * Sniffed from the bytes rather than trusted from `file.type` or the file name,
  * because both are advisory: pickers hand over an empty MIME type all the time,
  * and a mislabelled `.wav` that is really a 32 kbps AAC would otherwise be
- * granted the 32 MB cap and decode to a gigabyte. Twelve bytes is a cheap and
- * *actual* answer to the question the cap depends on.
+ * granted the 32 MB cap and decode to a gigabyte.
  *
  * - `RIFF....WAVE` — a WAV file, including everything this app's own Save
  *   button writes.
@@ -130,15 +143,146 @@ export const HEADER_SNIFF_BYTES = 12;
  *
  * Anything else is treated as compressed, which is the conservative direction:
  * an unrecognised uncompressed format simply gets the smaller cap.
+ *
+ * The first half of the answer, not the whole of it: the container says the
+ * *bytes* are laid out plainly, and says nothing about how many of them a
+ * second of audio takes. See {@link uncompressedByteLimit} for the rest.
  */
 export function isUncompressedContainer(header: Uint8Array): boolean {
-  if (header.length < HEADER_SNIFF_BYTES) return false;
-  const tag = (at: number): string => String.fromCharCode(...header.subarray(at, at + 4));
-  const container = tag(0);
-  const form = tag(8);
+  if (header.length < CONTAINER_MAGIC_BYTES) return false;
+  const container = fourCC(header, 0);
+  const form = fourCC(header, 8);
   if (container === "RIFF") return form === "WAVE";
   if (container === "FORM") return form === "AIFF" || form === "AIFC";
   return false;
+}
+
+function fourCC(header: Uint8Array, at: number): string {
+  return String.fromCharCode(...header.subarray(at, at + 4));
+}
+
+/** What the format chunk says the samples are. */
+interface PcmShape {
+  channels: number;
+  sampleRate: number;
+  bitsPerSample: number;
+}
+
+/**
+ * Walk the chunks of a RIFF or IFF file and hand back the one we want.
+ *
+ * Both formats are the same shape: a four-character id, a length, a payload,
+ * padded to an even boundary. They differ only in byte order, which is the
+ * `littleEndian` flag. A chunk claiming a length past the end of what we read
+ * simply ends the walk — there is nothing to find beyond it anyway.
+ */
+function findChunk(
+  view: DataView,
+  header: Uint8Array,
+  id: string,
+  littleEndian: boolean,
+): number | null {
+  let at = CONTAINER_MAGIC_BYTES;
+  while (at + 8 <= view.byteLength) {
+    const size = view.getUint32(at + 4, littleEndian);
+    if (fourCC(header, at) === id) return at + 8;
+    // `+ (size & 1)`: chunks are word-aligned, and an odd payload is followed
+    // by a pad byte that is not counted in its length.
+    at += 8 + size + (size & 1);
+  }
+  return null;
+}
+
+/** AIFF stores its sample rate as an 80-bit IEEE extended float, which is the
+ *  one field in either container that cannot just be read out. */
+function extended80(view: DataView, at: number): number {
+  const exponent = view.getUint16(at, false) & 0x7fff;
+  const mantissa = view.getUint32(at + 2, false) * 2 ** 32 + view.getUint32(at + 6, false);
+  return mantissa * 2 ** (exponent - 16383 - 63);
+}
+
+/** Uncompressed AIFC codecs. `sowt` is little-endian PCM, which is what a Mac
+ *  recorder writes; everything else in an AIFC is compressed. */
+const AIFC_PCM = new Set(["NONE", "sowt", "twos", "fl32", "fl64", "FL32", "FL64"]);
+
+/**
+ * The size cap this file's header actually earns, or `null` for "not an
+ * uncompressed PCM file — use the small one".
+ *
+ * The magic bytes are not enough, and this is the hole that closes here: `RIFF`
+ * + `WAVE` says the *container* is uncompressed, and the fmt chunk behind it is
+ * free to say the samples are 8-bit 8 kHz PCM, or IMA ADPCM, or an entire MP3
+ * stream wrapped in a WAV. All three are legal, all three pass a twelve-byte
+ * sniff, and all three expand far past the 4× the 32 MB tier is sized for — an
+ * 8-bit 8 kHz mono WAV at 32 MB is 70 minutes and ~1.6 GB decoded, which a
+ * phone answers by killing the tab; ADPCM and MP3-in-WAV are worse again.
+ *
+ * So the tier is granted on the format, and its size is *computed*:
+ *
+ * - Format tag 1 (PCM) or 3 (float) only. Anything else — ADPCM, µ-law, MP3-in-
+ *   WAV — is a codec, and a codec's expansion is not knowable from a header.
+ *   `WAVE_FORMAT_EXTENSIBLE` (0xFFFE) is refused with them, deliberately: its
+ *   real tag hides in a GUID this does not parse, and the cost of refusing is a
+ *   sentence rather than a dead tab.
+ * - At least 16 bits per sample. Below that the source is smaller than the
+ *   decode by more than the tier assumes, and nothing a recorder produces is
+ *   8-bit anyway.
+ * - Then the honest arithmetic: decoding produces one float per channel per
+ *   sample at {@link DECODE_SAMPLE_RATE}, and {@link mixToMono}'s copy is alive
+ *   alongside it, so a second of source costs `48000 × 4 × (channels + 1)`
+ *   bytes however few bytes it occupies in the file. The cap is whichever is
+ *   smaller: {@link MAX_UNCOMPRESSED_BYTES}, or the size at which that reaches
+ *   the memory budget. A 16-bit 48 kHz file expands 4× and keeps the full
+ *   32 MB; the same file at 8 kHz expands 24× and gets ~21 MB instead.
+ *
+ * Defensive throughout: a truncated, absent or implausible format chunk returns
+ * `null` and the file is treated as compressed. The failure mode of being wrong
+ * here is a killed tab, so every unknown resolves downwards.
+ */
+export function uncompressedByteLimit(header: Uint8Array): number | null {
+  if (!isUncompressedContainer(header)) return null;
+  const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+  const shape = fourCC(header, 0) === "RIFF" ? wavShape(view, header) : aiffShape(view, header);
+  if (shape === null) return null;
+
+  const { channels, sampleRate, bitsPerSample } = shape;
+  if (bitsPerSample < 16 || channels < 1 || channels > 32) return null;
+  if (!(sampleRate >= 4000 && sampleRate <= 768000)) return null;
+
+  const sourceBytesPerSec = sampleRate * channels * (bitsPerSample / 8);
+  const decodedBytesPerSec = DECODE_SAMPLE_RATE * 4 * (channels + 1);
+  const affordable = Math.floor((DECODE_BUDGET_BYTES * sourceBytesPerSec) / decodedBytesPerSec);
+  return Math.min(MAX_UNCOMPRESSED_BYTES, affordable);
+}
+
+/** `fmt `: tag, channels, rate, byte rate, block align, bits — 16 bytes, of
+ *  which we read three fields and the tag. */
+function wavShape(view: DataView, header: Uint8Array): PcmShape | null {
+  const at = findChunk(view, header, "fmt ", true);
+  if (at === null || at + 16 > view.byteLength) return null;
+  const format = view.getUint16(at, true);
+  if (format !== 1 && format !== 3) return null;
+  return {
+    channels: view.getUint16(at + 2, true),
+    sampleRate: view.getUint32(at + 4, true),
+    bitsPerSample: view.getUint16(at + 14, true),
+  };
+}
+
+/** `COMM`: channels, frame count, sample size, an 80-bit rate — and in an AIFC,
+ *  a codec after it. An AIFF that is not an AIFC is PCM by definition. */
+function aiffShape(view: DataView, header: Uint8Array): PcmShape | null {
+  const at = findChunk(view, header, "COMM", false);
+  if (at === null || at + 18 > view.byteLength) return null;
+  if (fourCC(header, 8) === "AIFC") {
+    if (at + 22 > view.byteLength) return null;
+    if (!AIFC_PCM.has(fourCC(header, at + 18))) return null;
+  }
+  return {
+    channels: view.getUint16(at, false),
+    bitsPerSample: view.getUint16(at + 6, false),
+    sampleRate: extended80(view, at + 8),
+  };
 }
 
 /** An expected failure with a message that can go straight on screen. Separate
@@ -262,10 +406,11 @@ export async function decodeAudioFile(
     throw new AudioFileError("That file is empty.");
   }
 
-  // Twelve bytes before anything else: which cap applies depends on what the
-  // file actually is, not on what it is called. See `isUncompressedContainer`.
+  // The header before anything else: which cap applies depends on what the file
+  // actually is, not on what it is called — and on what its format chunk says
+  // its samples are, not just on the container. See `uncompressedByteLimit`.
   const header = new Uint8Array(await file.slice(0, HEADER_SNIFF_BYTES).arrayBuffer());
-  const limit = isUncompressedContainer(header) ? MAX_UNCOMPRESSED_BYTES : MAX_COMPRESSED_BYTES;
+  const limit = uncompressedByteLimit(header) ?? MAX_COMPRESSED_BYTES;
   if (file.size > limit) {
     throw new AudioFileError(
       "That file is too large to decode on a phone. Trim it to a minute or so and try again.",
@@ -339,6 +484,21 @@ function decodeContext(): BaseAudioContext {
   // One frame at the target rate is all that is needed to own a decoder.
   decodeCtx ??= new OfflineAudioContext(1, 1, DECODE_SAMPLE_RATE);
   return decodeCtx;
+}
+
+/**
+ * Forget it. For tests, and for one specific hazard in them.
+ *
+ * The cache above deliberately outlives everything — including a test's stubbed
+ * `OfflineAudioContext`, which `vi.unstubAllGlobals()` removes from the global
+ * object while the context built *from* it stays parked in this module. The
+ * next file to import this module then decodes against a fake belonging to a
+ * test that has already finished, and the symptom is a failure somewhere else
+ * entirely. One line here disarms it; the alternative is a comment warning
+ * people about it.
+ */
+export function resetDecodeContext(): void {
+  decodeCtx = null;
 }
 
 /**

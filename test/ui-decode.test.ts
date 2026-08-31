@@ -2,12 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AudioFileError,
   DECODE_SAMPLE_RATE,
+  HEADER_SNIFF_BYTES,
   MAX_COMPRESSED_BYTES,
   MAX_UNCOMPRESSED_BYTES,
   capSamples,
   decodeAudioFile,
   isUncompressedContainer,
   mixToMono,
+  resetDecodeContext,
+  uncompressedByteLimit,
 } from "../src/audio/decode.js";
 
 /**
@@ -55,10 +58,11 @@ type DecodeOutcome =
 let outcome: DecodeOutcome = { kind: "promise", buffer: new FakeAudioBuffer([], 48000) };
 
 class FakeOfflineAudioContext {
-  /** Every construction ever, across the whole file. Deliberately *not* reset
-   *  between tests: the module caches one context for the life of the module,
-   *  and these tests share one import of it, so "how many were built" is a
-   *  file-wide fact rather than a per-test one. */
+  /** Every construction ever, across the whole file. Not reset between tests,
+   *  so "how many were built" is a file-wide fact: the module caches one
+   *  context and these tests share one import of it. The `afterEach` drops that
+   *  cache, so expect one construction per test that decodes — the thing worth
+   *  asserting is that a single *test* does not build several. */
   static built: number[][] = [];
   /** Reset per test: how many times the codec was actually reached. */
   static decodeCalls = 0;
@@ -94,16 +98,13 @@ class FakeOfflineAudioContext {
 
 /**
  * A file of `bytes` bytes whose *contents* never matter to the fake decoder —
- * but whose first twelve bytes do, because that is what decides which size cap
- * applies. `header` is written at offset 0 as ASCII; the default is a
- * compressed-looking file.
+ * but whose header does, because that is what decides which size cap applies.
+ * The default header is a compressed-looking file.
  *
  * Built as a stub rather than a real Blob so the oversize cases do not have to
  * allocate tens of megabytes to be tested.
  */
-function fakeFile(bytes: number, header = "\0\0\0\0\0\0\0\0\0\0\0\0"): File {
-  const head = new Uint8Array(12);
-  for (let i = 0; i < Math.min(12, header.length); i++) head[i] = header.charCodeAt(i);
+function fakeFile(bytes: number, head: Uint8Array = new Uint8Array(HEADER_SNIFF_BYTES)): File {
   return {
     size: bytes,
     slice: (start: number, end: number) => ({
@@ -113,9 +114,77 @@ function fakeFile(bytes: number, header = "\0\0\0\0\0\0\0\0\0\0\0\0"): File {
   } as unknown as File;
 }
 
+function ascii(head: Uint8Array, at: number, text: string): void {
+  for (let i = 0; i < text.length; i++) head[at + i] = text.charCodeAt(i);
+}
+
+interface WavShape {
+  /** 1 = PCM, 3 = float, and anything else is a codec: 0x11 IMA ADPCM,
+   *  0x55 an entire MP3 stream inside a WAV, 0xFFFE extensible. */
+  format?: number;
+  channels?: number;
+  sampleRate?: number;
+  bits?: number;
+  /** A chunk to put in front of `fmt `, as real writers do. */
+  lead?: string;
+}
+
+/** A RIFF/WAVE header with a real `fmt ` chunk in it. The defaults are what
+ *  this app's own Save button writes. */
+function wavHeader({
+  format = 1,
+  channels = 1,
+  sampleRate = 48000,
+  bits = 16,
+  lead,
+}: WavShape = {}): Uint8Array {
+  const head = new Uint8Array(HEADER_SNIFF_BYTES);
+  const view = new DataView(head.buffer);
+  ascii(head, 0, "RIFF");
+  ascii(head, 8, "WAVE");
+  let at = 12;
+  if (lead !== undefined) {
+    ascii(head, at, lead);
+    view.setUint32(at + 4, 8, true);
+    at += 16;
+  }
+  ascii(head, at, "fmt ");
+  view.setUint32(at + 4, 16, true);
+  view.setUint16(at + 8, format, true);
+  view.setUint16(at + 10, channels, true);
+  view.setUint32(at + 12, sampleRate, true);
+  view.setUint32(at + 16, (sampleRate * channels * bits) / 8, true);
+  view.setUint16(at + 20, (channels * bits) / 8, true);
+  view.setUint16(at + 22, bits, true);
+  return head;
+}
+
+/** The AIFF counterpart: a `COMM` chunk, big-endian, with the sample rate as
+ *  an 80-bit extended float. `codec` makes it an AIFC. */
+function aiffHeader(bits = 16, codec?: string): Uint8Array {
+  const head = new Uint8Array(HEADER_SNIFF_BYTES);
+  const view = new DataView(head.buffer);
+  ascii(head, 0, "FORM");
+  ascii(head, 8, codec === undefined ? "AIFF" : "AIFC");
+  ascii(head, 12, "COMM");
+  view.setUint32(16, codec === undefined ? 18 : 22, false);
+  view.setUint16(20, 1, false); // channels
+  view.setUint32(22, 48000, false); // frames
+  view.setUint16(26, bits, false);
+  // 44100 as an 80-bit extended float: exponent, then a 64-bit mantissa whose
+  // leading 1 is explicit. Exact in a double for a rate this size.
+  const exponent = Math.floor(Math.log2(44100));
+  const mantissa = 44100 * 2 ** (63 - exponent);
+  view.setUint16(28, 16383 + exponent, false);
+  view.setUint32(30, Math.floor(mantissa / 2 ** 32), false);
+  view.setUint32(34, mantissa % 2 ** 32, false);
+  if (codec !== undefined) ascii(head, 38, codec);
+  return head;
+}
+
 /** A RIFF/WAVE file of `bytes` bytes — what this app's own Save button writes. */
-function fakeWav(bytes: number): File {
-  return fakeFile(bytes, "RIFF\0\0\0\0WAVE");
+function fakeWav(bytes: number, shape?: WavShape): File {
+  return fakeFile(bytes, wavHeader(shape));
 }
 
 function ramp(length: number, from: number, to: number): Float32Array {
@@ -130,6 +199,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Before the unstub, and the ordering is the point: the module parks the
+  // context it built in a module-level variable, and `unstubAllGlobals` only
+  // takes the *constructor* off the global object. Without this line every
+  // later test in the process decodes against a fake belonging to a test that
+  // has already finished.
+  resetDecodeContext();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -282,7 +357,8 @@ describe("decoding a file", () => {
     const built = FakeOfflineAudioContext.built.length;
     outcome = { kind: "promise", buffer: new FakeAudioBuffer([ramp(480, 0, 1)], 48000) };
     for (let i = 0; i < 5; i++) await decodeAudioFile(fakeFile(1024));
-    expect(FakeOfflineAudioContext.built).toHaveLength(built);
+    // One, for this test's own stub — see `resetDecodeContext` in the teardown.
+    expect(FakeOfflineAudioContext.built).toHaveLength(built + 1);
     expect(FakeOfflineAudioContext.decodeCalls).toBe(5);
   });
 });
@@ -331,6 +407,86 @@ describe("the size cap", () => {
 
     outcome = { kind: "promise", buffer: new FakeAudioBuffer([ramp(480, 0, 1)], 48000) };
     await expect(decodeAudioFile(fakeWav(ownExport))).resolves.toBeDefined();
+  });
+
+  it("grants the big tier on the format chunk, not on the magic bytes", () => {
+    // The hole this closes: `RIFF....WAVE` says the container is uncompressed
+    // and says nothing whatever about the samples. A WAV is free to hold 8-bit
+    // 8 kHz PCM — 32 MB of that is 70 minutes and ~1.6 GB decoded — or IMA
+    // ADPCM, or an entire MP3 stream. All three pass a twelve-byte sniff.
+    expect(uncompressedByteLimit(wavHeader())).toBe(MAX_UNCOMPRESSED_BYTES);
+    expect(uncompressedByteLimit(wavHeader({ format: 3, bits: 32 }))).toBe(MAX_UNCOMPRESSED_BYTES);
+    expect(uncompressedByteLimit(wavHeader({ channels: 2, sampleRate: 44100 }))).toBe(
+      MAX_UNCOMPRESSED_BYTES,
+    );
+
+    // 8-bit, ADPCM, MP3-in-WAV, and `WAVE_FORMAT_EXTENSIBLE` — whose real tag
+    // is behind a GUID this deliberately does not parse.
+    expect(uncompressedByteLimit(wavHeader({ bits: 8, sampleRate: 8000 }))).toBeNull();
+    expect(uncompressedByteLimit(wavHeader({ format: 0x11 }))).toBeNull();
+    expect(uncompressedByteLimit(wavHeader({ format: 0x55 }))).toBeNull();
+    expect(uncompressedByteLimit(wavHeader({ format: 0xfffe, bits: 24 }))).toBeNull();
+  });
+
+  it("computes the cap from the expansion rather than assuming one", () => {
+    // Passing the format test is not enough on its own: 16-bit PCM at 8 kHz is
+    // legal, uncompressed and *six times* the seconds per byte of the 48 kHz
+    // file the 32 MB ceiling was sized for. The cap has to follow the rate.
+    const slow = uncompressedByteLimit(wavHeader({ sampleRate: 8000 })) as number;
+    expect(slow).toBeLessThan(MAX_UNCOMPRESSED_BYTES);
+    expect(slow).toBeGreaterThan(MAX_COMPRESSED_BYTES);
+
+    // And what "the cap" means: at that size the decode lands on the budget,
+    // not past it. Peak is one float per channel at 48 kHz plus the mono copy.
+    const seconds = slow / ((8000 * 1 * 16) / 8);
+    expect(seconds * DECODE_SAMPLE_RATE * 4 * 2).toBeLessThanOrEqual(512 * 1024 * 1024);
+
+    // The same file at 48 kHz is bounded by the ceiling instead — a phone can
+    // afford four times this much of it, and 32 MB is the judgment call there.
+    expect(uncompressedByteLimit(wavHeader())).toBe(MAX_UNCOMPRESSED_BYTES);
+  });
+
+  it("finds the format chunk behind the padding real writers put first", () => {
+    // `fmt ` is normally at byte 12 and nothing requires it: JUNK padding for
+    // alignment, a LIST of metadata, a bext broadcast chunk. Missing it would
+    // silently demote every file that has one.
+    expect(uncompressedByteLimit(wavHeader({ lead: "JUNK" }))).toBe(MAX_UNCOMPRESSED_BYTES);
+    expect(uncompressedByteLimit(wavHeader({ lead: "LIST" }))).toBe(MAX_UNCOMPRESSED_BYTES);
+  });
+
+  it("reads AIFF's own format chunk, and does not trust an AIFC", () => {
+    expect(uncompressedByteLimit(aiffHeader(16))).toBe(MAX_UNCOMPRESSED_BYTES);
+    expect(uncompressedByteLimit(aiffHeader(8))).toBeNull();
+    // An AIFC is an AIFF that may be compressed — `sowt` is little-endian PCM
+    // and safe, `ima4` is 4:1 ADPCM and is exactly the case the magic misses.
+    expect(uncompressedByteLimit(aiffHeader(16, "sowt"))).toBe(MAX_UNCOMPRESSED_BYTES);
+    expect(uncompressedByteLimit(aiffHeader(16, "ima4"))).toBeNull();
+  });
+
+  it("resolves every unknown downwards", () => {
+    // Being wrong in this direction costs a sentence on screen; being wrong in
+    // the other one kills the tab. So: no format chunk, a truncated one, a
+    // nonsense rate, a header shorter than the magic — all compressed.
+    const noFmt = new Uint8Array(64);
+    ascii(noFmt, 0, "RIFF");
+    ascii(noFmt, 8, "WAVE");
+    expect(uncompressedByteLimit(noFmt)).toBeNull();
+
+    const cut = wavHeader().slice(0, 20);
+    expect(uncompressedByteLimit(cut)).toBeNull();
+    expect(uncompressedByteLimit(wavHeader({ sampleRate: 0 }))).toBeNull();
+    expect(uncompressedByteLimit(wavHeader({ channels: 0 }))).toBeNull();
+    expect(uncompressedByteLimit(new Uint8Array(4))).toBeNull();
+  });
+
+  it("refuses a mislabelled WAV before the codec sees it", async () => {
+    // End to end, because the tiering is only worth anything if the cap it
+    // picks is the one that runs. 8-bit 8 kHz at 32 MB is the ~1.6 GB decode.
+    const calls = FakeOfflineAudioContext.decodeCalls;
+    await expect(
+      decodeAudioFile(fakeWav(MAX_UNCOMPRESSED_BYTES, { bits: 8, sampleRate: 8000 })),
+    ).rejects.toThrow(/too large/i);
+    expect(FakeOfflineAudioContext.decodeCalls).toBe(calls);
   });
 
   it("sniffs the container rather than trusting a name or a MIME type", () => {

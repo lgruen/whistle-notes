@@ -59,12 +59,32 @@ export const DEFAULT_CONFIG: DspConfig = {
     // enough that the ordinary few-dB breathing of room tone is all still
     // evidence.
     backgroundAboveFloorDb: 12,
-    // −70 dBFS. A backstop, not a gate — see VoicingConfig. Chosen from
-    // the reference recording rather than from taste: its quietest in-note
-    // frame measures −63.8 dBFS in band (a note's dying fall) and its room
-    // sits around −67, so −70 is below everything that recording contains as
-    // signal and the adaptive floor decides every frame of it. What it does
-    // catch is digital silence at −240, which is not a room at all.
+    // −70 dBFS, and closer to the signal than "backstop" suggests. Measured on
+    // the reference recording: the quietest in-note frame is −69.4 dBFS in band
+    // (a note's dying fall) — 0.6 dB of clearance — and the room reads −67.5
+    // dBFS as the median of every frame outside a note, −73.7 as the median of
+    // frames a clear 150 ms from one. In the real gaps the 20th percentile of
+    // those frames — the statistic the adaptive floor tracks — sits near −83,
+    // so `floor + 12` is about −71 and the maximum in `levelGate` picks *this*
+    // number: the absolute floor is what decides the quiet stretches of that
+    // recording, not a rule that never fires. (Run it with `absoluteFloorDb:
+    // -Infinity` and the take holds at 38 notes from 0 to −30 dB of
+    // attenuation, so the extra notes below are this constant's doing.)
+    //
+    // It stays at −70 anyway. Lowering it gives back, in proportion, the hole
+    // it exists for: one muted stretch at −240 dBFS drags the percentile down
+    // with it, `floor + 12` goes to −228, every frame in the file clears it,
+    // and the level gate silently stops existing for the whole take.
+    //
+    // What that costs, stated plainly. Behaviour is robust to attenuation of
+    // the reference take — 38 notes at full level, 40 at −18 dB, the melody
+    // intact throughout — because the notes are ~40 dB above the floor and the
+    // adaptive floor follows the level down. But there is a hard cliff at the
+    // bottom, measured on a synthetic five-note melody: at −69.0 dBFS in band
+    // the transcript is complete, at −71.0 dBFS it is empty, and nothing in
+    // between says why. A user whose whole take lands under the floor gets "no
+    // notes found" with no diagnostic — except that the debug panel prints each
+    // frame's `bandRmsDb` in dBFS, which is where that question is answered.
     absoluteFloorDb: -70,
     // Asymmetric by design — see VoicingConfig. Starting a note demands
     // 12 dB over the floor; holding one needs only 6.

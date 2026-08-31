@@ -312,6 +312,42 @@ describe("a wobble on a melody", () => {
     }
   });
 
+  /**
+   * The grid that pins `CENTRE_WINDOW_MS`, which has no config key and so no
+   * entry in the golden sweep.
+   *
+   * Thirteen legato runs with nothing but pitch marking the boundaries: nine
+   * whole-tone runs of 350 ms notes, four chromatic runs of 300 ms notes. The
+   * short chromatic ones are the load-bearing half — the centre window is
+   * 300 ms, and the constant's binding constraint is that it stay under the
+   * note it has to fit inside, not merely over a vibrato cycle.
+   *
+   * Measured by sweeping the constant against this grid: 200–300 ms all pass,
+   * 320 fails 2 (the 300 ms cells), 340 fails 4 (all of them), 360 fails 12,
+   * 450 fails 9; going the other way, 160 fails 1 and 120 fails 3 as the wobble
+   * starts leaking into the centre. A 7 % change either side of the default is
+   * therefore visible here, which is the whole point of writing it down.
+   */
+  const CENTRE_WINDOW_GRID: [number[], number, number, number][] = [
+    ...[50, 60, 70].flatMap((cents) =>
+      [4.5, 5, 5.5].map(
+        (hz) => [[84, 86, 88, 90, 92, 94], cents, hz, 0.35] as [number[], number, number, number],
+      ),
+    ),
+    ...[50, 60, 70, 80].map(
+      (cents) => [[84, 85, 86, 87, 88, 89], cents, 5, 0.3] as [number[], number, number, number],
+    ),
+  ];
+
+  it("holds the centre window inside the shortest note on the grid", () => {
+    for (const [melody, cents, hz, durSec] of CENTRE_WINDOW_GRID) {
+      expect(
+        legato(melody, cents, hz, durSec),
+        `${melody.join(",")} ±${cents}c@${hz}Hz ${durSec * 1000}ms`,
+      ).toEqual(melody);
+    }
+  });
+
   it("reads an ascending legato run rather than collapsing it", () => {
     // Runs are the worst case for a chain: every merge moves the median the
     // same way as the melody. Six notes, two-semitone steps, wobble up to

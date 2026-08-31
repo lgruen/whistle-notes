@@ -479,12 +479,23 @@ const MOVEMENT_STALL_MS = 80;
  *  between them is the wobble's full peak-to-peak, not its amplitude.
  *
  *  Applied to the *whole chain*, not per merge: twice this is the widest the
- *  reported pitches of all the fragments being reunited may span between them,
- *  so a wobble of up to roughly ±2 semitones about its centre is still put back
- *  together and one wider than that comes apart. Measured against the chain's
- *  own extremes rather than its running median, because a bound that moves as
- *  the median moves is not a bound at all — see `mergeWobbles`. Measured: one
- *  note through ±200 cents at 4 Hz, several at ±300. */
+ *  reported pitches of all the fragments being reunited may span between them.
+ *  Measured against the chain's own extremes rather than its running median,
+ *  because a bound that moves as the median moves is not a bound at all — see
+ *  `mergeWobbles`.
+ *
+ *  What it is *not* is the thing that decides where reassembly stops. Swept on
+ *  the ±60 to ±300 cent wobble ladder, every value from 0.75 to 8 gives the same
+ *  transcripts, and the whole test suite passes unchanged at 8; only below about
+ *  0.7 does it start to bite, and then hard — at 0.5 a ±90-cent vibrato comes
+ *  apart into nine alternating notes. Read it as a sanity rail with a wide
+ *  margin, not as a tuned edge.
+ *
+ *  The reassembly limit is real and worth recording — one note through ±200 and
+ *  ±250 cents at 4 Hz, three notes at ±300 — but it is set somewhere this
+ *  constant cannot reach: sweeping it, and `WOBBLE_CENTRE_SEMITONES` over
+ *  0.6–1.5, leaves that boundary exactly where it is. A change chasing it should
+ *  not start here, and where it *does* live has not been established. */
 const MAX_WOBBLE_SEMITONES = 2;
 
 /** How far the pitch an oscillation is centred on may wander across the
@@ -668,10 +679,41 @@ function markTransitional(
   return { transitional, oscillating };
 }
 
-/** Window the local pitch centre is measured over, in milliseconds. Chosen to
- *  span a whole cycle of the slowest wobble anyone produces (human vibrato
- *  bottoms out around 4 Hz, so 250 ms), because a half-cycle window would
- *  report the wobble's own swing as movement of its centre. */
+/**
+ * Window the local pitch centre is measured over, in milliseconds.
+ *
+ * The lower bound is the one the design argues for: it must span a whole cycle
+ * of the slowest wobble anyone produces (human vibrato bottoms out around 4 Hz,
+ * so 250 ms), because a half-cycle window reports the wobble's own swing as
+ * movement of its centre. That is not the binding constraint.
+ *
+ * **It must also stay under the shortest legato note it will meet.** The
+ * estimate below picks the least-spread window *containing* the frame, which
+ * works because some window of this width fits inside the note the frame
+ * belongs to. Once the width exceeds the note, no such window exists: every
+ * candidate straddles a boundary, the midpoint of the extremes lands between
+ * the two pitches, and the centre — the one measurement that is supposed to be
+ * unambiguous — smears across exactly the place it has to be sharp.
+ *
+ * Measured on a 13-cell grid of legato runs (see `test/glide.test.ts`), with
+ * the shortest notes in it 300 ms long. The band is narrow on both sides and
+ * this value sits at the top edge of it:
+ *
+ *     120 ms → 3 wrong   (wobble leaking into the centre)
+ *     160 ms → 1 wrong
+ *     200–300 ms → 0 wrong
+ *     320 ms → 2 wrong   (+7 %: the 300 ms cells only)
+ *     340 ms → 4 wrong   (all four 300 ms cells)
+ *     360 ms → 12 wrong  (+20 %: the 350 ms cells go too)
+ *     450 ms → 9 wrong
+ *
+ * Read the other way, with the window held at 300: an ascending run of 300 ms
+ * notes transcribes perfectly, 280 ms notes fail 8 cells of 9, 260 ms all 9. So
+ * the edge is at window ≈ note length, and the rule for changing this number is
+ * to keep it under ~0.9× the shortest legato note expected — which at 300 ms
+ * means notes of about 330 ms and up, not merely "longer than a vibrato cycle".
+ * Raising it to buy wobble immunity trades away short notes, silently.
+ */
 const CENTRE_WINDOW_MS = 300;
 
 /**

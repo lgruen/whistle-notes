@@ -308,10 +308,32 @@ setCaptureHandlers({
   onLimitReached: finishRecording,
   onInterrupted(message) {
     if (getState().phase !== "recording") return;
+    // Read before finishing: whatever is on the warning line at this moment is
+    // the processing warning, `finishRecording` clears it on the empty-take
+    // path, and this handler used to overwrite it on the other one. It is the
+    // single most useful line there is when a take comes back empty on a
+    // phone, and an interruption is no reason to throw it away.
+    const processing = getState().warning;
     finishRecording();
+
+    // `hasRecording` is the honest question, and the two answers need
+    // different sentences. A take that captured nothing lands on idle with no
+    // notes, no playback and nothing to save — telling that user "here is what
+    // was captured" points at an empty screen. It is also exactly the shape of
+    // the WebKit silent-graph failure, so it is the case where being precise
+    // about what happened matters most.
+    if (!getState().hasRecording) {
+      // A message, not a warning: this is *what happened*, and `applyResult`
+      // never runs on this path to overwrite it.
+      setState({
+        message: "Recording was interrupted before any audio was captured.",
+        warning: processing,
+      });
+      return;
+    }
     // Not `message`: `finishRecording` clears that, and `applyResult` sets it
     // again. The warning line survives both and is where non-fatal news goes.
-    setState({ warning: message });
+    setState({ warning: processing ? `${message} ${processing}` : message });
   },
 });
 
