@@ -1,7 +1,7 @@
 /*
- * Theme lives entirely in custom properties so the canvas piano-roll and the
- * SVG staff (later milestones) can read the same colours back out with
- * getComputedStyle instead of hard-coding a second, drifting palette.
+ * Theme lives entirely in custom properties: later milestones draw a canvas
+ * piano roll and an SVG staff, and both read these values back rather than
+ * carrying a second copy of the palette that would drift on the first tweak.
  */
 :root {
   color-scheme: dark light;
@@ -18,6 +18,9 @@
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);
   --safe-right: env(safe-area-inset-right, 0px);
+
+  --dock-height: 5.5rem;
+  --radius: 0.75rem;
 }
 
 @media (prefers-color-scheme: light) {
@@ -51,48 +54,223 @@ body {
   font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   padding:
     var(--safe-top) var(--safe-right)
-    var(--safe-bottom) var(--safe-left);
+    calc(var(--dock-height) + var(--safe-bottom)) var(--safe-left);
   -webkit-text-size-adjust: 100%;
 }
 
-/* Kills the 300 ms tap delay on the controls that arrive in M4. */
+/* Kills the 300 ms tap delay on every control. */
 button {
   touch-action: manipulation;
+  font: inherit;
+  color: inherit;
 }
+
+/* ── Header ─────────────────────────────────────────────────────────── */
+
+.header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg);
+  border-bottom: 1px solid var(--surface);
+}
+
+.brand {
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--accent);
+}
+
+.octave {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface);
+  border-radius: 999px;
+}
+
+.octave button {
+  min-width: 2.5rem;
+  min-height: 2rem;
+  padding: 0 0.4rem;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.octave button.is-active {
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 700;
+}
+
+/* ── Live readout (the hot path's only DOM) ─────────────────────────── */
 
 .app {
   flex: 1;
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  gap: 0.5rem;
-  padding: 1.5rem;
+  gap: 0.75rem;
+  width: 100%;
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 0.75rem;
+}
+
+.live {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.live-note {
+  font-size: clamp(3.5rem, 18vw, 4.5rem);
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The cents bar spans ±50 cents around the nearest note, so one cent is one
+   percent of its width — which is why the needle can be positioned by a
+   transform alone, with no layout read in the animation loop. */
+.cents {
+  position: relative;
+  width: min(18rem, 100%);
+  height: 0.6rem;
+  background: var(--surface);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.cents-center {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  margin-left: -0.5px;
+  background: var(--text-dim);
+  opacity: 0.6;
+}
+
+.cents-needle {
+  position: absolute;
+  inset: 0;
+  opacity: var(--needle-opacity, 0.25);
+  transform: translateX(calc(var(--cents, 0) * 1%));
+}
+
+.cents-needle::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  margin-left: -1.5px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.meter {
+  width: min(18rem, 100%);
+  height: 3px;
+  background: var(--surface);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.meter-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent-dim);
+  transform: scaleX(var(--level, 0));
+  transform-origin: left center;
+}
+
+.hint,
+.clock {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+
+.clock {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+}
+
+.message {
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text-dim);
+  font-size: 0.85rem;
   text-align: center;
 }
 
-.title {
-  margin: 0;
-  font-size: clamp(2rem, 9vw, 3rem);
+.message.is-error {
+  color: var(--danger);
+}
+
+/* ── Dock ───────────────────────────────────────────────────────────── */
+
+.dock {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding:
+    0.6rem calc(0.75rem + var(--safe-right))
+    calc(0.6rem + var(--safe-bottom)) calc(0.75rem + var(--safe-left));
+  background: var(--bg);
+  border-top: 1px solid var(--surface);
+}
+
+.btn {
+  min-height: 3.5rem;
+  border: 0;
+  border-radius: 999px;
   font-weight: 700;
-  letter-spacing: -0.02em;
-  color: var(--accent);
 }
 
-.tagline {
-  margin: 0;
-  color: var(--text);
+.btn:disabled {
+  opacity: 0.45;
 }
 
-.status {
-  margin: 0;
-  color: var(--text-dim);
-  font-size: 0.875rem;
+.btn-record {
+  flex: 1;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 1.15rem;
+}
+
+.btn-record.is-recording {
+  background: var(--danger);
+  color: #fff;
 }
 
 .footer {
-  padding: 0.75rem 1rem;
+  padding: 0.75rem 0 0;
   text-align: center;
   color: var(--text-dim);
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  opacity: 0.7;
 }

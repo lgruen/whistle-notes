@@ -22,14 +22,46 @@
     <title>Whistle Notes</title>
   </head>
   <body>
+    <!-- Single screen, thumb-first: everything that reports lives in the
+         scrolling middle, everything that acts lives in the fixed dock at the
+         bottom where a thumb actually reaches. -->
+    <header class="header">
+      <span class="brand">Whistle&nbsp;Notes</span>
+      <!-- Display octave. Whistling sits one to two octaves above the treble
+           staff, so this is nearly always -1 or -2; it changes what is drawn
+           and played, never what was heard. -->
+      <div class="octave" id="transpose" role="group" aria-label="Display octave">
+        <button type="button" data-transpose="0" aria-pressed="false">0</button>
+        <button type="button" data-transpose="-1" aria-pressed="false">−1</button>
+        <button type="button" data-transpose="-2" aria-pressed="false">−2</button>
+      </div>
+    </header>
+
     <main class="app">
-      <h1 class="title">Whistle Notes</h1>
-      <p class="tagline">Whistle a melody, see the piano notes to play.</p>
-      <p class="status" id="status">Scaffold — audio pipeline lands in a later milestone.</p>
+      <section class="live">
+        <div class="live-note" id="live-note" aria-live="off">—</div>
+        <div class="cents" aria-hidden="true">
+          <span class="cents-center"></span>
+          <span class="cents-needle" id="live-needle"></span>
+        </div>
+        <div class="meter" aria-hidden="true">
+          <span class="meter-fill" id="live-level"></span>
+        </div>
+        <p class="hint" id="live-hint">Tap Record and whistle a melody.</p>
+        <p class="clock" id="live-time"></p>
+      </section>
+
+      <p class="message" id="message" hidden></p>
+
+      <footer class="footer">
+        <span id="build-stamp"></span>
+      </footer>
     </main>
-    <footer class="footer">
-      <span id="build-stamp"></span>
-    </footer>
+
+    <div class="dock">
+      <button type="button" class="btn btn-record" id="record">Record</button>
+    </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
