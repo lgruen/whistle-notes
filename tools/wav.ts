@@ -166,10 +166,14 @@ export function encodeWav(samples: Float32Array, sampleRate: number): Uint8Array
   view.setUint32(40, dataLength, true);
 
   for (let i = 0; i < samples.length; i++) {
-    const clamped = Math.max(-1, Math.min(1, samples[i]));
-    // Asymmetric scaling: int16 runs −32768…32767, so +1.0 must map to 32767
-    // and −1.0 to −32768 if a full-scale sine is not to clip on one side only.
-    view.setInt16(44 + i * 2, clamped < 0 ? clamped * 32768 : clamped * 32767, true);
+    // Scale by 32768 (not 32767) so that this is the exact inverse of the
+    // reader's divide-by-32768, and *round* rather than truncate: `setInt16`
+    // truncates towards zero, which would add a half-LSB DC-ward bias to every
+    // sample. Clamp afterwards, since only +1.0 itself overflows, and clamp
+    // rather than let it wrap — a wrap turns the loudest moment of a recording
+    // into white noise, spectacularly and silently.
+    const scaled = Math.round(samples[i] * 32768);
+    view.setInt16(44 + i * 2, Math.max(-32768, Math.min(32767, scaled)), true);
   }
 
   return new Uint8Array(buffer);
