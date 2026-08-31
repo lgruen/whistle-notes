@@ -1,11 +1,12 @@
 import { registerSW } from "virtual:pwa-register";
 import FFT from "fft.js";
 import "./app.css";
-import { transcribe } from "./dsp/index.js";
+import { transcribe, type Note } from "./dsp/index.js";
 import {
   CaptureAborted,
   CaptureError,
   MAX_RECORD_SEC,
+  getLiveFrames,
   getLiveStatus,
   processingWarning,
   startRecording,
@@ -13,13 +14,19 @@ import {
 } from "./audio/capture.js";
 import { createControls } from "./ui/controls.js";
 import { createLiveView } from "./ui/live.js";
+import { initNoteList, renderNoteList } from "./ui/notelist.js";
+import { drawPianoRoll, resetRollRange } from "./ui/pianoroll.js";
 import { applyResult, getState, setState, setTranspose, subscribe, type AppState } from "./ui/state.js";
+import { invalidatePalette } from "./ui/theme.js";
 
 function element<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);
   if (!found) throw new Error(`missing element #${id}`);
   return found as T;
 }
+
+const canvas = element<HTMLCanvasElement>("roll");
+const noteListElement = element("notelist");
 
 const live = createLiveView({
   note: element("live-note"),
@@ -28,6 +35,8 @@ const live = createLiveView({
   hint: element("live-hint"),
   time: element("live-time"),
 });
+
+initNoteList(noteListElement);
 
 const controls = createControls(
   {
@@ -42,14 +51,36 @@ const controls = createControls(
   },
 );
 
-/* ── Rendering (cold path) ─────────────────────────────────────────── */
+/* ── Rendering (cold path) ──────────────────────────────────────────────
+ *
+ * Every state change re-renders, but the chip list is rebuilt only when its
+ * *content* changed — there is no point re-running `innerHTML` because a phase
+ * flag moved.
+ */
+
+let renderedNotes: readonly Note[] | null = null;
+let renderedTranspose = NaN;
 
 function render(state: AppState): void {
   controls.render(state);
 
-  // While recording, the readout belongs to the animation loop — touching it
-  // from here would fight it.
+  if (state.notes !== renderedNotes || state.transpose !== renderedTranspose) {
+    renderedNotes = state.notes;
+    renderedTranspose = state.transpose;
+    renderNoteList(noteListElement, state.notes, state.transpose);
+  }
+
+  // While recording, the readout and the roll belong to the animation loop —
+  // touching them from here would fight it.
   if (state.phase === "recording") return;
+
+  drawPianoRoll(canvas, {
+    frames: state.frames,
+    notes: state.notes,
+    transpose: state.transpose,
+    playingIndex: state.playingIndex,
+    live: false,
+  });
 
   switch (state.phase) {
     case "analyzing":
@@ -76,8 +107,8 @@ subscribe(render);
 /* ── The hot path ──────────────────────────────────────────────────────
  *
  * One rAF loop, alive only while the microphone is open. It reads the frame
- * buffer that `capture.ts` fills directly and writes to a text node and two CSS
- * custom properties. Nothing here calls setState — see the note in state.ts.
+ * buffer that `capture.ts` fills directly and writes to one text node and one
+ * canvas. Nothing here calls setState — see the note in state.ts.
  */
 
 let loopHandle = 0;
@@ -85,7 +116,16 @@ let loopHandle = 0;
 function loop(): void {
   loopHandle = requestAnimationFrame(loop);
   const status = getLiveStatus();
-  live.tick(status, getState().transpose, MAX_RECORD_SEC);
+  const transpose = getState().transpose;
+
+  live.tick(status, transpose, MAX_RECORD_SEC);
+  drawPianoRoll(canvas, {
+    frames: getLiveFrames(),
+    notes: [],
+    transpose,
+    playingIndex: null,
+    live: true,
+  });
 
   // The 60 s cap is enforced here rather than in the capture module so that
   // stopping goes through exactly the same path as tapping Stop.
@@ -105,6 +145,7 @@ function stopLoop(): void {
  * `await` before it would end the gesture. See `audio/capture.ts`.
  */
 function beginRecording(): void {
+  resetRollRange();
   const started = startRecording();
 
   setState({
@@ -164,6 +205,23 @@ function finishRecording(): void {
 }
 
 /* ── Environment ───────────────────────────────────────────────────── */
+
+window.addEventListener("resize", () => {
+  // The canvas backing store is sized in device pixels from a CSS-pixel box, so
+  // it has to hear about an orientation change; the palette cache might also be
+  // stale after a theme switch.
+  invalidatePalette();
+  const state = getState();
+  if (state.phase !== "recording") {
+    drawPianoRoll(canvas, {
+      frames: state.frames,
+      notes: state.notes,
+      transpose: state.transpose,
+      playingIndex: state.playingIndex,
+      live: false,
+    });
+  }
+});
 
 /**
  * Third leg of the fft.js interop smoke test (vitest and tsx being the other

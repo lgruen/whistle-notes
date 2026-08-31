@@ -1,7 +1,9 @@
 /*
- * Theme lives entirely in custom properties: later milestones draw a canvas
- * piano roll and an SVG staff, and both read these values back rather than
- * carrying a second copy of the palette that would drift on the first tweak.
+ * Theme lives entirely in custom properties so the canvas piano-roll and the
+ * SVG staff can read the same colours back out with getComputedStyle instead of
+ * hard-coding a second, drifting palette. `src/ui/theme.ts` is the reader; the
+ * SVG staff needs no reader at all, because it is inline in the document and
+ * can just use var() below.
  */
 :root {
   color-scheme: dark light;
@@ -223,6 +225,94 @@ button {
 
 .message.is-error {
   color: var(--danger);
+}
+
+/* ── Piano roll ─────────────────────────────────────────────────────── */
+
+.roll {
+  display: block;
+  width: 100%;
+  height: clamp(9rem, 26vh, 15rem);
+  background: var(--surface);
+  border-radius: var(--radius);
+}
+
+/* ── Transcript chips ───────────────────────────────────────────────── */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.chip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 2.75rem;
+  padding: 0.25rem 0.45rem;
+  border-radius: 0.5rem;
+  background: var(--surface);
+  line-height: 1.2;
+}
+
+.chip-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.chip-len {
+  color: var(--text-dim);
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.chip.is-playing {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.chip.is-playing .chip-len {
+  color: var(--bg);
+  opacity: 0.75;
+}
+
+.chip-rest {
+  align-self: center;
+  padding: 0 0.1rem;
+  color: var(--text-dim);
+  opacity: 0.6;
+}
+
+.sequence {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.sequence-text {
+  flex: 1;
+  overflow-x: auto;
+  white-space: nowrap;
+  padding: 0.4rem 0.5rem;
+  border-radius: 0.5rem;
+  background: var(--surface);
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+}
+
+.copy {
+  flex: none;
+  min-height: 2.25rem;
+  padding: 0 0.75rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.5rem;
+  background: transparent;
+  color: var(--accent);
+  font-size: 0.8rem;
 }
 
 /* ── Dock ───────────────────────────────────────────────────────────── */
