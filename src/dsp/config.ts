@@ -106,8 +106,24 @@ export const DEFAULT_CONFIG: DspConfig = {
     // Where a movement begins and ends. A whistle held steady wanders by a few
     // cents between frames, which at a 10.7 ms hop is already a couple of
     // semitones per second, so this cannot be near zero; a real scoop runs at
-    // 8–40. 3 separates them with room to spare, and it only ever decides
-    // *extent* — how far a movement reaches — never whether one happened.
+    // 8–40. It only ever decides *extent* — how far a movement reaches — never
+    // whether one happened.
+    //
+    // Not a plateau, and an earlier comment claiming "room to spare" was
+    // wrong. Measured on the 150-shape scoop grid it degrades monotonically
+    // upwards — 150/150 at 1.5–2, 149 at 2.5–3, 148 at 3.5–4.5, 147 at 5, 138
+    // at 8 — because a movement whose ends are cut short stops being
+    // recognised as one. On the reference recording it is exact at 3 and at
+    // 5–10, and differs by one note at 2 and at 3.5–4.5. Those two facts point
+    // in different directions and 3 is where they meet: the best value the
+    // synthetic evidence still agrees with.
+    //
+    // The recording's disagreement at 3.5–4.5 is worth naming, because it looks
+    // like a knife edge and is not one. The note that changes is a 150 ms
+    // gesture at 21.36 s measured at 1440.5 Hz — 47 cents flat of F#6, which is
+    // 53 cents sharp of F6. It is a coin flip between two piano keys, and a
+    // couple of frames moving in or out of the attack trim is enough to tip it.
+    // What is delicate there is the whistling, not the threshold.
     glideMinSlopeStPerSec: 3,
     // 80 cents. Under half of this is wobble; a movement that covers most of a
     // semitone and does not come back is a transition however long it took.

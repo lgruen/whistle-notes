@@ -1,15 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG, mergeConfig, type DspConfig, type PitchFrame } from "../src/dsp/index.js";
-import { FrameSource, parseSetting } from "../tools/transcribe-file.js";
+import { FrameSource, parseSetting, sweepPlan } from "../tools/transcribe-file.js";
 
 /**
- * The offline harness's two silent-wrong-answer bugs.
+ * The offline harness's silent-wrong-answer bugs.
  *
- * Neither of these produced an error or an obviously bad transcription. Both
- * produced a *plausible* one — a number that parsed to NaN, a sweep that
- * re-labelled frames it had not recomputed — which is the expensive kind of
- * wrong, because the output of this tool is the evidence every DSP decision in
- * the project is argued from.
+ * None of these produced an error or an obviously bad transcription. All of
+ * them produced *plausible* output — a number that parsed to NaN, a sweep that
+ * re-labelled frames it had not recomputed, a refusal that could not say what
+ * it was refusing, a run that answered most of the question and then failed
+ * with the answers still on the screen. That is the expensive kind of wrong,
+ * because the output of this tool is the evidence every DSP decision in the
+ * project is argued from.
  */
 
 describe("--set", () => {
@@ -77,6 +79,39 @@ describe("the frame cache", () => {
       const cfg: DspConfig = mergeConfig(DEFAULT_CONFIG, { analysis });
       expect(source.needsAnalysis(cfg)).toBe(true);
       expect(() => source.frames(cfg)).toThrow(/different analysis settings/);
+    }
+  });
+
+  it("names the setting that differs, even one the cache has never heard of", () => {
+    // A cache written by an older build can be missing a key the current config
+    // has. Iterating one side's keys only, the difference is invisible and the
+    // error says "unknown difference" — for exactly the case where knowing
+    // which setting moved is the whole of the answer.
+    const older = {
+      ...cache,
+      analysis: Object.fromEntries(
+        Object.entries(DEFAULT_CONFIG.analysis).filter(([k]) => k !== "subOctaveToleranceDb"),
+      ) as DspConfig["analysis"],
+    };
+    const source = new FrameSource(undefined, older);
+    expect(() => source.frames(DEFAULT_CONFIG)).toThrow(/subOctaveToleranceDb \(absent\) → 6/);
+  });
+
+  it("refuses a whole sweep before printing any of it", () => {
+    // The first combination of this sweep is servable and the second is not.
+    // Running them in order prints a perfectly formatted, perfectly correct
+    // answer and *then* errors — and a screenful of results above an error that
+    // scrolls away is the kind of output that ends up quoted in a commit
+    // message. So the plan is checked end to end before the first line.
+    const source = new FrameSource(undefined, cache);
+    const plan = sweepPlan(DEFAULT_CONFIG, ["analysis.windowSize=2048,4096"]);
+    expect(plan).toHaveLength(2);
+    expect(() => source.check(plan[0].cfg)).not.toThrow();
+    expect(() => source.check(plan[1].cfg)).toThrow(/different analysis settings/);
+
+    // A segmentation sweep is servable throughout, however many points it has.
+    for (const step of sweepPlan(DEFAULT_CONFIG, ["segment.toleranceCents=40,60,80"])) {
+      expect(() => source.check(step.cfg)).not.toThrow();
     }
   });
 

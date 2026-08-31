@@ -179,10 +179,23 @@ function analysisKey(analysis: DspConfig["analysis"]): string {
   );
 }
 
+/**
+ * Which analysis settings differ, for an error message a human can act on.
+ *
+ * Over the *union* of both key sets, not over one of them: a cache written by
+ * an older build can be missing a key the current config has, or carry one it
+ * has dropped, and iterating either side alone reports "unknown difference" for
+ * exactly the case that needs explaining most.
+ */
 function analysisDifferences(a: DspConfig["analysis"], b: DspConfig["analysis"]): string[] {
   const out: string[] = [];
-  for (const key of Object.keys(a) as (keyof DspConfig["analysis"])[]) {
-    if (a[key] !== b[key]) out.push(`analysis.${key} ${String(b[key])} → ${String(a[key])}`);
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const key of [...keys].sort() as (keyof DspConfig["analysis"])[]) {
+    if (a[key] !== b[key]) {
+      const was = key in b ? String(b[key]) : "(absent)";
+      const now = key in a ? String(a[key]) : "(absent)";
+      out.push(`analysis.${key} ${was} → ${now}`);
+    }
   }
   return out;
 }
@@ -217,22 +230,34 @@ class FrameSource {
     return !this.byAnalysis.has(analysisKey(cfg.analysis));
   }
 
+  /**
+   * Throw now if this config could never be served.
+   *
+   * Separate from `frames()` so a sweep can check *every* combination before it
+   * prints anything. A sweep that discovers the problem halfway through has
+   * already put a screenful of perfectly formatted results on the terminal, and
+   * a run that answers most of the question and then errors is a run whose
+   * output invites being used — the failure scrolls away and the numbers stay.
+   */
+  check(cfg: DspConfig): void {
+    if (!this.needsAnalysis(cfg) || this.file) return;
+    const [known] = [...this.byAnalysis.values()];
+    const changes = known ? analysisDifferences(cfg.analysis, known.analysis) : [];
+    throw new Error(
+      `the cached frames were computed with different analysis settings ` +
+        `(${changes.join(", ") || "unknown difference"}). Frames cannot be re-segmented under ` +
+        `analysis settings they were not produced with — re-run against the audio file instead ` +
+        `of --from-cache.`,
+    );
+  }
+
   frames(cfg: DspConfig): FrameCache {
     const key = analysisKey(cfg.analysis);
     const hit = this.byAnalysis.get(key);
     if (hit) return hit;
 
-    if (!this.file) {
-      const [known] = [...this.byAnalysis.values()];
-      const changes = known ? analysisDifferences(cfg.analysis, known.analysis) : [];
-      throw new Error(
-        `the cached frames were computed with different analysis settings ` +
-          `(${changes.join(", ") || "unknown difference"}). Frames cannot be re-segmented under ` +
-          `analysis settings they were not produced with — re-run against the audio file instead ` +
-          `of --from-cache.`,
-      );
-    }
-    const computed = computeFrames(this.file, cfg);
+    this.check(cfg);
+    const computed = computeFrames(this.file as string, cfg);
     this.byAnalysis.set(key, computed);
     return computed;
   }
@@ -442,6 +467,8 @@ function main(): void {
   let cfg = options.preset ? presetConfig(options.preset) : DEFAULT_CONFIG;
   cfg = applySettings(cfg, options.sets);
 
+  // Everything a `--sweep` will ask for, resolved and checked before a single
+  // line of output. See `sweepPlan`.
   let source: FrameSource;
   if (options.fromCache) {
     const loaded = JSON.parse(readFileSync(options.fromCache, "utf8")) as FrameCache;
@@ -456,6 +483,8 @@ function main(): void {
     if (!options.file) throw new Error("usage: transcribe-file.ts <file.wav> [flags]");
     source = new FrameSource(options.file);
   }
+  const plan = options.sweeps.length > 0 ? sweepPlan(cfg, options.sweeps) : [];
+  for (const step of plan) source.check(step.cfg);
   const cache = source.frames(cfg);
 
   if (options.framesCache) {
@@ -481,8 +510,8 @@ function main(): void {
     console.log("");
   }
 
-  if (options.sweeps.length > 0) {
-    runSweep(source, cfg, options.sweeps);
+  if (plan.length > 0) {
+    runSweep(source, plan);
     return;
   }
 
@@ -505,8 +534,13 @@ function main(): void {
  * Cartesian product of every `--sweep key=a,b,c`, re-segmenting each time —
  * and re-running the FFT stage for any combination that changes `analysis.*`,
  * which is announced in the output so that a sweep's cost is never a mystery.
+ *
+ * Every combination is parsed and checked for serveability *before* the first
+ * line is printed. A sweep that fails halfway leaves a screenful of correct
+ * answers on the terminal above an error that scrolls away, and those answers
+ * are exactly the kind of thing that ends up quoted in a commit message.
  */
-function runSweep(source: FrameSource, base: DspConfig, sweeps: string[]): void {
+function sweepPlan(base: DspConfig, sweeps: string[]): { combination: string; cfg: DspConfig }[] {
   const axes = sweeps.map((sweep) => {
     const eq = sweep.indexOf("=");
     if (eq < 0) throw new Error(`--sweep needs group.key=v1,v2,…, got ${sweep}`);
@@ -522,13 +556,19 @@ function runSweep(source: FrameSource, base: DspConfig, sweeps: string[]): void 
     combinations.splice(0, combinations.length, ...next);
   }
 
-  for (const combination of combinations) {
-    const cfg = applySettings(base, combination);
+  return combinations.map((parts) => ({
+    combination: parts.join(" "),
+    cfg: applySettings(base, parts),
+  }));
+}
+
+function runSweep(source: FrameSource, plan: { combination: string; cfg: DspConfig }[]): void {
+  for (const { combination, cfg } of plan) {
     const refft = source.needsAnalysis(cfg);
     const cache = source.frames(cfg);
     const { notes, tuningOffsetCents } = segmentNotes(cache.frames, cfg, cache.sampleRate);
     console.log(
-      `${combination.join(" ").padEnd(38)} → ${String(notes.length).padStart(3)} notes, ` +
+      `${combination.padEnd(38)} → ${String(notes.length).padStart(3)} notes, ` +
         `tune ${centsString(tuningOffsetCents).padStart(3)}c : ${sequenceLine(notes)}` +
         `${refft ? `\n  (FFT stage re-run: ${cache.frames.length} frames)` : ""}`,
     );
@@ -538,7 +578,7 @@ function runSweep(source: FrameSource, base: DspConfig, sweeps: string[]): void 
 // Run only when invoked as a script, so the argument parsing and the frame
 // cache can be unit-tested. They are worth testing: both have silently
 // produced *plausible* wrong answers, which is the expensive kind.
-export { FrameSource, parseSetting };
+export { FrameSource, parseSetting, sweepPlan };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
