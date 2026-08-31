@@ -12,6 +12,7 @@ import {
   shiftDraft,
   targetFromNotes,
   trimDraft,
+  trimDraftTo,
   type TargetDraft,
 } from "../src/practice/target.js";
 
@@ -69,6 +70,42 @@ describe("a draft", () => {
     for (let i = 0; i < 20; i++) d = trimDraft(d, "end");
     expect(draftNoteCount(d)).toBe(1);
     expect(draftNotes(d)).toHaveLength(1);
+  });
+
+  it("cuts the nearer end back to a tapped note", () => {
+    // The gesture a video trimmer uses, and the reason it exists: a MIDI import
+    // is hundreds of notes long and the phrase worth practising is the first
+    // eight, which is sixty taps of the Drop button and one of this.
+    expect(draftNotes(trimDraftTo(draft(), 1)).map((note) => note.midi)).toEqual([74, 76, 74, 72]);
+    expect(draftNotes(trimDraftTo(draft(), 3)).map((note) => note.midi)).toEqual([72, 74, 76, 74]);
+  });
+
+  it("pushes the kept range back out to a tapped note that was dropped", () => {
+    // Same gesture in the other direction, which is what makes it its own undo.
+    const trimmed = { ...draft(), keepFrom: 2, keepTo: 3 };
+    expect(draftNotes(trimDraftTo(trimmed, 0)).map((note) => note.midi)).toEqual([72, 74, 76]);
+    expect(draftNotes(trimDraftTo(trimmed, 4)).map((note) => note.midi)).toEqual([76, 74, 72]);
+  });
+
+  it("always leaves a kept range with the tapped note in it", () => {
+    // Swept, because the two branches are where an off-by-one would produce an
+    // empty or inverted range — and an empty range is a target with no notes.
+    for (let keepFrom = 0; keepFrom < NOTES.length; keepFrom++) {
+      for (let keepTo = keepFrom + 1; keepTo <= NOTES.length; keepTo++) {
+        for (let index = 0; index < NOTES.length; index++) {
+          const next = trimDraftTo({ ...draft(), keepFrom, keepTo }, index);
+          const where = `${keepFrom}..${keepTo} tapping ${index}`;
+          expect(next.keepFrom, where).toBeLessThanOrEqual(index);
+          expect(next.keepTo, where).toBeGreaterThan(index);
+          expect(draftNoteCount(next), where).toBeGreaterThan(0);
+        }
+      }
+    }
+  });
+
+  it("ignores a tap on a note that is not there", () => {
+    const d = draft();
+    for (const index of [-1, 5, 1.5, NaN]) expect(trimDraftTo(d, index)).toBe(d);
   });
 
   it("keeps the trimmed notes, so trimming can be undone", () => {

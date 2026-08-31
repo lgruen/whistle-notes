@@ -122,6 +122,8 @@ export interface PracticeHandlers {
   onCloseMidi(): void;
 
   onTrimDraft(end: "start" | "end"): void;
+  /** Cut the nearer end of the kept range back to one note, by index. */
+  onTrimDraftTo(index: number): void;
   onResetTrim(): void;
   /** Move the whole draft by whole octaves. */
   onShiftDraft(delta: number): void;
@@ -226,15 +228,15 @@ export function targetRowHtml(target: PracticeTarget): string {
  * came from.
  */
 export const DRAFT_HINT_RECORDED =
-  "This is what the app heard. Drop anything at the ends that was not part of " +
-  "the melody, and move the whole thing up or down if it came out further away " +
-  "than you played it — that happens most on the deepest piano keys.";
+  "This is what the app heard. Tap a note to cut the nearer end back to it, and " +
+  "move the whole thing up or down if it came out further away than you played " +
+  "it — that happens most on the deepest piano keys.";
 
 /** The same screen, for a melody that arrived from a file rather than a
  *  microphone: nothing was *heard*, so there is nothing to doubt. */
 export const DRAFT_HINT_IMPORTED =
-  "Drop anything at the ends you do not want, move the whole thing up or down " +
-  "if you like, then give it a name.";
+  "Tap a note to cut the nearer end back to it, keeping just the phrase you " +
+  "want. Move the whole thing up or down if you like, then give it a name.";
 
 export function draftHint(draft: TargetDraft): string {
   return draft.source === "recorded" ? DRAFT_HINT_RECORDED : DRAFT_HINT_IMPORTED;
@@ -252,11 +254,15 @@ export function draftMetaText(draft: TargetDraft): string {
 }
 
 /**
- * The draft's notes, as chips.
+ * The draft's notes, as chips — and as the trim control itself.
  *
- * Trimmed notes stay on screen, greyed, rather than disappearing: seeing what
- * is about to go is the whole feedback loop of the two Drop buttons, and it is
- * what makes "Keep all" a visible undo rather than a leap of faith.
+ * Buttons rather than spans, because tapping one cuts the nearer end of the
+ * kept range back to it (see `trimDraftTo`); the Drop buttons underneath are
+ * the fine adjustment. Trimmed notes stay on screen, greyed, rather than
+ * disappearing: seeing what is about to go is the whole feedback loop, it is
+ * what makes "Keep all" a visible undo rather than a leap of faith, and a
+ * dropped chip has to remain tappable for the gesture to work in both
+ * directions.
  */
 export function draftChipsHtml(draft: TargetDraft): string {
   return draft.notes
@@ -264,9 +270,9 @@ export function draftChipsHtml(draft: TargetDraft): string {
       const kept = index >= draft.keepFrom && index < draft.keepTo;
       const name = midiToName(note.midi + 12 * draft.octaveShift);
       return (
-        `<span class="chip${kept ? "" : " is-dropped"}">` +
+        `<button type="button" class="chip${kept ? "" : " is-dropped"}" data-i="${index}">` +
         `<span class="chip-name">${name}</span>` +
-        `</span>`
+        `</button>`
       );
     })
     .join("");
@@ -378,6 +384,14 @@ export function createPracticeView(
     if (id) handlers.onPickMelody(id);
   });
   elements.midiBack.addEventListener("click", () => handlers.onCloseMidi());
+
+  // Delegated, because the chips are rebuilt from a string on every edit.
+  elements.draftNotes.addEventListener("click", (event) => {
+    const index = (event.target as HTMLElement | null)
+      ?.closest<HTMLElement>("[data-i]")
+      ?.getAttribute("data-i");
+    if (index !== null && index !== undefined) handlers.onTrimDraftTo(Number(index));
+  });
 
   elements.draftBack.addEventListener("click", () => handlers.onDiscardDraft());
   elements.draftTrimStart.addEventListener("click", () => handlers.onTrimDraft("start"));

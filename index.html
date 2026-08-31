@@ -155,7 +155,9 @@
           <button type="button" class="ghost" id="practice-draft-back">← Back</button>
           <h2 class="practice-title">New melody</h2>
           <p class="practice-lead" id="practice-draft-hint"></p>
-          <div class="chips" id="practice-draft-notes"></div>
+          <!-- Also the trim control: tapping a note cuts the nearer end of the
+               melody back to it. See draftChipsHtml in src/ui/practice.ts. -->
+          <div class="chips chips-draft" id="practice-draft-notes"></div>
           <p class="practice-meta" id="practice-draft-meta"></p>
           <p class="practice-meta" id="practice-draft-note" hidden></p>
 

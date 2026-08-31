@@ -253,7 +253,11 @@ same `{name, source, notes: {midi, durSec}[]}` whatever they came from:
 
 Recorded and MIDI melodies stop at a **draft** (`TargetDraft` in `target.ts`),
 which holds the untouched notes plus a kept range and an octave shift, so
-trimming is always undoable. Drafts are never persisted — restoring a half-made
+trimming is always undoable. The chips *are* the trim control — tapping one
+moves the nearer end of the kept range to it, which cuts when the note is kept
+and restores when it is dropped; the Drop buttons are the fine adjustment. Both
+exist because a whistled take needs one note off each end and a MIDI import
+needs sixty. Drafts are never persisted — restoring a half-made
 target on the next launch would confront the user with notes they no longer
 remember recording.
 

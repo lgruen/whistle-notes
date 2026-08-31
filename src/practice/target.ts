@@ -237,7 +237,31 @@ export function trimDraft(draft: TargetDraft, end: "start" | "end"): TargetDraft
     : { ...draft, keepTo: draft.keepTo - 1 };
 }
 
-/** Put every note back. The undo for the two buttons above. */
+/**
+ * Cut the nearer end back to one note — or push it back out to one.
+ *
+ * The Drop buttons are right for a whistled take, which needs one note off the
+ * front and maybe one off the back. They are useless for an import: a real MIDI
+ * file's melody track runs to hundreds of notes, and the phrase worth practising
+ * is the first eight of them. Sixty taps is not a trim control.
+ *
+ * So a note is also a tap target, and the rule is the one a video trimmer uses:
+ * whichever end of the kept range is nearer moves to the note you tapped. That
+ * makes it a *cut* when the note is inside the kept range and a *restore* when
+ * it is outside, which is the same gesture in both directions and needs no
+ * second control to undo it.
+ */
+export function trimDraftTo(draft: TargetDraft, index: number): TargetDraft {
+  if (!Number.isInteger(index) || index < 0 || index >= draft.notes.length) return draft;
+  // Midpoint of the kept range, so "nearer" is measured against what is on
+  // screen as kept rather than against the whole take.
+  const middle = (draft.keepFrom + draft.keepTo - 1) / 2;
+  return index <= middle
+    ? { ...draft, keepFrom: index, keepTo: Math.max(draft.keepTo, index + 1) }
+    : { ...draft, keepTo: index + 1, keepFrom: Math.min(draft.keepFrom, index) };
+}
+
+/** Put every note back. The undo for every trim above. */
 export function resetDraftTrim(draft: TargetDraft): TargetDraft {
   return { ...draft, keepFrom: 0, keepTo: draft.notes.length };
 }

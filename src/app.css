@@ -337,12 +337,16 @@ button {
   gap: 0.3rem;
 }
 
+/* `border: 0` because a draft's chips are <button>s — they are the trim
+   control — while the transcript's are spans. Everything else about them is
+   the same on purpose: it is the same object in two states. */
 .chip {
   display: flex;
   flex-direction: column;
   align-items: center;
   min-width: 2.75rem;
   padding: 0.25rem 0.45rem;
+  border: 0;
   border-radius: 0.5rem;
   background: var(--surface);
   line-height: 1.2;
@@ -611,8 +615,16 @@ button {
   gap: 0.4rem;
 }
 
+/* Taller than a transcript chip, because these are tap targets: tapping one
+   cuts the nearer end of the melody back to it. */
+.chips-draft .chip {
+  min-height: 2.5rem;
+  justify-content: center;
+}
+
 /* Trimmed notes stay visible so the Drop buttons have something to point at,
-   and so "Keep all" reads as an undo rather than a gamble. */
+   so "Keep all" reads as an undo rather than a gamble, and so tapping one can
+   push the kept range back out to it. */
 .chip.is-dropped {
   opacity: 0.35;
   text-decoration: line-through;

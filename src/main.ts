@@ -59,6 +59,7 @@ import {
   shiftDraft,
   targetFromNotes,
   trimDraft,
+  trimDraftTo,
   type TargetDraft,
 } from "./practice/target.js";
 import { createControls } from "./ui/controls.js";
@@ -230,6 +231,7 @@ const practice = createPracticeView(
     onCloseMidi: () => showLibrary(),
 
     onTrimDraft: (end) => reviseDraft((draft) => trimDraft(draft, end)),
+    onTrimDraftTo: (index) => reviseDraft((draft) => trimDraftTo(draft, index)),
     onResetTrim: () => reviseDraft(resetDraftTrim),
     onShiftDraft: (delta) => reviseDraft((draft) => shiftDraft(draft, delta)),
     onRenameDraft: (name) => reviseDraft((draft) => ({ ...draft, name })),

@@ -341,6 +341,7 @@ function mountPractice(): {
     onPickMelody: vi.fn(),
     onCloseMidi: vi.fn(),
     onTrimDraft: vi.fn(),
+    onTrimDraftTo: vi.fn(),
     onResetTrim: vi.fn(),
     onShiftDraft: vi.fn(),
     onRenameDraft: vi.fn(),
@@ -600,7 +601,7 @@ describe("the draft screen", () => {
   it("shows every note, and greys the ones that are about to go", () => {
     const { el, render } = mountPractice();
     render({ screen: "draft", draft: { ...DRAFT, keepFrom: 1, keepTo: 4 } });
-    const chips = el.draftNotes.innerHTML.split("</span></span>");
+    const chips = el.draftNotes.innerHTML.split("</button>");
     // Five chips, of which the first and last are struck out.
     expect(el.draftNotes.innerHTML.match(/class="chip[ "]/g)).toHaveLength(5);
     expect(chips[0]).toContain("is-dropped");
@@ -647,7 +648,11 @@ describe("the draft screen", () => {
     el.draftHigher.click();
     el.draftSave.click();
     el.draftBack.click();
+    clickChild(el.draftNotes, "data-i", "3");
     expect(handlers.onTrimDraft.mock.calls).toEqual([["start"], ["end"]]);
+    // A number, not the string the attribute holds: the store's trim does index
+    // arithmetic with it.
+    expect(handlers.onTrimDraftTo).toHaveBeenCalledWith(3);
     expect(handlers.onResetTrim).toHaveBeenCalledTimes(1);
     expect(handlers.onShiftDraft.mock.calls).toEqual([[-1], [1]]);
     expect(handlers.onSaveDraft).toHaveBeenCalledTimes(1);
