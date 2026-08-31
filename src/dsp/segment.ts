@@ -295,10 +295,7 @@ function runStateMachine(cfg: DspConfig, input: StateMachineInput): Draft[] {
       if (accepted.length === 0) {
         pending.push({ index: i, m });
         const from = confirmedFrom();
-        if (from < 0) {
-          if (pending.length > s.confirmFrames) pending.shift();
-          continue;
-        }
+        if (from < 0) continue;
         const claimed = pending.slice(from);
         current.firstPitchIndex = claimed[0].index;
         for (const p of claimed) accepted.push(p.m);
@@ -343,12 +340,7 @@ function runStateMachine(cfg: DspConfig, input: StateMachineInput): Draft[] {
       // is a wobble, and only a run of mutually consistent ones is a new note.
       pending.push({ index: i, m });
       const from = confirmedFrom();
-      if (from < 0) {
-        // Scattered, not a new pitch. Retire the oldest candidate — it stays
-        // in the note's time span, just not in its pitch — and keep watching.
-        if (pending.length > s.confirmFrames) pending.shift();
-        continue;
-      }
+      if (from < 0) continue;
 
       const claimed = pending.slice(from);
       current.endIndex = claimed[0].index - 1;
