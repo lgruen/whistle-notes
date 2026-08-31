@@ -9,7 +9,6 @@ import {
   scoreText,
   takeawayText,
   targetPlayback,
-  targetPlaybackSec,
   transpositionText,
   verdictChips,
   type HeardNote,
@@ -95,11 +94,6 @@ describe("playing a target", () => {
     const scheduled = targetPlayback([{ midi: 84, durSec: 0 }]);
     expect(scheduled[0].endSec).toBe(0);
     expect(scheduled[0].durationSec).toBe(0);
-  });
-
-  it("says how long the whole thing takes", () => {
-    expect(targetPlaybackSec(melody([84, 86], 0.5))).toBeCloseTo(1 + TARGET_GAP_SEC, 12);
-    expect(targetPlaybackSec([])).toBe(0);
   });
 });
 

@@ -130,16 +130,6 @@ export function targetPlayback(
   return out;
 }
 
-/** Total sounding length of a target, gaps included — for "about 4 seconds". */
-export function targetPlaybackSec(
-  notes: readonly TargetNote[],
-  gapSec: number = TARGET_GAP_SEC,
-): number {
-  const scheduled = targetPlayback(notes, gapSec);
-  const last = scheduled[scheduled.length - 1];
-  return last ? last.endSec : 0;
-}
-
 /* ── The overlay ──────────────────────────────────────────────────────── */
 
 /** What happened at one drawn position: a target slot's verdict, or a note that
