@@ -28,6 +28,20 @@ export interface RollView {
   /** True while recording: the plot grows with the take and the vertical range
    *  is only ever widened, so held notes do not make the axis breathe. */
   live: boolean;
+  /**
+   * The take's global tuning bias in cents, as measured by the segmenter.
+   *
+   * The rectangles are drawn at pitches the segmenter arrived at *after* taking
+   * this bias out (`correctedMidi = midiFloat - offset/100`), so a trail drawn
+   * from raw Hz would sit up to half a semitone away from the very notes it is
+   * supposed to explain — the picture would say the segmenter had boxed the
+   * wrong pitch, which is exactly the accusation this view exists to settle.
+   * Shifting the trail by the same amount puts both on one reference.
+   *
+   * Omitted (or 0) while live, where no offset has been measured yet: the live
+   * trail is raw by definition, and there are no rectangles to disagree with.
+   */
+  tuningOffsetCents?: number;
 }
 
 /** Frames below this are breath and room noise; drawing them would bury the
@@ -70,9 +84,12 @@ export function rollMidiRange(
   frames: readonly PitchFrame[],
   notes: readonly Note[],
   previous?: MidiRange | null,
+  /** Semitones subtracted from the trail before it is drawn; see
+   *  {@link RollView.tuningOffsetCents}. */
+  trailShift = 0,
 ): MidiRange {
   const extent = { min: Infinity, max: -Infinity };
-  extendExtent(extent, frames, 0);
+  extendExtent(extent, frames, 0, trailShift);
   for (const note of notes) {
     if (note.midi < extent.min) extent.min = note.midi;
     if (note.midi > extent.max) extent.max = note.midi;
@@ -82,11 +99,16 @@ export function rollMidiRange(
 
 /** Widen `extent` by the frames from `from` onwards. Split out from
  *  {@link rollMidiRange} so the live path can scan only what is new. */
-function extendExtent(extent: MidiRange, frames: readonly PitchFrame[], from: number): void {
+function extendExtent(
+  extent: MidiRange,
+  frames: readonly PitchFrame[],
+  from: number,
+  trailShift: number,
+): void {
   for (let i = from; i < frames.length; i++) {
     const frame = frames[i];
     if (frame.hz === null || frame.clarity < TRAIL_MIN_CLARITY) continue;
-    const midi = hzToMidiFloat(frame.hz);
+    const midi = hzToMidiFloat(frame.hz) - trailShift;
     if (!Number.isFinite(midi)) continue;
     if (midi < extent.min) extent.min = midi;
     if (midi > extent.max) extent.max = midi;
@@ -134,6 +156,8 @@ let liveRange: MidiRange | null = null;
 let liveExtent: MidiRange = { min: Infinity, max: -Infinity };
 let liveScanned = 0;
 let cachedSize: { width: number; height: number } | null = null;
+let sizeObserver: ResizeObserver | null = null;
+let observed: HTMLCanvasElement | null = null;
 
 /** Call when a new take starts, so the axis is not inherited from the last. */
 export function resetRollRange(): void {
@@ -145,6 +169,30 @@ export function resetRollRange(): void {
 /** Drop the cached element size — call on resize or orientation change. */
 export function invalidateRollSize(): void {
   cachedSize = null;
+}
+
+/**
+ * Watch the canvas itself for size changes.
+ *
+ * A window `resize` listener only catches the reasons the *window* changed
+ * size, and the canvas has others: the warning line appearing mid-take, the
+ * message line growing to two rows, the transcript pushing the layout around.
+ * Each of those re-flows the canvas without a resize event, and the live path
+ * would then keep drawing into a stale cached height — a plot silently
+ * stretched or squashed against its own gridlines.
+ *
+ * Best-effort by design: `ResizeObserver` is everywhere that matters but the
+ * feature test costs one line, and without it the window listener in `main.ts`
+ * still covers the common case.
+ */
+function observeSize(canvas: HTMLCanvasElement): void {
+  if (observed === canvas || typeof ResizeObserver === "undefined") return;
+  sizeObserver?.disconnect();
+  observed = canvas;
+  // The observer fires once on `observe`, which is a free invalidation of a
+  // cache that is about to be filled anyway.
+  sizeObserver = new ResizeObserver(invalidateRollSize);
+  sizeObserver.observe(canvas);
 }
 
 /** The canvas's CSS size, measured at most once per resize while live. */
@@ -163,6 +211,7 @@ export function rollSpanSec(frames: readonly PitchFrame[], live: boolean): numbe
 export function drawPianoRoll(canvas: HTMLCanvasElement, view: RollView): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
+  observeSize(canvas);
 
   // Device-pixel scaling. The canvas is sized in CSS pixels by the stylesheet;
   // its backing store has to be sized in device pixels or every line is a
@@ -178,13 +227,20 @@ export function drawPianoRoll(canvas: HTMLCanvasElement, view: RollView): void {
   ctx.clearRect(0, 0, width, height);
 
   const palette = readPalette(canvas);
+  /*
+   * Semitones to lower the trail by so it lines up with the rectangles. Live
+   * takes get none: no offset has been measured yet, and the live trail is the
+   * raw measurement by definition. See {@link RollView.tuningOffsetCents}.
+   */
+  const trailShift = view.live ? 0 : (view.tuningOffsetCents ?? 0) / 100;
+
   let range: MidiRange;
   if (view.live) {
     // The frame buffer is appended to and never rewritten, so only the tail is
     // new. (If it ever got shorter, the take restarted without a reset — start
     // the scan over rather than trust a stale extent.)
     if (view.frames.length < liveScanned) resetRollRange();
-    extendExtent(liveExtent, view.frames, liveScanned);
+    extendExtent(liveExtent, view.frames, liveScanned, trailShift);
     liveScanned = view.frames.length;
     // Notes are empty while live, but folding them into a copy rather than into
     // the accumulator keeps this correct if that ever changes.
@@ -196,7 +252,7 @@ export function drawPianoRoll(canvas: HTMLCanvasElement, view: RollView): void {
     liveRange = padExtent(extent, liveRange);
     range = liveRange;
   } else {
-    range = rollMidiRange(view.frames, view.notes);
+    range = rollMidiRange(view.frames, view.notes, null, trailShift);
   }
   const spanSec = rollSpanSec(view.frames, view.live);
 
@@ -253,7 +309,9 @@ export function drawPianoRoll(canvas: HTMLCanvasElement, view: RollView): void {
       penDown = false;
       continue;
     }
-    const midi = hzToMidiFloat(frame.hz);
+    // Same shift the segmenter applied before rounding, so trail and
+    // rectangles are drawn against one reference.
+    const midi = hzToMidiFloat(frame.hz) - trailShift;
     if (!Number.isFinite(midi)) {
       penDown = false;
       continue;

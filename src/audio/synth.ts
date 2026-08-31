@@ -10,6 +10,7 @@
 
 import { midiToHz, type Note } from "../dsp/index.js";
 import { transposeMidi } from "../notes/format.js";
+import { isRecording } from "./capture.js";
 
 /** A note placed on the playback timeline, in seconds from the first note. */
 export interface ScheduledNote {
@@ -97,8 +98,24 @@ export function isPlaying(): boolean {
 }
 
 /**
- * Start playback. Must be called synchronously from a tap handler — a fresh
- * `AudioContext` is created here and can only autoplay inside a gesture.
+ * Start playback; returns whether it actually started.
+ *
+ * Must be called synchronously from a tap handler — a fresh `AudioContext` is
+ * created here and can only autoplay inside a gesture.
+ *
+ * ## Why the microphone check lives here
+ *
+ * Echo cancellation is switched off on purpose (it eats whistles), so a phone
+ * playing this synth into its own open microphone would transcribe itself. The
+ * UI already disables the Play button while recording, but a *disabled button*
+ * is a presentation detail: it does not survive a keyboard activation racing a
+ * state change, a stray `beginPlayback()` from a future caller, or anyone
+ * reordering `render()`. The rule belongs where the resource is acquired, so
+ * refusing here makes it structural rather than cosmetic.
+ *
+ * The refusal is reported rather than silent because the caller has UI state to
+ * keep in step: a `playing: true` set against a playback that never started
+ * leaves a Stop button that stops nothing.
  *
  * ## Why a fresh context per playback
  *
@@ -113,10 +130,13 @@ export function startPlayback(
   notes: readonly Note[],
   transpose: number,
   playbackHandlers: PlaybackHandlers,
-): void {
+): boolean {
+  // Before `stopPlayback()`: a refused start must change nothing at all.
+  if (isRecording()) return false;
+
   stopPlayback();
   const scheduled = playbackSchedule(notes, transpose);
-  if (scheduled.length === 0) return;
+  if (scheduled.length === 0) return false;
 
   ctx = new AudioContext();
   // Swallowed, not left floating: Safari rejects `resume()` when it disagrees
@@ -178,6 +198,7 @@ export function startPlayback(
     raf = requestAnimationFrame(tick);
   };
   raf = requestAnimationFrame(tick);
+  return true;
 }
 
 /** Stop playback immediately, without a click, and release the context. */

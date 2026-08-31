@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { midiToHz, midiToName, type Note } from "../src/dsp/index.js";
 
 /**
  * The capture module's *lifecycle*, tested with a fake Web Audio stack.
@@ -29,6 +30,15 @@ const CAP_SEC = 60;
  *  whole point of several tests below is that this ends up empty. */
 const openTracks = new Set<FakeTrack>();
 
+/** What the fake platform claims it granted. Constraints are requests, not
+ *  commands, so a device is free to hand back a track with its voice
+ *  processing still on — which is the case worth warning about. */
+let grantedSettings: Record<string, boolean> = {
+  noiseSuppression: false,
+  echoCancellation: false,
+  autoGainControl: false,
+};
+
 class FakeTrack {
   readyState: "live" | "ended" = "live";
   muted = false;
@@ -42,7 +52,9 @@ class FakeTrack {
   }
 
   getSettings(): Record<string, boolean> {
-    return { noiseSuppression: false, echoCancellation: false, autoGainControl: false };
+    // A stopped track is not obliged to remember anything, and this one does
+    // not: the settings have to be snapshotted while the track is live.
+    return this.readyState === "ended" ? {} : { ...grantedSettings };
   }
 
   addEventListener(_type: string, listener: Listener): void {
@@ -84,7 +96,21 @@ class FakeNode {
 }
 
 class FakeGain extends FakeNode {
-  gain = { value: 1 };
+  /** Enough of an `AudioParam` for the synth to schedule an envelope on it —
+   *  the capture path only ever reads and writes `value`. */
+  gain = {
+    value: 1,
+    setValueAtTime(): void {},
+    linearRampToValueAtTime(): void {},
+    cancelScheduledValues(): void {},
+  };
+}
+
+class FakeOscillator extends FakeNode {
+  type = "";
+  frequency = { value: 0 };
+  start(): void {}
+  stop(): void {}
 }
 
 /** Whether a suspended context comes back when `resume()` is called. */
@@ -126,6 +152,10 @@ class FakeAudioContext {
 
   createMediaStreamSource(): FakeNode {
     return new FakeNode();
+  }
+
+  createOscillator(): FakeOscillator {
+    return new FakeOscillator();
   }
 
   /** The audio session was interrupted — a call, a route change, iOS. */
@@ -173,6 +203,11 @@ function installGlobals(): void {
   pendingPrompts.length = 0;
   gumMode = "grant";
   resumeRestores = true;
+  grantedSettings = {
+    noiseSuppression: false,
+    echoCancellation: false,
+    autoGainControl: false,
+  };
 
   vi.stubGlobal("AudioContext", FakeAudioContext);
   vi.stubGlobal("AudioWorkletNode", FakeWorkletNode);
@@ -236,7 +271,7 @@ describe("starting a take", () => {
     await capture.startRecording();
     feed(CAP_SEC);
     expect(capture.getLiveStatus().elapsedSec).toBe(CAP_SEC);
-    expect(capture.stopRecording().samples.length).toBe(CAP_SEC * SAMPLE_RATE);
+    expect(capture.stopRecording()?.samples.length).toBe(CAP_SEC * SAMPLE_RATE);
 
     // Now tap Record again. The animation loop starts as soon as the tap
     // handler returns and reads this *while the permission prompt is still up*.
@@ -256,7 +291,7 @@ describe("starting a take", () => {
     feed(1);
 
     expect(capture.getLiveStatus().elapsedSec).toBeCloseTo(1, 6);
-    expect(capture.stopRecording().samples.length).toBe(SAMPLE_RATE);
+    expect(capture.stopRecording()?.samples.length).toBe(SAMPLE_RATE);
     expect(limits).toHaveLength(1);
   });
 
@@ -327,7 +362,7 @@ describe("a start that was overtaken", () => {
     // And it really is still recording, not merely flagged as such.
     feed(0.5);
     expect(capture.getLiveStatus().elapsedSec).toBeCloseTo(1, 6);
-    expect(capture.stopRecording().samples.length).toBe(SAMPLE_RATE);
+    expect(capture.stopRecording()?.samples.length).toBe(SAMPLE_RATE);
   });
 
   it("still closes its own context rather than leaking it", async () => {
@@ -368,7 +403,7 @@ describe("the 60 s cap", () => {
     expect(capture.getLiveStatus().elapsedSec).toBe(CAP_SEC);
     expect(limitCalls).toBe(1);
 
-    expect(capture.stopRecording().samples.length).toBe(CAP_SEC * SAMPLE_RATE);
+    expect(capture.stopRecording()?.samples.length).toBe(CAP_SEC * SAMPLE_RATE);
   });
 
   it("can stop the take from inside the audio callback", async () => {
@@ -377,7 +412,7 @@ describe("the 60 s cap", () => {
     capture.setCaptureHandlers({
       // Exactly what main.ts does: the same finish path a tap on Stop takes.
       onLimitReached: () => {
-        captured = capture.stopRecording().samples;
+        captured = capture.stopRecording()?.samples ?? null;
       },
       onInterrupted: () => {},
     });
@@ -415,7 +450,7 @@ describe("an interrupted audio session", () => {
     // UI stuck on "recording" until the user gives up and reloads.
     expect(interruptions).toHaveLength(1);
     expect(interruptions[0]).toMatch(/interrupted/i);
-    expect(capture.stopRecording().samples.length).toBe(SAMPLE_RATE);
+    expect(capture.stopRecording()?.samples.length).toBe(SAMPLE_RATE);
   });
 
   it("says nothing when the context comes back", async () => {
@@ -453,5 +488,177 @@ describe("an interrupted audio session", () => {
 
     expect(interruptions).toHaveLength(1);
     expect(interruptions[0]).toMatch(/microphone/i);
+  });
+});
+
+describe("stopping when there is no take", () => {
+  it("returns null instead of inventing an empty one", async () => {
+    const capture = await loadCapture();
+
+    // Never started at all.
+    expect(capture.stopRecording()).toBeNull();
+
+    // Started, but the permission prompt is still up: this is the tap-Record-
+    // then-tap-Stop path, and it is the one that used to return a zero-length
+    // buffer at a *guessed* 48 kHz. The caller transcribed that into a
+    // confident "no notes found" about audio that never existed.
+    gumMode = "hang";
+    const pending = capture.startRecording();
+    expect(capture.stopRecording()).toBeNull();
+
+    pendingPrompts[0].resolve(new FakeStream());
+    await expect(pending).rejects.toBeInstanceOf(capture.CaptureAborted);
+  });
+
+  it("still releases everything, because Stop is also how a pending start is abandoned", async () => {
+    const capture = await loadCapture();
+    gumMode = "hang";
+    const pending = capture.startRecording();
+    const orphan = FakeAudioContext.instances[0];
+
+    expect(capture.stopRecording()).toBeNull();
+
+    // The null return says "no audio"; it must not be read as "nothing to do".
+    // This teardown is what invalidates the in-flight start.
+    pendingPrompts[0].resolve(new FakeStream());
+    await expect(pending).rejects.toBeInstanceOf(capture.CaptureAborted);
+    expect(orphan.state).toBe("closed");
+    expect(openTracks.size).toBe(0);
+    expect(capture.isRecording()).toBe(false);
+  });
+
+  it("returns a take exactly once", async () => {
+    const capture = await loadCapture();
+    await capture.startRecording();
+    feed(1);
+
+    expect(capture.stopRecording()?.samples.length).toBe(SAMPLE_RATE);
+    // Idempotent by phase in the caller, and now honest here too: a second
+    // stop has no take to report.
+    expect(capture.stopRecording()).toBeNull();
+  });
+});
+
+describe("what the device actually granted", () => {
+  it("is snapshotted at acquisition, so the warning survives the take", async () => {
+    const capture = await loadCapture();
+    grantedSettings = {
+      noiseSuppression: true,
+      echoCancellation: false,
+      autoGainControl: true,
+    };
+
+    await capture.startRecording();
+    feed(0.5);
+    expect(capture.stopRecording()?.samples.length).toBe(SAMPLE_RATE / 2);
+
+    // Read *after* the take, which is when everything that wants it runs: the
+    // warning line is set from a promise continuation, and the debug panel is
+    // only ever open while a result is on screen. Reading the stream at that
+    // point finds nothing — teardown dropped it — so the whistle-eating
+    // noise suppression went unreported precisely when it mattered.
+    expect(capture.processingWarning()).toMatch(/noise suppression \+ auto gain/);
+    const info = capture.getCaptureInfo();
+    expect(info.sampleRate).toBe(SAMPLE_RATE);
+    expect(info.settings?.noiseSuppression).toBe(true);
+    expect(info.settings?.echoCancellation).toBe(false);
+  });
+
+  it("says nothing when the constraints were honoured", async () => {
+    const capture = await loadCapture();
+    await capture.startRecording();
+    capture.stopRecording();
+    expect(capture.processingWarning()).toBeNull();
+  });
+
+  it("does not carry a previous take's answer into the next one", async () => {
+    const capture = await loadCapture();
+    grantedSettings = { noiseSuppression: true, echoCancellation: false, autoGainControl: false };
+    await capture.startRecording();
+    capture.stopRecording();
+    expect(capture.processingWarning()).not.toBeNull();
+
+    // A device can hand out a differently-configured track on every
+    // acquisition, so the next take starts with no answer at all rather than
+    // the last one's.
+    grantedSettings = { noiseSuppression: false, echoCancellation: false, autoGainControl: false };
+    gumMode = "hang";
+    void capture.startRecording();
+    expect(capture.processingWarning()).toBeNull();
+    expect(capture.getCaptureInfo().settings).toBeNull();
+  });
+});
+
+describe("recording and playback are mutually exclusive", () => {
+  /** The synth, loaded against the same fresh capture module. */
+  async function loadSynth(): Promise<typeof import("../src/audio/synth.js")> {
+    return import("../src/audio/synth.js");
+  }
+
+  function melody(): Note[] {
+    return [72, 74, 76].map((midi, i) => ({
+      midi,
+      noteName: midiToName(midi),
+      centsOffset: 0,
+      startSec: i * 0.5,
+      endSec: i * 0.5 + 0.4,
+      durationSec: 0.4,
+      pitchHz: midiToHz(midi),
+      confidence: 0.9,
+      gapBeforeSec: 0,
+      flags: {},
+    }));
+  }
+
+  it("refuses to start the synth while the microphone is open", async () => {
+    const capture = await loadCapture();
+    const synth = await loadSynth();
+    vi.stubGlobal("requestAnimationFrame", () => 1);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    await capture.startRecording();
+    feed(0.5);
+    const contextsBefore = FakeAudioContext.instances.length;
+
+    // No echo cancellation (it eats whistles), so a phone playing this into
+    // its own open microphone would transcribe itself. The disabled Play
+    // button is presentation; this is the rule.
+    const started = synth.startPlayback(melody(), 0, { onIndex: () => {}, onEnd: () => {} });
+
+    expect(started).toBe(false);
+    expect(synth.isPlaying()).toBe(false);
+    // A refusal changes nothing: no context opened, and the take is untouched.
+    expect(FakeAudioContext.instances).toHaveLength(contextsBefore);
+    expect(capture.isRecording()).toBe(true);
+    feed(0.5);
+    expect(capture.stopRecording()?.samples.length).toBe(SAMPLE_RATE);
+  });
+
+  it("plays once the microphone is closed", async () => {
+    const capture = await loadCapture();
+    const synth = await loadSynth();
+    vi.stubGlobal("requestAnimationFrame", () => 1);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    await capture.startRecording();
+    feed(0.5);
+    capture.stopRecording();
+
+    expect(synth.startPlayback(melody(), 0, { onIndex: () => {}, onEnd: () => {} })).toBe(true);
+    expect(synth.isPlaying()).toBe(true);
+    synth.stopPlayback();
+    expect(synth.isPlaying()).toBe(false);
+  });
+
+  it("reports a refusal rather than lying about having started", async () => {
+    const capture = await loadCapture();
+    const synth = await loadSynth();
+    await capture.startRecording();
+
+    // The caller sets `playing: true` off this return value; a silent refusal
+    // would leave a Stop button that stops nothing.
+    expect(synth.startPlayback([], 0, { onIndex: () => {}, onEnd: () => {} })).toBe(false);
+    capture.stopRecording();
+    expect(synth.startPlayback([], 0, { onIndex: () => {}, onEnd: () => {} })).toBe(false);
   });
 });

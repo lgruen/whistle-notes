@@ -29,6 +29,7 @@ import {
   subscribe,
   type AppState,
 } from "./ui/state.js";
+import { shouldApplyUpdate, type UpdateTrigger } from "./ui/sw-update.js";
 import { invalidatePalette } from "./ui/theme.js";
 
 function element<T extends HTMLElement>(id: string): T {
@@ -136,6 +137,7 @@ function render(state: AppState): void {
     transpose: state.transpose,
     playingIndex: state.playingIndex,
     live: false,
+    tuningOffsetCents: state.tuningOffsetCents,
   });
 
   const playing = state.playingIndex === null ? null : state.notes[state.playingIndex];
@@ -263,7 +265,15 @@ function finishRecording(): void {
   if (getState().phase !== "recording") return;
   stopLoop();
 
-  const { samples, sampleRate } = stopRecording();
+  const take = stopRecording();
+  if (!take) {
+    // Stop tapped while the permission prompt was still up: the take never
+    // started, so there is nothing to analyse. Saying so and going back to idle
+    // beats transcribing an empty buffer into a confident "no notes found"
+    // about audio that was never recorded.
+    setState({ phase: "idle", message: "", warning: null });
+    return;
+  }
   setState({ phase: "analyzing", message: "" });
 
   // Paint first, analyse second. `transcribe` is synchronous and can take a
@@ -274,7 +284,7 @@ function finishRecording(): void {
   requestAnimationFrame(() => {
     setTimeout(() => {
       try {
-        const result = transcribe(samples, sampleRate);
+        const result = transcribe(take.samples, take.sampleRate);
         applyResult(result.notes, result.frames, result.tuningOffsetCents);
       } catch (error) {
         console.error("[transcribe] failed", error);
@@ -288,10 +298,15 @@ function beginPlayback(): void {
   const state = getState();
   if (state.notes.length === 0) return;
 
-  startPlayback(state.notes, state.transpose, {
+  // `startPlayback` enforces the recording/playback exclusion itself (see
+  // `audio/synth.ts`), so a refusal has to be respected here rather than
+  // assumed away: flagging `playing` against a playback that never started
+  // would leave a Stop button that stops nothing.
+  const started = startPlayback(state.notes, state.transpose, {
     onIndex: (index) => setState({ playingIndex: index }),
     onEnd: () => setState({ playing: false, playingIndex: null }),
   });
+  if (!started) return;
   // After `startPlayback`, which internally stops any previous run and would
   // otherwise clear the flag we just set.
   setState({ playing: true, playingIndex: null });
@@ -315,6 +330,7 @@ window.addEventListener("resize", () => {
       transpose: state.transpose,
       playingIndex: state.playingIndex,
       live: false,
+      tuningOffsetCents: state.tuningOffsetCents,
     });
   }
 });
@@ -375,9 +391,9 @@ if (stamp) stamp.textContent = `build ${__BUILD__}`;
  * the same app triggers the update — and the take is destroyed mid-recording
  * with no explanation. So the SW is registered in `prompt` mode (see
  * `vite.config.ts`), which parks the new worker in `waiting`, and we apply it
- * ourselves at a moment when a reload costs nothing: not recording, not
- * analysing, not playing. If that moment is not now, the update simply waits —
- * for the next phase change or the next time the app is foregrounded.
+ * ourselves at a moment when a reload costs nothing. Which moments those are is
+ * `shouldApplyUpdate` in `ui/sw-update.ts`; if now is not one of them the update
+ * simply waits — for the next phase change or the next foreground.
  */
 let updatePending = false;
 
@@ -385,27 +401,29 @@ const updateSW = registerSW({
   immediate: true,
   onNeedRefresh() {
     updatePending = true;
-    applyPendingUpdate();
+    applyPendingUpdate("state");
   },
   onRegisteredSW(_swUrl, registration) {
     if (!registration) return;
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "visible") return;
       void registration.update();
-      applyPendingUpdate();
+      applyPendingUpdate("foreground");
     });
   },
 });
 
-/** A reload here must not cost the user anything they cannot get back. */
-function safeToReload(): boolean {
+function applyPendingUpdate(trigger: UpdateTrigger): void {
+  if (!updatePending) return;
   const { phase, playing } = getState();
-  if (isRecording() || playing || isPlaying()) return false;
-  return phase === "idle" || phase === "result" || phase === "error";
-}
-
-function applyPendingUpdate(): void {
-  if (!updatePending || !safeToReload()) return;
+  // Both views of "is audio running": the store is updated by the app, the two
+  // audio modules by their own callbacks, and a reload must lose to either.
+  const context = {
+    phase,
+    playing: playing || isPlaying(),
+    recording: isRecording(),
+  };
+  if (!shouldApplyUpdate(context, trigger)) return;
   updatePending = false;
   // Tells the waiting worker to take over; the plugin's registration reloads
   // the page once it is controlling.
@@ -413,4 +431,4 @@ function applyPendingUpdate(): void {
 }
 
 // Every phase change is a chance for a deferred update to land.
-subscribe(applyPendingUpdate);
+subscribe(() => applyPendingUpdate("state"));

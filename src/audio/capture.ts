@@ -61,6 +61,25 @@ let source: MediaStreamAudioSourceNode | null = null;
 let worklet: AudioWorkletNode | null = null;
 let sink: GainNode | null = null;
 
+/**
+ * `track.getSettings()`, read once at acquisition time.
+ *
+ * Read *when the track is opened*, not when somebody asks: a stopped track's
+ * settings are not guaranteed to survive `stop()`, and the two places that want
+ * them — the "noise suppression is on" warning and the debug panel — both run
+ * after the take has ended in the common case. A Record→Stop fast enough that
+ * `getUserMedia` resolves after the stop used to lose the warning entirely,
+ * which is precisely the take where it mattered most.
+ *
+ * Deliberately outlives {@link teardown} so the debug panel can still answer
+ * "what did this device actually give us?" while the result is on screen; it is
+ * cleared at the start of the next take, not at the end of this one.
+ */
+let trackSettings: MediaTrackSettings | null = null;
+/** Sample rate of the most recent take's context; see {@link trackSettings}
+ *  for why this survives teardown. */
+let lastSampleRate: number | null = null;
+
 let tracker: PitchTracker | null = null;
 let blocks: Float32Array[] = [];
 let totalSamples = 0;
@@ -175,6 +194,10 @@ function resetTakeState(): void {
   maxSamples = Infinity;
   endSignalled = false;
   tracker = null;
+  // The *previous* take's answer to "did the constraints take?" must not be
+  // reported against this one — a device can hand out a differently-configured
+  // track on every acquisition.
+  trackSettings = null;
 }
 
 /**
@@ -268,6 +291,14 @@ export async function startRecording(): Promise<void> {
   if (mine !== session) throw await abandon(ctx, opened);
 
   stream = opened;
+  // Snapshot what the device actually granted, now, while the track is live.
+  // See `trackSettings`: everything that reads this runs after the take.
+  trackSettings = opened.getAudioTracks()[0]?.getSettings() ?? null;
+  lastSampleRate = ctx.sampleRate;
+  // Also on the console: `getSettings()` is the only honest answer to "did the
+  // constraints take?", and it is the first thing to check on a device.
+  console.info("[capture] track settings", trackSettings, "at", ctx.sampleRate, "Hz");
+
   // The pipeline is rate-agnostic and reads whatever the device gave us; iOS
   // ignores a sampleRate constraint anyway, so asking for one only invites a
   // resampler into the path.
@@ -369,12 +400,8 @@ export async function startRecording(): Promise<void> {
  * nothing like a microphone problem, so it is worth a line on screen.
  */
 export function processingWarning(): string | null {
-  const track = stream?.getAudioTracks()[0];
-  if (!track) return null;
-  const settings = track.getSettings();
-  // Also on the console: `getSettings()` is the only honest answer to "did the
-  // constraints take?", and it is the first thing to check on a device.
-  console.info("[capture] track settings", settings);
+  const settings = trackSettings;
+  if (!settings) return null;
 
   const on: string[] = [];
   if (settings.noiseSuppression) on.push("noise suppression");
@@ -385,14 +412,55 @@ export function processingWarning(): string | null {
 }
 
 /**
- * Stop recording and return everything captured, as one buffer.
+ * What the device actually gave us, for the debug panel.
+ *
+ * This is the on-device answer to the risk the plan flags but cannot settle
+ * from a laptop: a platform that ignores the raw-signal constraints gates the
+ * whistle out and produces an empty transcript that looks nothing like a
+ * microphone problem. Values survive the end of a take on purpose — they are
+ * read while the *result* is on screen.
+ */
+export interface CaptureInfo {
+  /** Sample rate of the last take's context, or `null` before the first one.
+   *  The pipeline is rate-agnostic, so this is diagnostic, not a setting. */
+  sampleRate: number | null;
+  /** `track.getSettings()` as snapshotted at acquisition. */
+  settings: MediaTrackSettings | null;
+}
+
+export function getCaptureInfo(): CaptureInfo {
+  return { sampleRate: lastSampleRate, settings: trackSettings };
+}
+
+/** Audio ready for `transcribe()`. The same shape a decoded file produces, so
+ *  the two input paths converge on one line in `main.ts`. */
+export interface CapturedAudio {
+  samples: Float32Array;
+  sampleRate: number;
+}
+
+/**
+ * Stop recording and return everything captured — or `null` if nothing was.
  *
  * Synchronous on purpose: the caller needs the samples in hand to switch to the
  * `analyzing` phase and let the browser paint before the transcription blocks
  * the main thread.
+ *
+ * ## The `null` case, and why it is not an error
+ *
+ * Stop is also how a *pending* start is abandoned — tap Record, then tap Stop
+ * while the permission prompt is still up. There is no take, but there is still
+ * work to do: the teardown below is what invalidates the in-flight start (via
+ * the generation counter) so it cannot build a graph nobody is watching.
+ *
+ * So the teardown always runs and the return value is honest: it used to hand
+ * back an empty `Float32Array` at a *guessed* 48 kHz, which the caller then
+ * transcribed into a confident "no notes found" — a made-up answer about audio
+ * that never existed. `null` says what actually happened.
  */
-export function stopRecording(): { samples: Float32Array; sampleRate: number } {
-  const sampleRate = audioCtx?.sampleRate ?? 48000;
+export function stopRecording(): CapturedAudio | null {
+  const wasRecording = recording;
+  const sampleRate = audioCtx?.sampleRate ?? null;
   recording = false;
 
   // Tracks first and immediately: this is what turns off the recording
@@ -413,6 +481,9 @@ export function stopRecording(): { samples: Float32Array; sampleRate: number } {
   blocks = [];
 
   void teardown();
+  // `sampleRate` is null exactly when there was no context to read it from, so
+  // the two conditions cannot disagree; both are checked so the type narrows.
+  if (!wasRecording || sampleRate === null) return null;
   return { samples, sampleRate };
 }
 
