@@ -673,6 +673,12 @@ button {
   font-size: 1rem;
 }
 
+/* Sharing a row with an outline button — "Practice this" next to "Whistle
+   along" — it has to take its half rather than shrink to its text. */
+.add-row .btn-save {
+  flex: 1;
+}
+
 .ghost.danger.is-armed {
   border-color: var(--danger);
   font-weight: 700;
@@ -744,6 +750,13 @@ button {
   font-variant-numeric: tabular-nums;
   line-height: 1;
   letter-spacing: -0.02em;
+}
+
+/* Taller than the diff roll: this one is the whole screen's picture, there is
+   no verdict strip under it competing for room, and the melody is drawn whole
+   rather than a slot at a time. */
+.roll-follow {
+  height: clamp(10rem, 30vh, 16rem);
 }
 
 /* ── The verdict strip ──────────────────────────────────────────────────

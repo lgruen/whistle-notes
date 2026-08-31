@@ -629,6 +629,52 @@ describe("the echo drills", () => {
   });
 });
 
+describe("the follow-along warm-up", () => {
+  it("moves the melody into the whistler's register, as every exercise does", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [60, 62, 64], 1);
+    store.addTarget(saved);
+    store.setRange({ lowMidi: 79, highMidi: 96 });
+    store.beginFollow(saved.id);
+
+    const follow = store.getPracticeState().follow!;
+    expect(store.getPracticeState().screen).toBe("follow");
+    expect(follow.notes.map((note) => note.midi)).toEqual([84, 86, 88]);
+    expect(follow.running).toBe(false);
+  });
+
+  it("does not open on a melody that is not there", async () => {
+    const store = await loadStore();
+    store.beginFollow("nonexistent");
+    expect(store.getPracticeState().follow).toBeNull();
+    expect(store.getPracticeState().screen).toBe("library");
+  });
+
+  it("stores nothing at all, however long it runs", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [84, 86], 1);
+    store.addTarget(saved);
+    store.beginFollow(saved.id);
+    store.setFollowRunning(true);
+    store.setFollowRunning(false);
+    // The exemption that lets the microphone and the speaker run together is
+    // paid for by exactly this: no alignment, no statistics, no history.
+    expect(store.getPracticeState().stats.intervals.size).toBe(0);
+    expect(store.getPracticeState().stats.targets.size).toBe(0);
+    expect(store.getPracticeState().stats.holds).toBeNull();
+  });
+
+  it("ends when the melody it was about is deleted", async () => {
+    const store = await loadStore();
+    const saved = target("Tron", [84, 86], 1);
+    store.addTarget(saved);
+    store.beginFollow(saved.id);
+    store.removeTarget(saved.id);
+    expect(store.getPracticeState().follow).toBeNull();
+    expect(store.getPracticeState().screen).toBe("library");
+  });
+});
+
 describe("the range check", () => {
   it("is not a range until both ends are in", async () => {
     const store = await loadStore();
@@ -805,10 +851,12 @@ describe("the practice island", () => {
     // and it is the sharpest case of all: it lays a melody out for a synth it
     // may not import and lays a diff out on a canvas it may not touch, and both
     // of those are arithmetic that a test can check exactly.
-    // `drill` joined in T4, and it is the one that had to be argued for: it
-    // chooses random notes, and the obvious way to do that is `Math.random` —
-    // which would be untestable. So randomness is injected, and the impure
-    // default lives in `store.ts` where the rest of the platform does.
+    // `drill` and `follow` joined in T4/T5. `drill` is the one that had to be
+    // argued for: it chooses random notes, and the obvious way to do that is
+    // `Math.random` — which would be untestable. So randomness is injected, and
+    // the impure default lives in `store.ts` where the rest of the platform
+    // does. `follow` lays a melody out for a canvas it may not import, exactly
+    // as `recall` does for the synth.
     for (const name of [
       "align",
       "stats",
@@ -818,6 +866,7 @@ describe("the practice island", () => {
       "bundled",
       "recall",
       "drill",
+      "follow",
     ]) {
       const source = await read(name);
       for (const token of BROWSER_ONLY) {

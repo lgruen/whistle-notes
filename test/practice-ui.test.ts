@@ -29,6 +29,8 @@ import {
   DRILL_RANGE_NUDGE,
   ECHO_HINT_FIRST,
   ECHO_HINT_HEARD,
+  FOLLOW_ECHO_NOTE,
+  FOLLOW_HINT,
   HOLD_HINT_FIRST,
   HOLD_HINT_HEARD,
   TARGET_EXERCISES,
@@ -121,6 +123,8 @@ describe("the ear-first rule", () => {
       HOLD_HINT_HEARD,
       ECHO_HINT_FIRST,
       ECHO_HINT_HEARD,
+      FOLLOW_HINT,
+      FOLLOW_ECHO_NOTE,
       ...BUNDLED_MELODIES.map((melody) => melody.name),
     ]) {
       expect(copy, copy).not.toMatch(PITCH_NAME);
@@ -348,6 +352,7 @@ const ELEMENT_KEYS = [
   "detailMeta",
   "detailNext",
   "detailPractice",
+  "detailFollow",
   "detailHistory",
   "detailHeat",
   "detailTrouble",
@@ -405,6 +410,12 @@ const ELEMENT_KEYS = [
   "echoListen",
   "echoListens",
   "echoWhistle",
+  "follow",
+  "followBack",
+  "followName",
+  "followHint",
+  "followCanvas",
+  "followStart",
   "result",
   "resultBack",
   "resultCanvas",
@@ -465,6 +476,10 @@ function mountPractice(): {
     onEchoRetry: vi.fn(),
     onEchoNext: vi.fn(),
     onCloseDrill: vi.fn(),
+    onFollow: vi.fn(),
+    onFollowStart: vi.fn(),
+    onFollowStop: vi.fn(),
+    onCloseFollow: vi.fn(),
   };
   const view = createPracticeView(
     el as unknown as PracticeElements,
@@ -483,6 +498,7 @@ function mountPractice(): {
     recall: null,
     hold: null,
     echo: null,
+    follow: null,
     recordingTarget: false,
     message: "",
     storageError: null,
@@ -1454,5 +1470,52 @@ describe("the result screen, shared by both echo exercises", () => {
     // The strip is the same machinery recall uses, so the same rule holds: a
     // chip names a wrong or extra note, never the note that was wanted.
     expect(el.resultStrip.innerHTML).toContain("vchip");
+  });
+});
+
+describe("the follow-along warm-up", () => {
+  const follow = (running = false) => ({
+    targetId: TARGET.id,
+    notes: AS_PLAYED,
+    running,
+  });
+
+  it("opens from the melody it is about", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "target", targets: [TARGET], selectedId: TARGET.id });
+    expect(el.detailFollow.getAttribute("data-target")).toBe(TARGET.id);
+    el.detailFollow.click();
+    expect(handlers.onFollow).toHaveBeenCalledWith(TARGET.id);
+  });
+
+  it("promises no score, and admits the microphone will hear the speaker", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "follow", targets: [TARGET], follow: follow() });
+    expect(el.followName.textContent).toBe("Tron");
+    expect(el.followHint.textContent).toMatch(/nothing is counted/i);
+    // The honest part. Echo cancellation is off everywhere in this app, so the
+    // trail really will pick up the synth — saying so costs a line and turns a
+    // confusing artefact into an expected one.
+    expect(el.followHint.textContent).toMatch(/hears the speaker/i);
+    expect(el.followHint.textContent).toMatch(/headphones/i);
+    for (const text of [el.followHint.textContent, el.followStart.textContent]) {
+      expect(text, text).not.toMatch(PITCH_NAME);
+      expect(text, text).not.toMatch(INTERVAL_WORDS);
+    }
+  });
+
+  it("becomes the only way out while it is running", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "follow", targets: [TARGET], follow: follow() });
+    expect(el.followStart.textContent).toBe("Start");
+    el.followStart.click();
+    expect(handlers.onFollowStart).toHaveBeenCalledTimes(1);
+
+    render({ screen: "follow", targets: [TARGET], follow: follow(true) });
+    expect(el.followStart.textContent).toBe("Stop");
+    expect(el.followBack.disabled).toBe(true);
+    el.followStart.click();
+    expect(handlers.onFollowStop).toHaveBeenCalledTimes(1);
+    expect(handlers.onFollowStart).toHaveBeenCalledTimes(1);
   });
 });

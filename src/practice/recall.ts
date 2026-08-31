@@ -355,18 +355,32 @@ function midiRange(
   items: readonly OverlayItem[],
   trail: readonly TrailPoint[],
 ): { min: number; max: number } {
+  const pitches: number[] = [];
+  for (const item of items) {
+    if (item.targetMidi !== null) pitches.push(item.targetMidi);
+    if (item.heardMidi !== null) pitches.push(item.heardMidi);
+  }
+  for (const point of trail) pitches.push(point.midi);
+  return paddedMidiRange(pitches);
+}
+
+/**
+ * The vertical extent of a practice plot: every pitch it has to hold, padded,
+ * and never zoomed in tighter than an octave.
+ *
+ * Shared with the follow-along warm-up, which is a different picture of the same
+ * kind — a roll in the whistler's own register with a trail over it. Two copies
+ * of this arithmetic would be two plots that disagree about how much air a
+ * melody needs above it.
+ */
+export function paddedMidiRange(pitches: Iterable<number>): { min: number; max: number } {
   let min = Infinity;
   let max = -Infinity;
-  const see = (midi: number | null): void => {
-    if (midi === null || !Number.isFinite(midi)) return;
+  for (const midi of pitches) {
+    if (!Number.isFinite(midi)) continue;
     if (midi < min) min = midi;
     if (midi > max) max = midi;
-  };
-  for (const item of items) {
-    see(item.targetMidi);
-    see(item.heardMidi);
   }
-  for (const point of trail) see(point.midi);
 
   if (min > max) {
     // Nothing to show. Centre on C6, where whistling lives, so an empty plot

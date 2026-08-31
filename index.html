@@ -232,9 +232,14 @@
           <h2 class="practice-title" id="practice-target-name"></h2>
           <p class="practice-meta" id="practice-target-meta"></p>
           <p class="card-body" id="practice-target-next"></p>
-          <button type="button" class="btn btn-save" id="practice-target-practice">
-            Practice this
-          </button>
+          <div class="add-row">
+            <button type="button" class="btn btn-save" id="practice-target-practice">
+              Practice this
+            </button>
+            <button type="button" class="btn btn-add" id="practice-target-follow">
+              Whistle along
+            </button>
+          </div>
 
           <!-- Everything this melody has taught the app about the whistler.
                The rows are the point: the same cell red six times is a trouble
@@ -318,6 +323,23 @@
           <p class="practice-meta" id="practice-echo-listens" hidden></p>
           <button type="button" class="btn btn-attempt" id="practice-echo-whistle">
             Whistle it back
+          </button>
+        </section>
+
+        <!-- The warm-up. The one screen in the app where the microphone and the
+             speaker are open together, which it is allowed to do precisely
+             because nothing here is scored or stored. See practice/follow.ts. -->
+        <section class="practice-screen" id="practice-follow" hidden>
+          <button type="button" class="ghost" id="practice-follow-back">← Melody</button>
+          <h2 class="practice-title" id="practice-follow-name"></h2>
+          <p class="practice-lead" id="practice-follow-hint"></p>
+          <canvas
+            class="roll roll-follow"
+            id="practice-follow-roll"
+            aria-label="The melody, and your own whistle over it"
+          ></canvas>
+          <button type="button" class="btn btn-attempt" id="practice-follow-start">
+            Start
           </button>
         </section>
 

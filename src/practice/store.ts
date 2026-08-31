@@ -99,7 +99,8 @@ export type PracticeScreen =
   | "midi"
   | "recall"
   | "hold"
-  | "echo";
+  | "echo"
+  | "follow";
 
 /** Which end of the range the user is being asked for, during the check. */
 export type RangeStep = "low" | "high";
@@ -220,6 +221,21 @@ export interface EchoSession {
   ramp: string;
 }
 
+/**
+ * The warm-up: a melody scrolling past while the user whistles along.
+ *
+ * The only place in the app where the microphone and the speaker are open at
+ * once. Nothing is scored and nothing is stored — see `practice/follow.ts` for
+ * why that is what makes it safe to do at all.
+ */
+export interface FollowSession {
+  targetId: string;
+  /** The melody as it will be played: already in the whistler's register. */
+  notes: readonly TargetNote[];
+  /** Whether the melody is running right now. */
+  running: boolean;
+}
+
 export interface PracticeState {
   screen: PracticeScreen;
   /** Newest first. */
@@ -249,6 +265,8 @@ export interface PracticeState {
   hold: HoldSession | null;
   /** The phrase-echo drill now running, or `null`. */
   echo: EchoSession | null;
+  /** The follow-along warm-up now running, or `null`. */
+  follow: FollowSession | null;
   /** Whether a take is being recorded *into a draft* (rather than for the
    *  range check). Cleared the moment the notes arrive. */
   recordingTarget: boolean;
@@ -330,6 +348,7 @@ let state: PracticeState = {
   recall: null,
   hold: null,
   echo: null,
+  follow: null,
   recordingTarget: false,
   message: "",
   storageError: null,
@@ -413,6 +432,7 @@ export function showLibrary(message = ""): void {
     recall: null,
     hold: null,
     echo: null,
+    follow: null,
     recordingTarget: false,
     message,
   });
@@ -430,6 +450,7 @@ export function selectTarget(id: string, message = ""): void {
     recall: null,
     hold: null,
     echo: null,
+    follow: null,
     message,
   });
 }
@@ -575,6 +596,7 @@ export function removeTarget(id: string): void {
     // An exercise about a melody that no longer exists has nothing to play and
     // nothing to score.
     recall: state.recall?.targetId === id ? null : state.recall,
+    follow: state.follow?.targetId === id ? null : state.follow,
     storageError: libraryError ?? statsError,
   });
 }
@@ -889,6 +911,44 @@ export function nextEcho(rng: Rng = Math.random): void {
 /** Leave either drill, back to the library it was started from. */
 export function closeDrill(): void {
   showLibrary();
+}
+
+/* ── Follow along ─────────────────────────────────────────────────────── */
+
+/**
+ * Open the warm-up on a target.
+ *
+ * The melody is moved into the whistler's register here, once, exactly as
+ * `beginRecall` does — nothing is scored, but the user still has to be able to
+ * whistle what they are hearing.
+ */
+export function beginFollow(targetId: string): void {
+  const target = state.targets.find((candidate) => candidate.id === targetId);
+  if (!target) return;
+  setPracticeState({
+    screen: "follow",
+    selectedId: targetId,
+    follow: {
+      targetId,
+      notes: transposeIntoRange(target.notes, state.range),
+      running: false,
+    },
+    message: "",
+  });
+}
+
+/** The melody is playing and the microphone is open, or it is not. The one flag
+ *  the screen uses to decide whether the only enabled button is Stop. */
+export function setFollowRunning(running: boolean): void {
+  const follow = state.follow;
+  if (!follow || follow.running === running) return;
+  setPracticeState({ follow: { ...follow, running }, message: "" });
+}
+
+/** Leave the warm-up, back to the melody it was about. */
+export function closeFollow(): void {
+  if (state.follow) selectTarget(state.follow.targetId);
+  else showLibrary();
 }
 
 /* ── The history ──────────────────────────────────────────────────────── */

@@ -63,8 +63,15 @@ export interface ScheduleOptions {
 const ATTACK_SEC = 0.005;
 const RELEASE_SEC = 0.03;
 const PEAK_GAIN = 0.25;
-/** Scheduling lead-in, so the first note is not already late when it is set. */
-const LEAD_SEC = 0.08;
+/**
+ * Scheduling lead-in, so the first note is not already late when it is set.
+ *
+ * Exported because one caller has to draw a picture in step with the sound: the
+ * follow-along playhead starts when `startPlayback` is *called*, and without
+ * subtracting this it would run 80 ms ahead of the melody for the whole run.
+ */
+export const PLAYBACK_LEAD_SEC = 0.08;
+const LEAD_SEC = PLAYBACK_LEAD_SEC;
 
 /** Which synth plays the transcript back. See the module header. */
 export type Voice = "clean" | "supersaw";
@@ -303,6 +310,9 @@ export function isPlaying(): boolean {
  * keep in step: a `playing: true` set against a playback that never started
  * leaves a Stop button that stops nothing.
  *
+ * There is exactly one deliberate exception, and it is a different function —
+ * see {@link startPlaybackOverMicrophone}.
+ *
  * ## Why a fresh context per playback
  *
  * The capture context is closed on stop, so there is nothing to reuse; and on
@@ -311,6 +321,14 @@ export function isPlaying(): boolean {
  * the tracks are stopped gets normal media routing. A context costs about a
  * millisecond, and it is closed again when playback ends, so there is no
  * accumulation.
+ *
+ * The exception above is the one case where the tracks are *not* stopped first,
+ * and on iOS a fresh context may not be enough to escape that routing — the
+ * audio session is still record-capable, which is what the earpiece behaviour
+ * actually keys off. Untested on iOS at the time of writing; on Android the two
+ * contexts coexist and play at normal volume. If a warm-up comes out at whisper
+ * volume on an iPhone, that is this, and the honest fix is headphones rather
+ * than a second audio path to keep alive.
  */
 export function startPlayback(
   notes: readonly PlayableNote[],
@@ -320,7 +338,40 @@ export function startPlayback(
 ): boolean {
   // Before `stopPlayback()`: a refused start must change nothing at all.
   if (isRecording()) return false;
+  return play(notes, transpose, playbackHandlers, voice);
+}
 
+/**
+ * The one deliberate exception to the rule above, for the follow-along warm-up.
+ *
+ * A separate exported function rather than a flag on {@link startPlayback},
+ * because the exemption should be *greppable*: `startPlayback` keeps a refusal
+ * that no caller can accidentally opt out of, and every place in the app that
+ * plays over an open microphone is found by searching for this name. There is
+ * exactly one.
+ *
+ * What makes it safe is not anything this module does — the microphone really
+ * will hear the speaker, because echo cancellation is off everywhere in this
+ * project on purpose. It is what the caller does with the audio: the warm-up
+ * transcribes nothing, aligns nothing and stores nothing, so the worst the echo
+ * can do is draw a faint line on a picture nobody is graded on, and the screen
+ * says so. See `practice/follow.ts`. **If follow-along ever grows a score, this
+ * function has to go.**
+ */
+export function startPlaybackOverMicrophone(
+  notes: readonly PlayableNote[],
+  playbackHandlers: PlaybackHandlers,
+  voice: Voice = "clean",
+): boolean {
+  return play(notes, 0, playbackHandlers, voice);
+}
+
+function play(
+  notes: readonly PlayableNote[],
+  transpose: number,
+  playbackHandlers: PlaybackHandlers,
+  voice: Voice,
+): boolean {
   stopPlayback();
   const scheduled = playbackSchedule(notes, transpose);
   if (scheduled.length === 0) return false;

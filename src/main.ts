@@ -1,7 +1,13 @@
 import { registerSW } from "virtual:pwa-register";
 import FFT from "fft.js";
 import "./app.css";
-import { transcribe, midiToName, type Note, type PitchFrame } from "./dsp/index.js";
+import {
+  hzToMidiFloat,
+  midiToName,
+  transcribe,
+  type Note,
+  type PitchFrame,
+} from "./dsp/index.js";
 import {
   CaptureAborted,
   CaptureError,
@@ -16,7 +22,14 @@ import {
   type CapturedAudio,
 } from "./audio/capture.js";
 import { AudioFileError, decodeAudioFile } from "./audio/decode.js";
-import { isPlaying, startPlayback, stopPlayback, type PlayableNote } from "./audio/synth.js";
+import {
+  PLAYBACK_LEAD_SEC,
+  isPlaying,
+  startPlayback,
+  startPlaybackOverMicrophone,
+  stopPlayback,
+  type PlayableNote,
+} from "./audio/synth.js";
 import { downloadWav, takeFilename } from "./audio/wav-export.js";
 import { a4FromOffsetCents, transposeMidi } from "./notes/format.js";
 import { bundledMelody } from "./practice/bundled.js";
@@ -30,14 +43,16 @@ import {
   type MidiMelody,
 } from "./practice/midi.js";
 import { representativeMidi } from "./practice/range.js";
-import { targetPlayback } from "./practice/recall.js";
+import { targetPlayback, type TrailPoint } from "./practice/recall.js";
 import { alignAttempt } from "./practice/align.js";
 import { holdPlayback, scoreHold, HOLD_REFERENCE_SEC } from "./practice/drill.js";
+import { appendFollowPoint, followDone, followModel } from "./practice/follow.js";
 import {
   addTarget,
   beginDraft,
   beginEcho,
   beginEchoTake,
+  beginFollow,
   beginHold,
   beginHoldTake,
   beginRangeStep,
@@ -46,6 +61,7 @@ import {
   beginTargetTake,
   captureRangeEnd,
   closeDrill,
+  closeFollow,
   closeRecall,
   countEchoListen,
   countHoldPlay,
@@ -69,6 +85,7 @@ import {
   retryRecall,
   saveDraft,
   selectTarget,
+  setFollowRunning,
   setPracticeMessage,
   showLibrary,
   showMidiPicker,
@@ -90,6 +107,7 @@ import {
 import { createControls } from "./ui/controls.js";
 import { createDebugView } from "./ui/debug.js";
 import { trailFromFrames } from "./ui/diffroll.js";
+import { drawFollowRoll } from "./ui/followroll.js";
 import { createHoldMeter } from "./ui/holdmeter.js";
 import { createLiveView, formatClock } from "./ui/live.js";
 import { highlightNoteList, initNoteList, renderNoteList } from "./ui/notelist.js";
@@ -188,19 +206,20 @@ const transcribeView = element("transcribe-view");
 const practiceView = element("practice-view");
 
 /**
- * The hold drill's live needle.
+ * The two practice widgets on the hot path.
  *
- * Driven from an animation loop with the microphone open, and never anywhere
- * near a store — the same hot/cold split the transcriber's live readout follows,
- * for the same reason (see the note at the top of `ui/state.ts`). Built here
- * rather than inside the practice view because the view's `render` is the cold
- * path and must not be able to reach it.
+ * Both are driven from animation loops with the microphone open and neither goes
+ * anywhere near a store — the same hot/cold split the transcriber's live readout
+ * follows, for the same reason (see the note at the top of `ui/state.ts`). They
+ * are built here rather than inside the practice view because the view's
+ * `render` is the cold path and must not be able to reach them.
  */
 const holdMeter = createHoldMeter({
   cents: element("practice-hold-cents"),
   needle: element("practice-hold-needle"),
   hint: element("practice-hold-meter-hint"),
 });
+const followCanvas = element<HTMLCanvasElement>("practice-follow-roll");
 
 const practice = createPracticeView(
   {
@@ -221,6 +240,7 @@ const practice = createPracticeView(
     detailMeta: element("practice-target-meta"),
     detailNext: element("practice-target-next"),
     detailPractice: element<HTMLButtonElement>("practice-target-practice"),
+    detailFollow: element<HTMLButtonElement>("practice-target-follow"),
     detailHistory: element("practice-target-history"),
     detailHeat: element("practice-target-heat"),
     detailTrouble: element("practice-target-trouble"),
@@ -254,6 +274,12 @@ const practice = createPracticeView(
     echoListen: element<HTMLButtonElement>("practice-echo-listen"),
     echoListens: element("practice-echo-listens"),
     echoWhistle: element<HTMLButtonElement>("practice-echo-whistle"),
+    follow: element("practice-follow"),
+    followBack: element<HTMLButtonElement>("practice-follow-back"),
+    followName: element("practice-follow-name"),
+    followHint: element("practice-follow-hint"),
+    followCanvas: element<HTMLCanvasElement>("practice-follow-roll"),
+    followStart: element<HTMLButtonElement>("practice-follow-start"),
     result: element("practice-result"),
     resultBack: element<HTMLButtonElement>("practice-result-done"),
     resultCanvas: element<HTMLCanvasElement>("practice-result-roll"),
@@ -365,6 +391,14 @@ const practice = createPracticeView(
     onCloseDrill: () => {
       stopPlayback();
       closeDrill();
+    },
+
+    onFollow: beginFollow,
+    onFollowStart: startFollowAlong,
+    onFollowStop: stopFollowAlong,
+    onCloseFollow: () => {
+      stopFollowAlong();
+      closeFollow();
     },
 
     onTrimDraft: (end) => reviseDraft((draft) => trimDraft(draft, end)),
@@ -524,6 +558,107 @@ function listenToPhrase(): void {
 function playHoldReference(): void {
   const hold = getPracticeState().hold;
   if (hold) playPrompt(holdPlayback(hold.referenceMidi, HOLD_REFERENCE_SEC), countHoldPlay);
+}
+
+/* ── Follow along ─────────────────────────────────────────────────────
+ *
+ * The one place in the app where the speaker and the microphone are open at
+ * once. It is allowed precisely because nothing here is transcribed, aligned or
+ * stored: the take is dropped on stop, so the echo the microphone certainly
+ * picks up can do no more than draw a faint line. See `practice/follow.ts` and
+ * `startPlaybackOverMicrophone`.
+ */
+
+/** The melody being followed, or `null` when nothing is running. */
+let followRoll: ReturnType<typeof followModel> | null = null;
+let followTrail: TrailPoint[] = [];
+let followHandle = 0;
+/** The animation clock at the first frame of this run; `-1` until it arrives. */
+let followStartMs = -1;
+
+function startFollowAlong(): void {
+  const follow = getPracticeState().follow;
+  if (!follow || follow.running) return;
+
+  // The microphone first and synchronously — the iOS gesture rule every take in
+  // this app follows — and only then the melody, because `beginRecording` stops
+  // any playback on its way in.
+  beginRecording("follow");
+  const model = followModel(follow.notes);
+  const started = startPlaybackOverMicrophone(
+    model.notes,
+    {
+      onIndex: () => undefined,
+      onEnd: () => setState({ playing: false, playingIndex: null }),
+    },
+    getState().voice,
+  );
+  if (!started) {
+    // Nothing to whistle along to. Give the microphone straight back rather
+    // than leaving a take running behind a screen with no melody on it.
+    finishRecording();
+    setPracticeMessage("Could not start the melody on this device.");
+    return;
+  }
+
+  followRoll = model;
+  followTrail = [];
+  followStartMs = -1;
+  setState({ playing: true, playingIndex: null });
+  setFollowRunning(true);
+  followHandle = requestAnimationFrame(followLoop);
+}
+
+/**
+ * One clock, not two.
+ *
+ * The playhead runs on the animation clock, offset by the synth's own lead-in so
+ * that a note drawn under the line is a note sounding now; each trail point is
+ * placed at wherever the playhead is *at that frame*, carrying whatever pitch
+ * the microphone last reported. So the trail lags by the analysis latency (a
+ * 43 ms window plus a block or two) and nothing has to reconcile the capture
+ * context's clock with the playback context's. Nothing here is measured, which
+ * is what makes that trade honest.
+ */
+function followLoop(timestampMs: number): void {
+  followHandle = requestAnimationFrame(followLoop);
+  const model = followRoll;
+  if (!model) return;
+  if (followStartMs < 0) followStartMs = timestampMs;
+
+  const elapsed = (timestampMs - followStartMs) / 1000 - PLAYBACK_LEAD_SEC;
+  const status = getLiveStatus();
+  const voiced = status.voiced;
+  const fresh =
+    voiced !== null &&
+    voiced.hz !== null &&
+    (status.frame?.tSec ?? 0) - voiced.tSec <= FOLLOW_HOLD_SEC;
+  if (elapsed >= 0) {
+    appendFollowPoint(followTrail, elapsed, fresh && voiced.hz !== null ? hzToMidiFloat(voiced.hz) : null);
+  }
+
+  drawFollowRoll(followCanvas, {
+    model,
+    trail: followTrail,
+    elapsedSec: Math.max(0, elapsed),
+  });
+  if (followDone(elapsed, model)) stopFollowAlong();
+}
+
+/** How long a reading lingers after the whistle stops — the same quarter second
+ *  the live readout uses, so a held note draws one line rather than a dotted
+ *  one. */
+const FOLLOW_HOLD_SEC = 0.25;
+
+/** End the warm-up: the line, the melody and the microphone, in that order.
+ *  Idempotent, because both the natural end and every Stop come through here. */
+function stopFollowAlong(): void {
+  if (followHandle) cancelAnimationFrame(followHandle);
+  followHandle = 0;
+  followRoll = null;
+  stopPlayback();
+  finishRecording();
+  setFollowRunning(false);
 }
 
 function renderPractice(): void {
@@ -763,7 +898,14 @@ let lastTake: CapturedAudio | null = null;
  * analysis is scheduled, so a mode switch mid-analysis cannot redirect a take
  * that is already in flight.
  */
-type TakeIntent = "transcribe" | RangeStep | "target" | "attempt" | "hold" | "echo";
+type TakeIntent =
+  | "transcribe"
+  | RangeStep
+  | "target"
+  | "attempt"
+  | "hold"
+  | "echo"
+  | "follow";
 let takeIntent: TakeIntent = "transcribe";
 
 /**
@@ -772,14 +914,19 @@ let takeIntent: TakeIntent = "transcribe";
  * The transcriber's message line is not on screen in practice mode, so every
  * failure has to be routed by intent rather than dropped into `AppState`. Every
  * store call here also clears the flag the screen uses to decide whether a take
- * is running, which is what stops a failed take leaving a Stop button behind.
+ * is running, which is what stops a failed take leaving a Stop button behind —
+ * and the warm-up, which has a melody running alongside its microphone, has to
+ * stop that too.
  */
 function practiceTakeFailed(intent: Exclude<TakeIntent, "transcribe">, message: string): void {
   if (intent === "target") endTargetTake(message);
   else if (intent === "attempt") endRecallTake(message);
   else if (intent === "hold") endHoldTake(message);
   else if (intent === "echo") endEchoTake(message);
-  else endRangeStep(message);
+  else if (intent === "follow") {
+    stopFollowAlong();
+    setPracticeMessage(message);
+  } else endRangeStep(message);
 }
 
 /**
@@ -910,6 +1057,14 @@ function finishRecording(): void {
   stopHoldLoop();
 
   const take = stopRecording();
+  // The warm-up scores nothing and stores nothing, so its audio has nowhere to
+  // go. Dropped here rather than handed to `analyze`: a minute of FFTs for a
+  // screen that never had a result is pure heat, and holding the samples any
+  // longer than the microphone would keep ~11 MB alive for nothing.
+  if (takeIntent === "follow") {
+    setState({ phase: "idle", message: "", warning: null, hasRecording: false });
+    return;
+  }
   if (!take) {
     // Stop tapped while the permission prompt was still up: the take never
     // started, so there is nothing to analyse. Saying so and going back to idle
@@ -939,6 +1094,10 @@ const TAKE_SUBJECTS: Record<TakeIntent, string> = {
   attempt: "that attempt",
   hold: "that note",
   echo: "that phrase",
+  // Never reached — a warm-up take is dropped in `finishRecording` and never
+  // analysed. Present because the map is exhaustive over the intents on
+  // purpose: a new arm should have to say what it is about.
+  follow: "that warm-up",
 };
 
 /**
@@ -1208,6 +1367,11 @@ function analyze(audio: CapturedAudio, subject: string): void {
           applyEchoTake(result.notes, result.frames, result.tuningOffsetCents);
         } else if (intent === "hold") {
           applyHoldTake(result.frames);
+        } else if (intent === "follow") {
+          // Unreachable: a warm-up take never gets here. Explicit rather than
+          // falling through to the range arm, which would take a `RangeStep`
+          // this is not.
+          setState({ phase: "idle", notes: [], frames: [] });
         } else {
           applyRangeTake(intent, result.notes);
         }

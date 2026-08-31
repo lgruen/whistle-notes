@@ -36,6 +36,7 @@ import {
   isDefaultRange,
   type HoldScore,
 } from "../practice/drill.js";
+import { followModel } from "../practice/follow.js";
 import { chordWarning, melodySummary, type MidiMelody } from "../practice/midi.js";
 import { isUsableRange, rangeSpanSemitones, type WhistleRange } from "../practice/range.js";
 import {
@@ -71,6 +72,7 @@ import type {
   RecallAttempt,
 } from "../practice/store.js";
 import { drawDiffOverlay } from "./diffroll.js";
+import { drawFollowRoll } from "./followroll.js";
 import type { Phase } from "./state.js";
 
 export interface PracticeElements {
@@ -103,6 +105,8 @@ export interface PracticeElements {
   detailNext: HTMLElement;
   /** Starts the recall exercise on this melody. */
   detailPractice: HTMLButtonElement;
+  /** Starts the follow-along warm-up on it. */
+  detailFollow: HTMLButtonElement;
   /** The whole history block; hidden until there is an attempt in it. */
   detailHistory: HTMLElement;
   /** One bar per slot, tinted by how often it has gone wrong. */
@@ -164,6 +168,16 @@ export interface PracticeElements {
   echoListen: HTMLButtonElement;
   echoListens: HTMLElement;
   echoWhistle: HTMLButtonElement;
+
+  /* The follow-along warm-up: the only screen where the microphone and the
+     speaker run at once. Nothing is scored — see `practice/follow.ts`. */
+  follow: HTMLElement;
+  followBack: HTMLButtonElement;
+  followName: HTMLElement;
+  followHint: HTMLElement;
+  followCanvas: HTMLCanvasElement;
+  /** "Start" — and "Stop", while it is running. */
+  followStart: HTMLButtonElement;
 
   result: HTMLElement;
   /** The back arrow at the top; the same action as {@link resultDone}, because
@@ -265,6 +279,12 @@ export interface PracticeHandlers {
   onEchoNext(): void;
   /** Leave either drill. */
   onCloseDrill(): void;
+
+  /* Follow along. */
+  onFollow(id: string): void;
+  onFollowStart(): void;
+  onFollowStop(): void;
+  onCloseFollow(): void;
 
   onTrimDraft(end: "start" | "end"): void;
   /** Cut the nearer end of the kept range back to one note, by index. */
@@ -579,6 +599,30 @@ export function echoMetaText(echo: EchoSession): string {
   return `${count} note${count === 1 ? "" : "s"}.`;
 }
 
+/* ── Follow along ─────────────────────────────────────────────────────── */
+
+/**
+ * The warm-up's whole instruction, including the honest part.
+ *
+ * The second sentence exists because the app cannot hide what it is doing: echo
+ * cancellation is off everywhere in this project (it eats whistles), so with the
+ * speaker and the microphone both open the trail really will pick up the synth.
+ * Saying so costs one line and turns a confusing artefact into an expected one —
+ * and points at the fix, which is headphones.
+ */
+export const FOLLOW_HINT =
+  "Just whistle along — nothing is counted and nothing is kept. Your own line " +
+  "is drawn over the melody as you go.";
+
+export const FOLLOW_ECHO_NOTE =
+  "The microphone hears the speaker too, so the line may trace the melody a " +
+  "little on its own. Headphones fix that.";
+
+/** "Start" — and "Stop", while it is running. */
+export function followLabel(running: boolean): string {
+  return running ? "Stop" : "Start";
+}
+
 /* ── Recall: the verdict strip ────────────────────────────────────────── */
 
 /** What one chip shows: a big mark, a small line under it, and the sentence a
@@ -775,6 +819,11 @@ export function createPracticeView(
     if (id) handlers.onPractice(id);
   });
 
+  elements.detailFollow.addEventListener("click", () => {
+    const id = elements.detailFollow.getAttribute("data-target");
+    if (id) handlers.onFollow(id);
+  });
+
   elements.rangeButton.addEventListener("click", () => handlers.onOpenRange());
   elements.rangeDone.addEventListener("click", () => handlers.onCloseRange());
 
@@ -823,6 +872,12 @@ export function createPracticeView(
   elements.echoWhistle.addEventListener("click", () => {
     if (elements.echoWhistle.dataset.running === "true") handlers.onStopCapture();
     else handlers.onEchoAttempt();
+  });
+
+  elements.followBack.addEventListener("click", () => handlers.onCloseFollow());
+  elements.followStart.addEventListener("click", () => {
+    if (elements.followStart.dataset.running === "true") handlers.onFollowStop();
+    else handlers.onFollowStart();
   });
 
   /**
@@ -948,9 +1003,10 @@ export function createPracticeView(
     else handlers.onCaptureRange("high");
   });
 
-  // Written once: it is a fixed sentence, and keeping it in TypeScript rather
-  // than in `index.html` is what lets a test hold the ear-first promise to it.
+  // Written once: fixed sentences, and keeping them in TypeScript rather than
+  // in `index.html` is what lets a test hold the ear-first promise to them.
   elements.detailNext.textContent = TARGET_EXERCISES;
+  elements.followHint.textContent = `${FOLLOW_HINT} ${FOLLOW_ECHO_NOTE}`;
 
   let renderedTargets: readonly PracticeTarget[] | null = null;
   let renderedMelodies: readonly MidiMelody[] | null = null;
@@ -966,6 +1022,7 @@ export function createPracticeView(
       const recall = state.screen === "recall" ? state.recall : null;
       const echo = state.screen === "echo" ? state.echo : null;
       const hold = state.screen === "hold" ? state.hold : null;
+      const follow = state.screen === "follow" ? state.follow : null;
       // The attempt the shared result screen is showing, and whose exercise it
       // belongs to. Recall first only because a screen can only be one of them.
       const shown = recall?.attempt ?? echo?.attempt ?? null;
@@ -977,6 +1034,7 @@ export function createPracticeView(
       elements.draft.hidden = state.screen !== "draft";
       elements.midi.hidden = state.screen !== "midi";
       elements.hold.hidden = hold === null;
+      elements.follow.hidden = follow === null;
       // One `screen`, two elements: before the attempt and after it. The first
       // one is where the ear-first rule has to hold, and keeping it a separate
       // element is what lets a test say so. The echo drill splits the same way,
@@ -1062,6 +1120,7 @@ export function createPracticeView(
         elements.detailMeta.textContent = summary.detail;
         elements.detailDelete.setAttribute("data-target", selected.id);
         elements.detailPractice.setAttribute("data-target", selected.id);
+        elements.detailFollow.setAttribute("data-target", selected.id);
 
         // The history block, which is also the answer to "is this melody
         // getting easier?". Absent until there is something in it: an empty
@@ -1177,6 +1236,32 @@ export function createPracticeView(
         elements.echoWhistle.textContent = attempting ? "Stop" : "Whistle it back";
         elements.echoWhistle.disabled = analysing || playing;
         elements.echoBack.disabled = attempting || analysing;
+      }
+
+      /* ── Follow along ──────────────────────────────────────────────────
+       *
+       * The only screen that leaves the microphone open next to the speaker,
+       * and the only one with nothing to score. While it runs, Stop is the one
+       * enabled control — the same rule every take in this app follows, and
+       * here it also has to stop the melody.
+       */
+      if (follow) {
+        const target = state.targets.find((t) => t.id === follow.targetId) ?? null;
+        elements.followName.textContent = target?.name ?? "";
+        elements.followStart.dataset.running = String(follow.running);
+        elements.followStart.classList.toggle("is-recording", follow.running);
+        elements.followStart.textContent = followLabel(follow.running);
+        elements.followBack.disabled = follow.running;
+        // While it runs the animation loop owns this canvas; between runs it is
+        // drawn once from here, so the melody is on screen before Start is
+        // tapped and stays there after it finishes.
+        if (!follow.running) {
+          drawFollowRoll(elements.followCanvas, {
+            model: followModel(follow.notes),
+            trail: [],
+            elapsedSec: null,
+          });
+        }
       }
 
       /* ── The shared result screen ─────────────────────────────────── */
