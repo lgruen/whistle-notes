@@ -528,19 +528,74 @@ export function intervalName(semitones: number): string {
 }
 
 /**
+ * Cents either side of a full octave that still read as *the* octave.
+ *
+ * An octave crack is a register event rather than an aim error: the whistle
+ * jumps to the next partial and arrives there with the same wobble any other
+ * note has. Fifty cents is a quarter tone — wide enough to catch a crack sung
+ * sloppily, narrow enough that a major 7th stays a wrong note.
+ */
+const OCTAVE_SLIP_CENTS = 50;
+
+/** Is this residual an octave out, rather than a note aimed at and missed? */
+function octaveOut(cents: number | null): boolean {
+  return cents !== null && Math.abs(Math.abs(cents) - 1200) <= OCTAVE_SLIP_CENTS;
+}
+
+/**
+ * Did the register slip partway through — part of the attempt an octave from
+ * the rest?
+ *
+ * The signature is bimodality: at least one slot sitting in the register the
+ * aligner chose, and at least one sitting an octave off it. `clean` and `off`
+ * are by definition "within `OFF_CENTS` of the chosen register", so the
+ * verdicts already carry the near-zero half of the test and only the octave
+ * half needs measuring.
+ *
+ * Worth a function rather than an inline check because **the aligner's reading
+ * of which half was the mistake is not safe to repeat out loud.** Past ~58%
+ * cracked (see the prior note in `align.ts`) the crack *wins* the register, and
+ * the slots then marked `wrong` are the notes the user sang correctly in the
+ * register that played. A sentence naming those slots sends them to fix the
+ * half they got right. So where this is true, the words describe the slip
+ * itself — which is the one claim both readings agree on — and name no slot.
+ */
+export function registerSlipped(alignment: Alignment): boolean {
+  let held = false;
+  let slipped = false;
+  for (const slot of alignment.slots) {
+    if (slot.verdict === "wrong") {
+      if (octaveOut(slot.residualCents)) slipped = true;
+    } else if (slot.verdict === "clean" || slot.verdict === "off") {
+      held = true;
+    }
+  }
+  return held && slipped;
+}
+
+/**
  * The register the attempt came out in, said out loud.
  *
  * Reassurance is the job here, not correction. Echoing a melody in your own
  * register is not a mistake — it is what the whole transposition-invariant
  * aligner exists to allow — and a beginner who sees "a 5th above" without being
  * told that is fine will try to fix something that is not broken.
+ *
+ * With one exception, which is what `slipped` is for ({@link registerSlipped}
+ * computes it): "the shape is what counts" is a claim about a melody moved
+ * *intact*. When part of the attempt sits an octave from the rest, the register
+ * did not hold, there is no single register to forgive, and the reassurance
+ * would be consoling the user about the very thing that went wrong. So it is
+ * dropped, the register is simply stated, and {@link takeawayText} underneath
+ * carries the news.
  */
-export function transpositionText(transposition: number): string {
+export function transpositionText(transposition: number, slipped = false): string {
   if (transposition === 0) return "You whistled it in the register it played in.";
   // `transposition` is what the *attempt* needs adding to reach the target, so
   // a positive value means the attempt was below.
   const direction = transposition > 0 ? "below" : "above";
-  return `You whistled it ${intervalName(transposition)} ${direction} what played — which is fine, the shape is what counts.`;
+  const register = `You whistled it ${intervalName(transposition)} ${direction} what played`;
+  return slipped ? `${register}.` : `${register} — which is fine, the shape is what counts.`;
 }
 
 /**
@@ -621,6 +676,14 @@ export function takeawayText(alignment: Alignment): string {
 
   const wrong = alignment.slots.find((slot) => slot.verdict === "wrong");
   if (wrong && wrong.residualCents !== null) {
+    // An octave-out residual is the one case where naming the slot may be
+    // naming the half of the attempt that was *right* — see
+    // {@link registerSlipped} for why the aligner's choice of register cannot
+    // be reported as a note to re-aim. The slip is what happened under either
+    // reading, so the slip is what gets said, and no slot is pointed at.
+    if (octaveOut(wrong.residualCents)) {
+      return "Part of that came out an octave from the rest — the register slipped partway through.";
+    }
     return `The ${ordinal(wrong.slot + 1)} note came out ${distanceText(wrong.residualCents)}.`;
   }
 

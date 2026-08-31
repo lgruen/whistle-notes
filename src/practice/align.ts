@@ -275,8 +275,24 @@ export interface Alignment {
    * exists and why it is continuous.
    */
   offsetCents: number;
-  /** Total alignment cost at that transposition. Comparable across attempts at
-   *  the same target, meaningless across different targets. */
+  /**
+   * Total alignment cost at that transposition — and **around
+   * {@link offsetCents}**, not around A = 440.
+   *
+   * The final pass is run with the reference already applied (see the second
+   * `fill` in {@link alignAttempt}), so every distance this sums up is measured
+   * from where the whistler was actually singing. What that makes it is a
+   * measure of **shape alone**: an attempt a uniform 45 cents sharp scores ~0,
+   * exactly as a dead-on one does, because taking the reference out is the
+   * whole point of having one.
+   *
+   * So nothing may read this as "how in tune was it" — it cannot answer that,
+   * and it will answer *well* for a take that was consistently half a semitone
+   * off. Tuning is `offsetCents`, and only `offsetCents`.
+   *
+   * Comparable across attempts at the same target, meaningless across different
+   * targets.
+   */
   cost: number;
   /** One entry per target slot, in order. */
   slots: SlotResult[];
@@ -667,6 +683,35 @@ export function alignAttempt(
   // phrases — resolves to the more plausible one rather than to whichever came
   // first in an arbitrary sweep. The prior above settles most of those ties on
   // its own; the order still decides the ones it cannot reach.
+  //
+  // There is one *exact* tie the prior provably cannot break, and it is worth
+  // knowing where it sits. Take an `m`-note attempt with `k` notes cracked a
+  // full octave and the other `m - k` in the played register, every cracked
+  // note saturated (an octave is, comfortably) and every held one inside the
+  // free radius. Staying costs `SUB_MAX_COST * k`; moving to the crack's octave
+  // costs `SUB_MAX_COST * (m - k) + TRANSPOSE_PRIOR_MAX * m`. The difference is
+  // `(12k - 7m) / 4`, so the two registers are exactly equal at `k = 7m/12` —
+  // the ~58% line the prior note in the module docblock names, written as the
+  // fraction it actually is. Because `k` and `m` are integers that needs
+  // `12 | m`; anywhere off that grid `|12k - 7m| >= 1` and the two registers
+  // differ by at least 0.25, which is eight orders above {@link EPSILON}. So
+  // this is a genuine knife edge, not a numerical one, and it is reached only
+  // at `m` = 12, 24, 36, … with exactly `7m/12` notes cracked.
+  //
+  // On it, `cost < bestCost - EPSILON` declines to switch and the answer goes
+  // to whichever of the two tied registers this loop reaches first — i.e. the
+  // one nearer the centring guess, with `candidates` breaking even *that* by
+  // yielding `centre - d` before `centre + d`. Deterministic, and defensible
+  // (the median is the robust estimate of where the attempt sat), which is why
+  // this is a note and not a fix: any rule put here would be picking one of two
+  // readings that the cost function itself says are equally good.
+  //
+  // Nothing the app generates today can reach it: the bundled melodies are 9,
+  // 13, 14, 14 and 15 notes and the echo drill's phrases are 3 to 6, and no
+  // multiple of 12 is in either list. An imported MIDI melody is the open edge
+  // — `MAX_MELODY_NOTES` is 64, so 12, 24, 36, 48 and 60 are all reachable, and
+  // a 24-note melody with 14 cracked notes lands on it exactly (verified: both
+  // registers cost 21.000000000000).
   for (const transposition of candidates(centre, radius)) {
     const cost = fill(transposition, 0);
     if (cost < bestCost - EPSILON) {

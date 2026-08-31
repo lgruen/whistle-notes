@@ -13,6 +13,7 @@ import {
   listenCountText,
   ordinal,
   overlayModel,
+  registerSlipped,
   scoreText,
   takeawayText,
   targetPlayback,
@@ -348,6 +349,33 @@ describe("what the app says about an attempt", () => {
     expect(transpositionText(-19)).toContain("an octave and a 5th above");
   });
 
+  /** The reassurance is a claim about a melody moved *intact*. Said over an
+   *  attempt whose register broke halfway, "the shape is what counts" is
+   *  consoling the user about the thing that went wrong. */
+  it("keeps the reassurance for a whole-melody echo and drops it for a slip", () => {
+    const held = alignAttempt(whistled(LONG.map((midi) => midi + 12)), melody(LONG));
+    expect(registerSlipped(held)).toBe(false);
+    expect(transpositionText(held.transposition, registerSlipped(held))).toBe(
+      "You whistled it an octave above what played — which is fine, the shape is what counts.",
+    );
+
+    // Five of seven notes cracked an octave up — past the ~58% line, so the
+    // aligner reads the crack as the register and marks the two notes that
+    // stayed put as wrong. The register still did not hold.
+    const slipped = alignAttempt(whistled([96, 98, 100, 91, 89, 98, 96]), melody(LONG));
+    expect(slipped.transposition).toBe(-12);
+    expect(registerSlipped(slipped)).toBe(true);
+    expect(transpositionText(slipped.transposition, registerSlipped(slipped))).toBe(
+      "You whistled it an octave above what played.",
+    );
+
+    // And under the line, where the aligner stays in the played register: still
+    // bimodal, still a slip.
+    const cracked = alignAttempt(whistled([84, 86, 100, 103, 89, 86, 84]), melody(LONG));
+    expect(cracked.transposition).toBe(0);
+    expect(registerSlipped(cracked)).toBe(true);
+  });
+
   it("names an interval the way a person would say it", () => {
     expect(intervalName(0)).toBe("the same note");
     expect(intervalName(1)).toBe("a semitone");
@@ -380,12 +408,38 @@ describe("what the app says about an attempt", () => {
     expect(takeawayText(attemptWith(PHRASE))).toBe("Every note landed. Nothing to fix.");
   });
 
-  it("counts an octave error as an octave rather than as 1200 cents", () => {
-    // One note cracked into the octave above; the rest is fine, so the aligner
-    // stays in the original register and reports a single wrong slot.
-    const alignment = attemptWith([84, 86, 100, 91, 89]);
-    expect(alignment.transposition).toBe(0);
-    expect(takeawayText(alignment)).toBe("The 3rd note came out an octave high.");
+  /**
+   * The sentence this replaced named the slot: "The 3rd note came out an octave
+   * high." True under the reading the aligner happened to pick, and *false*
+   * under the other one — past ~58% cracked the crack wins the register and the
+   * slots marked `wrong` are the notes that were sung correctly, so naming one
+   * sends the user to re-aim a note they got right. The register-slip sentence
+   * is the claim both readings share, and it points at no slot at all.
+   */
+  it("calls an octave-out slot a register slip, and names no note", () => {
+    // Under the line: one note cracked into the octave above, the aligner stays
+    // in the register that played, and the cracked note is the wrong one.
+    const under = attemptWith([84, 86, 100, 91, 89]);
+    expect(under.transposition).toBe(0);
+    expect(takeawayText(under)).toBe(
+      "Part of that came out an octave from the rest — the register slipped partway through.",
+    );
+    // Over it, with the verdicts inverted — five of seven cracked, so the two
+    // notes the user got right are the ones marked wrong. Same sentence, which
+    // is the whole point of choosing it.
+    const over = alignAttempt(whistled([96, 98, 100, 91, 89, 98, 96]), melody(LONG));
+    expect(over.transposition).toBe(-12);
+    expect(takeawayText(over)).toBe(
+      "Part of that came out an octave from the rest — the register slipped partway through.",
+    );
+    // A crack whistled sloppily is still a crack: 40 cents off the octave.
+    expect(takeawayText(attemptWith([84, 86, 99.6, 91, 89]))).toMatch(/register slipped/);
+
+    // And it does not fire on a wrong note that merely happens to be a long way
+    // out — a major 7th is a note that was aimed at and missed, so it is named.
+    const seventh = attemptWith([84, 86, 99, 91, 89]);
+    expect(seventh.slots[2].residualCents).toBeCloseTo(1100, 6);
+    expect(takeawayText(seventh)).toBe("The 3rd note came out 11 semitones sharp.");
   });
 
   it("has ordinals a person can read", () => {

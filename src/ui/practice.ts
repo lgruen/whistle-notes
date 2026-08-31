@@ -43,6 +43,7 @@ import {
   listenCountText,
   ordinal,
   overlayModel,
+  registerSlipped,
   scoreText,
   takeawayText,
   transpositionText,
@@ -1391,7 +1392,11 @@ export function createPracticeView(
           // the user cannot learn anything from. Empty below the point where it
           // changed something audible.
           elements.resultSummary.textContent = [
-            `${scoreText(shown.alignment)}. ` + transpositionText(shown.alignment.transposition),
+            `${scoreText(shown.alignment)}. ` +
+              transpositionText(
+                shown.alignment.transposition,
+                registerSlipped(shown.alignment),
+              ),
             tuningText(shown.alignment.offsetCents),
           ]
             .filter((line) => line !== "")

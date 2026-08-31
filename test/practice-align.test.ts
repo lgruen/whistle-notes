@@ -200,6 +200,26 @@ describe("an attempt that got it right", () => {
     }
   });
 
+  it("clamps a pathological reference at ±60 cents", () => {
+    // The backstop, pinned. Ordinarily unreachable — a whistler more than half a
+    // semitone out is absorbed by the *transposition* instead — so it takes an
+    // adversarial shape to reach: three notes 65 cents sharp, plus one a full
+    // semitone flat, which weighs nothing in the tapered mean (past `OFF_CENTS`)
+    // but costs enough at any other register to pin the search to this one. The
+    // raw estimate is then the full 65, and only `MAX_REFERENCE_CENTS` stops it.
+    const alignment = alignAttempt(
+      whistled([84.65, 86.65, 88.65, 89]),
+      melody([84, 86, 88, 90]),
+    );
+    expect(alignment.transposition).toBe(0);
+    expect(alignment.offsetCents).toBe(60);
+    // Sub-clamp, the same shape passes the raw estimate straight through, so
+    // the assertion above is about the clamp and not about the taper.
+    expect(
+      alignAttempt(whistled([84.55, 86.55, 88.55, 89]), melody([84, 86, 88, 90])).offsetCents,
+    ).toBeCloseTo(55, 6);
+  });
+
   it("gives one note no reference of its own", () => {
     // Otherwise a single-note attempt is dead on by construction, which is a
     // tautology rather than a measurement.
