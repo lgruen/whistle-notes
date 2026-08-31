@@ -979,6 +979,23 @@ describe("the recall screen, before the attempt", () => {
     expect(el.recallListen.disabled).toBe(true);
   });
 
+  /**
+   * The bug this pins: walking off this screen mid-take would leave the
+   * microphone open with nothing on screen that gets back to a Stop — the take
+   * would run until the 60 s cap closed it. The range check's Done button
+   * already follows this rule; so does this one.
+   */
+  it("will not let you walk away from a running take", () => {
+    const { el, render } = mountPractice();
+    for (const phase of ["recording", "analyzing"] as const) {
+      render({ screen: "recall", targets: [TARGET], recall: session({ recording: true }) }, phase);
+      expect(el.recallBack.disabled, phase).toBe(true);
+    }
+    // ...and it is right back the moment the take is over.
+    render({ screen: "recall", targets: [TARGET], recall: session() });
+    expect(el.recallBack.disabled).toBe(false);
+  });
+
   it("will not open the microphone over its own loudspeaker", () => {
     // Echo cancellation is off throughout this app, so a phone recording while
     // the melody is still playing would transcribe the answer.

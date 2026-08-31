@@ -872,6 +872,11 @@ export function createPracticeView(
         // would transcribe the melody it just played. Same rule as the dock's
         // Record button.
         elements.recallWhistle.disabled = analysing || playing;
+        // The same rule the range check's Done button follows: while a take is
+        // running there is exactly one way out of this screen and it is the
+        // button that started it. Leaving mid-take would walk away from an open
+        // microphone with nothing on screen that gets back to a Stop.
+        elements.recallBack.disabled = attempting || analysing;
 
         if (recall.attempt && recall.attempt !== renderedAttempt) {
           renderedAttempt = recall.attempt;
