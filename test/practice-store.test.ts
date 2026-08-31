@@ -229,8 +229,14 @@ describe("the library", () => {
     store.recordPracticeAttempt(
       saved.id,
       saved.notes,
+      // One note forty cents flat, the other two true: an aim error rather than
+      // a reference, so there is something for the ledger to remember.
       alignAttempt(
-        saved.notes.map((note) => ({ midi: note.midi, centsOffset: -45, durationSec: 0.4 })),
+        saved.notes.map((note, i) => ({
+          midi: note.midi,
+          centsOffset: i === 1 ? -40 : 0,
+          durationSec: 0.4,
+        })),
         saved.notes,
       ),
       9,
@@ -240,7 +246,8 @@ describe("the library", () => {
     store.removeTarget(saved.id);
     expect(store.getPracticeState().stats.targets.has(saved.id)).toBe(false);
     // The rising whole-tone step is about the person, and survives.
-    expect(store.getPracticeState().stats.intervals.get(2)?.absCentsEwma).toBeCloseTo(45, 6);
+    expect(store.getPracticeState().stats.intervals.get(2)?.observations).toBe(2);
+    expect(store.getPracticeState().stats.intervals.get(2)!.absCentsEwma).toBeGreaterThan(10);
   });
 
   it("persists an attempt so a history outlives the session", async () => {
@@ -359,10 +366,15 @@ describe("the recall exercise", () => {
     const state = store.getPracticeState();
     expect(state.recall!.recording).toBe(false);
     expect(state.recall!.attempt!.alignment).toBe(alignment);
+    // Forty-five cents flat on every note is one fact about the whistle, not
+    // three wrong notes: the aligner reports it as the attempt's own reference
+    // and scores the shape around it. The hold drill is where absolute aim is
+    // measured — see the reference note in `practice/align.ts`.
+    expect(alignment.offsetCents).toBeCloseTo(-45, 6);
     expect(state.stats.targets.get(saved.id)!.history[0].verdicts).toEqual([
-      "off",
-      "off",
-      "off",
+      "clean",
+      "clean",
+      "clean",
     ]);
   });
 
@@ -388,11 +400,14 @@ describe("the recall exercise", () => {
     store.finishRecallAttempt({ notes: [], trail: [], alignment }, 9);
 
     const stats = store.getPracticeState().stats;
-    // Two rising whole tones, both sung 45 cents flat — and keyed on +2
-    // whatever octave and whatever register they were sung in.
+    // Two rising whole tones, keyed on +2 whatever octave and whatever register
+    // they were sung in. The 45 cents they were all flat by is the whistler's
+    // own reference rather than an aim error, so the ledger's aim average is
+    // what is left after it comes off — which is nothing.
     expect([...stats.intervals.keys()]).toEqual([2]);
     expect(stats.intervals.get(2)!.observations).toBe(2);
-    expect(stats.intervals.get(2)!.absCentsEwma).toBeCloseTo(45, 6);
+    expect(alignment.offsetCents).toBeCloseTo(-45, 6);
+    expect(stats.intervals.get(2)!.absCentsEwma).toBeCloseTo(0, 6);
     expect(stats.intervals.get(2)!.wrongRateEwma).toBe(0);
 
     // And it survives the session, which is what makes it a history.

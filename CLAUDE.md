@@ -318,7 +318,10 @@ distance: *at this moment you were here, and the melody wanted you there.*
   that never settled — share the picture with the diff.
 - Every pitch has the alignment's `transposition` *subtracted*, so a melody
   echoed a 5th up is drawn where the user should have whistled it rather than
-  moved somewhere they never sang.
+  moved somewhere they never sang. The alignment's `offsetCents` comes off with
+  it, for the same reason and one more: the verdicts were decided around that
+  reference, so a ghost drawn without it would put a row of ✓ chips over a
+  picture of every note sitting above its box.
 - Slots nobody sang have no span to borrow, so they are wedged into the silence
   between their neighbours and allowed to overhang it slightly — reading as
   squeezed in between, which is truer than being hidden.
@@ -410,6 +413,26 @@ offset. That correction exists to rescue a consistently-sharp whistler from
 coin-flip note names, and it works by measuring exactly the bias this drill
 reports. Pass it in and the drill congratulates the person it is supposed to be
 diagnosing. There is a test named after this.
+
+**...and so must recall's** (decision, 2026-09-01). `applyAttemptTake` and
+`applyEchoTake` put the correction *back* on with `undoTuningCorrection` before
+they align, and build their trail with a zero offset to match. Two reasons, and
+the second is the one that made it urgent:
+
+1. Handed corrected notes, the aligner measures residuals the DSP has already
+   removed — a flawless score for someone 45 cents sharp on every note, from the
+   same take the hold drill calls 45 cents sharp.
+2. The DSP's correction is **gated** on concentration, so it stops firing
+   somewhere around ±25 cents of jitter. That was a scoring cliff: seven clean
+   notes on one side of it, two clean and one wrong with 48-cent residuals on
+   the other, from whistling that changed by ten cents.
+
+`align.ts` then estimates the reference itself, continuously (`offsetCents` — a
+tapered mean of the paired residuals, no gate anywhere), scores the shape around
+it, and the result screen says so in a sentence. So **recall scores shape and
+the deviation around the whistler's own reference; the hold drill scores
+absolute aim** — and both describe the number through `distanceText`, so 45
+cents is "45 cents sharp" wherever the app says it.
 
 **Echo a phrase.** `echoPhrase` walks the drill register in steps drawn from
 weighted candidates: ±1–4 semitones common, ±5–7 occasional, ±8–12 rare. The

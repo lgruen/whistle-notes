@@ -148,9 +148,64 @@ describe("an attempt that got it right", () => {
     );
     expect(verdicts(alignment)).toEqual(["clean", "clean", "clean", "clean", "clean"]);
     expect(alignment.cost).toBeCloseTo(0, 12);
+    // Residuals are reported around the attempt's own reference, and a wobble
+    // this size has a centre of its own — a few cents, here. So the deviation
+    // that went in is what comes back *plus* the reference: the two numbers
+    // together are the measurement, and neither is complete alone.
+    expect(Math.abs(alignment.offsetCents)).toBeLessThan(10);
     for (let i = 0; i < wobble.length; i++) {
-      expect(alignment.slots[i].residualCents).toBeCloseTo(wobble[i], 6);
+      expect(alignment.slots[i].residualCents! + alignment.offsetCents).toBeCloseTo(wobble[i], 6);
     }
+  });
+
+  it("scores a whistler who runs sharp throughout against their own reference", () => {
+    // The decision this file's `offsetCents` exists for: 45 cents sharp on
+    // every note is one fact about the whistle, not five wrong notes — and the
+    // hold drill is where the absolute aim gets reported.
+    for (const bias of [-45, -20, 20, 45]) {
+      const alignment = alignAttempt(
+        whistled(PHRASE.map((midi) => midi + bias / 100)),
+        melody(PHRASE),
+      );
+      expect(alignment.offsetCents, `${bias}c`).toBeCloseTo(bias, 6);
+      expect(verdicts(alignment), `${bias}c`).toEqual(Array(5).fill("clean"));
+      for (const slot of alignment.slots) {
+        expect(slot.residualCents, `${bias}c`).toBeCloseTo(0, 6);
+      }
+    }
+  });
+
+  it("moves its reference smoothly, with no threshold to fall off", () => {
+    // The failure this replaced was a *cliff*: the DSP's tuning correction is
+    // gated on concentration, so a whistler whose jitter grew by ten cents went
+    // from seven clean notes to two clean, five off and one wrong. Nothing here
+    // may step: a cent more scatter is a cent less reference.
+    const jitter = (i: number, spread: number): number => spread * Math.sin(i * 2.399963);
+    const reference = (spread: number): number =>
+      alignAttempt(
+        whistled(PHRASE.map((midi, i) => midi + (45 + jitter(i, spread)) / 100)),
+        melody(PHRASE),
+      ).offsetCents;
+
+    let previous = reference(0);
+    expect(previous).toBeCloseTo(45, 6);
+    for (const spread of [5, 10, 15, 20, 25, 30, 35, 40]) {
+      const offset = reference(spread);
+      // Never by more than a few cents per five of scatter — a gate would show
+      // up here as a double-digit step between two neighbours — and never all
+      // the way off, which is what the gated correction did at ±30.
+      expect(Math.abs(previous - offset), `spread ${spread}`).toBeLessThan(8);
+      expect(offset, `spread ${spread}`).toBeGreaterThan(20);
+      previous = offset;
+    }
+  });
+
+  it("gives one note no reference of its own", () => {
+    // Otherwise a single-note attempt is dead on by construction, which is a
+    // tautology rather than a measurement.
+    const alignment = alignAttempt(whistled([60.4]), melody([60]));
+    expect(alignment.offsetCents).toBe(0);
+    expect(alignment.slots[0].residualCents).toBeCloseTo(40, 6);
   });
 
   it("finds the register, wherever the whistle lives", () => {
@@ -186,7 +241,14 @@ describe("one note off pitch", () => {
         "clean",
         "clean",
       ]);
-      expect(alignment.slots[2].residualCents, `${cents}c`).toBeCloseTo(cents, 6);
+      // Around the attempt's own reference — one note off pitch pulls that by a
+      // couple of cents on a five-note phrase, and the taper is what keeps it to
+      // a couple rather than a fifth of the error.
+      expect(alignment.slots[2].residualCents! + alignment.offsetCents, `${cents}c`).toBeCloseTo(
+        cents,
+        6,
+      );
+      expect(Math.abs(alignment.offsetCents), `${cents}c`).toBeLessThan(5);
       // `heardMidi` is the nearest semitone to what came out, so it agrees with
       // the target until the error passes a quarter tone — which is the whole
       // reason the *verdict*, not this field, is what names the intended note.
@@ -208,16 +270,26 @@ describe("one note off pitch", () => {
     expect(verdictForCents(-CLEAN_CENTS)).toBe("off");
     expect(verdictForCents(-OFF_CENTS)).toBe("wrong");
 
-    // ...and the same boundaries survive the trip through the aligner.
+    // ...and the same boundaries survive the trip through the aligner, where
+    // they are measured around the attempt's own reference. One note out of
+    // five moves that by a couple of cents, so the margin here is five rather
+    // than one; `at` reads the boundary back off the alignment to stay honest
+    // about which quantity is being tested.
     const at = (cents: number): string => {
       const pitches = PHRASE.map((midi, i) => (i === 1 ? midi + cents / 100 : midi));
-      return verdicts(alignAttempt(whistled(pitches), melody(PHRASE)))[1];
+      const alignment = alignAttempt(whistled(pitches), melody(PHRASE));
+      return alignment.slots[1].verdict;
     };
-    expect(at(CLEAN_CENTS - 1)).toBe("clean");
-    expect(at(CLEAN_CENTS + 1)).toBe("off");
-    expect(at(OFF_CENTS - 1)).toBe("off");
-    expect(at(OFF_CENTS + 1)).toBe("wrong");
-    expect(at(-OFF_CENTS - 1)).toBe("wrong");
+    const around = (cents: number): number => {
+      const pitches = PHRASE.map((midi, i) => (i === 1 ? midi + cents / 100 : midi));
+      return alignAttempt(whistled(pitches), melody(PHRASE)).offsetCents;
+    };
+    expect(Math.abs(around(CLEAN_CENTS))).toBeLessThan(5);
+    expect(at(CLEAN_CENTS - 5)).toBe("clean");
+    expect(at(CLEAN_CENTS + 5)).toBe("off");
+    expect(at(OFF_CENTS - 5)).toBe("off");
+    expect(at(OFF_CENTS + 5)).toBe("wrong");
+    expect(at(-OFF_CENTS - 5)).toBe("wrong");
 
     // Exactly *on* a boundary, through the aligner, the answer is whichever way
     // IEEE-754 rounded `(midi + cents/100 + transposition - targetMidi) * 100`
@@ -226,10 +298,21 @@ describe("one note off pitch", () => {
     // cent either side is decisive (above), and nothing is allowed to depend on
     // which side an exact boundary value falls. The pure function is where the
     // rule itself is pinned.
-    expect(["clean", "off"]).toContain(at(CLEAN_CENTS));
-    expect(["clean", "off"]).toContain(at(-CLEAN_CENTS));
-    expect(["off", "wrong"]).toContain(at(OFF_CENTS));
-    expect(["off", "wrong"]).toContain(at(-OFF_CENTS));
+    // Two notes deviated by exactly opposite amounts, so the attempt's own
+    // reference is zero by symmetry and the residual reaching `verdictForCents`
+    // is the injected one — to within the float error this is about.
+    const onBoundary = (cents: number): string => {
+      const alignment = alignAttempt(
+        whistled([60 + cents / 100, 67 - cents / 100]),
+        melody([60, 67]),
+      );
+      expect(alignment.offsetCents).toBeCloseTo(0, 9);
+      return alignment.slots[0].verdict;
+    };
+    expect(["clean", "off"]).toContain(onBoundary(CLEAN_CENTS));
+    expect(["clean", "off"]).toContain(onBoundary(-CLEAN_CENTS));
+    expect(["off", "wrong"]).toContain(onBoundary(OFF_CENTS));
+    expect(["off", "wrong"]).toContain(onBoundary(-OFF_CENTS));
   });
 });
 
@@ -456,7 +539,13 @@ describe("adversarial", () => {
     expect(orphans.extras.map((e) => e.attemptIndex)).toEqual([0, 1]);
 
     const nothing = alignAttempt([], []);
-    expect(nothing).toEqual({ transposition: 0, cost: 0, slots: [], extras: [] });
+    expect(nothing).toEqual({
+      transposition: 0,
+      offsetCents: 0,
+      cost: 0,
+      slots: [],
+      extras: [],
+    });
   });
 
   it("never lets a duration mismatch change a verdict", () => {
@@ -751,6 +840,10 @@ describe("fuzz", () => {
   it("recovers the register and the verdict of every pitch perturbation", () => {
     const random = rng(0xa11a);
     const failures: string[] = [];
+    /** Perturbations that were still their injected kind after the attempt's
+     *  own reference came off them. */
+    let survived = 0;
+    let perturbed = 0;
     for (let take = 0; take < 400; take++) {
       const target = randomMelody(random);
       const shift = Math.round((random() - 0.5) * 28);
@@ -762,27 +855,37 @@ describe("fuzz", () => {
       const sign = random() < 0.5 ? -1 : 1;
       if (kind === "off") deviation[slot] = sign * (35 + random() * 30);
       if (kind === "wrong") deviation[slot] = sign * (100 + random() * 200);
-
-      const expected = target.map(() => "clean");
-      if (kind !== "clean") expected[slot] = kind;
+      if (kind !== "clean") perturbed++;
 
       const alignment = alignAttempt(
         whistled(target.map((midi, i) => midi + shift + deviation[i] / 100)),
         melody(target),
       );
+      // Residuals — and therefore verdicts — are measured around the attempt's
+      // own reference, so the ground truth is the deviation that went in *minus*
+      // the reference that came back. Two things are asserted rather than one:
+      // that the reference cannot run away on a wobbly attempt, and that the
+      // residual is exactly the injected deviation once it is taken off.
+      const reference = alignment.offsetCents;
+      const expected = target.map((_, i) => verdictForCents(deviation[i] - reference));
+      if (kind !== "clean" && expected[slot] === kind) survived++;
+
       const problems: string[] = [];
       if (alignment.transposition !== -shift) {
         problems.push(`register ${alignment.transposition} want ${-shift}`);
       }
+      // The wobble injected below is ±15 cents and an off note pulls a little
+      // further, so this is the bound on an honest reference — not on a
+      // runaway one.
+      if (Math.abs(reference) > 25) problems.push(`reference ${reference}`);
       if (verdicts(alignment).join(",") !== expected.join(",")) {
         problems.push(`verdicts ${verdicts(alignment).join(",")} want ${expected.join(",")}`);
       }
       if (alignment.extras.length > 0) problems.push(`${alignment.extras.length} extras`);
-      // The reported residual is the deviation that was put in, always.
       for (let i = 0; i < target.length; i++) {
         const residual = alignment.slots[i].residualCents;
-        if (residual === null || Math.abs(residual - deviation[i]) > 1e-6) {
-          problems.push(`residual[${i}] ${residual} want ${deviation[i]}`);
+        if (residual === null || Math.abs(residual + reference - deviation[i]) > 1e-6) {
+          problems.push(`residual[${i}] ${residual} want ${deviation[i] - reference}`);
         }
       }
       if (problems.length > 0) {
@@ -793,6 +896,11 @@ describe("fuzz", () => {
     // note count is unchanged, so there is exactly one sensible alignment — and
     // anything less than perfect here is a bug, not a hard case.
     expect(failures.length, failures.slice(0, 5).join(" | ")).toBe(0);
+    // The injected perturbation is measured around the attempt's own reference
+    // like everything else, so one that was thrown in a couple of cents past a
+    // boundary can legitimately come back on the other side of it. Measured:
+    // 262 of 266 survive, and a budget is the honest way to say that.
+    expect(survived / perturbed).toBeGreaterThan(0.97);
   });
 
   it("recovers the shape of every structural perturbation", () => {

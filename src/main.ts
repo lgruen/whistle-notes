@@ -44,7 +44,7 @@ import {
 } from "./practice/midi.js";
 import { representativeMidi } from "./practice/range.js";
 import { targetPlayback, type TrailPoint } from "./practice/recall.js";
-import { alignAttempt } from "./practice/align.js";
+import { alignAttempt, undoTuningCorrection } from "./practice/align.js";
 import { holdPlayback, scoreHold, HOLD_REFERENCE_SEC } from "./practice/drill.js";
 import { appendFollowPoint, followDone, followModel } from "./practice/follow.js";
 import {
@@ -1201,6 +1201,16 @@ function applyTargetTake(notes: readonly Note[]): void {
  * they are the only layer of that picture that can distinguish a note aimed at
  * badly from a note scooped into and never settled — which is the difference
  * between practising aim and practising patience.
+ *
+ * **The aligner is fed the raw pitches**, with the segmenter's global tuning
+ * correction put back — and the trail is built with a zero offset to match, so
+ * the notes and the line under them stay on one reference. That correction
+ * exists to keep note *names* stable for a consistently sharp whistler, and
+ * handing it to the aligner leaves it measuring residuals the DSP has already
+ * removed: a perfect score for somebody 45 cents sharp, until the correction's
+ * concentration gate stops firing and the same take suddenly scores badly. The
+ * aligner estimates the reference itself, continuously — see the reference note
+ * in `practice/align.ts`, which is where this decision is written down.
  */
 function applyAttemptTake(notes: readonly Note[], frames: readonly PitchFrame[], tuningOffsetCents: number): void {
   // Back to `idle` with nothing kept, as every practice take does: the
@@ -1221,10 +1231,11 @@ function applyAttemptTake(notes: readonly Note[], frames: readonly PitchFrame[],
     return;
   }
 
+  const heard = undoTuningCorrection(notes, tuningOffsetCents);
   finishRecallAttempt({
-    notes,
-    trail: trailFromFrames(frames, tuningOffsetCents),
-    alignment: alignAttempt(notes, recall.notes),
+    notes: heard,
+    trail: trailFromFrames(frames, 0),
+    alignment: alignAttempt(heard, recall.notes),
   });
 }
 
@@ -1256,10 +1267,13 @@ function applyEchoTake(
     return;
   }
 
+  // Raw pitches and a raw trail, exactly as `applyAttemptTake` takes them: one
+  // aligner, one reference, one decision — see the note there.
+  const heard = undoTuningCorrection(notes, tuningOffsetCents);
   finishEchoAttempt({
-    notes,
-    trail: trailFromFrames(frames, tuningOffsetCents),
-    alignment: alignAttempt(notes, echo.phrase),
+    notes: heard,
+    trail: trailFromFrames(frames, 0),
+    alignment: alignAttempt(heard, echo.phrase),
   });
 }
 

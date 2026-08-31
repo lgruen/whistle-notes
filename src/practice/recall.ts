@@ -35,6 +35,17 @@
  * which draws the ghost where the user should have whistled given the register
  * they picked — rather than moving their own take somewhere they never sang.
  *
+ * The same is true of the fraction of a semitone underneath it. `align.ts`
+ * measures the reference the attempt was actually whistled against — see
+ * `offsetCents` there, and the decision that put it there — and scores every
+ * verdict around it, so the ghost has to move with it too. Otherwise a whistler
+ * who ran forty cents sharp all the way through would read a row of ✓ chips
+ * over a picture showing every note sitting visibly above its box, and the two
+ * halves of the screen would be answering different questions. The trail and
+ * the notes stay exactly where the microphone put them; it is the target that
+ * moves, because the target is the thing being restated in the user's own
+ * terms. The sentence underneath ({@link tuningText}) says so out loud.
+ *
  * ## What gets named, and what does not
  *
  * Practice mode is ear-first, and the boundary is about prompts rather than
@@ -213,6 +224,9 @@ export interface OverlayInput {
 export function overlayModel(input: OverlayInput): OverlayModel {
   const { alignment, attempt } = input;
   const transposition = alignment.transposition;
+  // Semitones to take off the target to reach the attempt's own terms: the
+  // register they chose, and the reference they were whistling against.
+  const toAttempt = transposition - alignment.offsetCents / 100;
   const items: OverlayItem[] = [];
 
   /** Extras grouped by the slot they came after; `-1` is "before everything". */
@@ -252,8 +266,9 @@ export function overlayModel(input: OverlayInput): OverlayModel {
   pushExtras(-1);
   for (const slot of alignment.slots) {
     // Drawn where the user should have whistled it, not where the target is
-    // written: the whole screen lives in the attempt's register.
-    const targetMidi = slot.targetMidi - transposition;
+    // written: the whole screen lives in the attempt's register, and on its
+    // reference.
+    const targetMidi = slot.targetMidi - toAttempt;
     if (slot.attemptIndex === null) {
       items.push({
         index: items.length,
@@ -503,6 +518,33 @@ export function transpositionText(transposition: number): string {
   // a positive value means the attempt was below.
   const direction = transposition > 0 ? "below" : "above";
   return `You whistled it ${intervalName(transposition)} ${direction} what played — which is fine, the shape is what counts.`;
+}
+
+/**
+ * Below this the reference is not worth a sentence: ten cents is inside the
+ * wobble of a good whistle, and a screen that announced every one of them would
+ * be reporting rounding as a habit. Fifteen leaves a margin on top of that.
+ */
+export const TUNING_NOTICE_CENTS = 15;
+
+/**
+ * "You ran about 40 cents sharp throughout — scored against that."
+ *
+ * The one sentence that keeps the scoring honest. `align.ts` measures the
+ * reference an attempt was whistled against and marks the notes right or wrong
+ * around *it*, which is the only way to score shape without a consistently
+ * sharp whistler being told five notes were wrong when one thing was. But a
+ * correction the app makes and never mentions is the app knowing something
+ * about the user that it refuses to tell them — the transcriber says the same
+ * thing about the same measurement, in its own units — so past the point where
+ * it changed anything audible, it is said out loud.
+ *
+ * Through {@link distanceText}, like the hold drill, so forty-five cents is
+ * described in the same words wherever the app says it.
+ */
+export function tuningText(offsetCents: number): string {
+  if (!Number.isFinite(offsetCents) || Math.abs(offsetCents) < TUNING_NOTICE_CENTS) return "";
+  return `You ran about ${distanceText(offsetCents)} throughout — scored against that.`;
 }
 
 /** "4 of 5 notes clean · 1 missed" — the score, such as it is. */

@@ -51,6 +51,21 @@ function attemptOf(target: readonly TargetNote[], deviations: readonly (number |
 /** C major triad up and back: intervals +4, +3, -3, -4. */
 const TRIAD = melody([60, 64, 67, 64, 60]);
 
+/**
+ * The deviation the *ledger* sees, given the one that was whistled.
+ *
+ * The aligner measures every residual around the attempt's own reference (see
+ * `offsetCents` in `practice/align.ts`), so one note thrown fifty cents flat in
+ * an otherwise exact attempt pulls that reference a couple of cents with it and
+ * arrives here as forty-six. That is the number the aim average is supposed to
+ * hold — it is the deviation relative to where this person was actually
+ * whistling — so the expectations below are written through this rather than
+ * against the raw input, which would be asserting the old behaviour.
+ */
+function asSeen(alignment: Alignment, cents: number): number {
+  return Math.abs(cents - alignment.offsetCents);
+}
+
 describe("per-interval statistics", () => {
   it("keys on the directed step in the target, not the position", () => {
     const stats = recordAttempt(emptyStats(), "t", TRIAD, attemptOf(TRIAD, [0, 0, 0, 0, 0]), 1);
@@ -67,22 +82,32 @@ describe("per-interval statistics", () => {
     // The triad's two thirds are slot 2 (+3, rising) and slot 3 (−3, falling).
     // Rising sung 50 cents flat, falling sung true. An unsigned "third" bucket
     // would average these into a 25-cent wobble and drill neither.
-    const stats = recordAttempt(emptyStats(), "t", TRIAD, attemptOf(TRIAD, [0, 0, -50, 0, 0]), 1);
-    expect(stats.intervals.get(3)?.absCentsEwma).toBeCloseTo(50, 9);
-    expect(stats.intervals.get(-3)?.absCentsEwma).toBeCloseTo(0, 9);
-    expect(stats.intervals.get(4)?.absCentsEwma).toBeCloseTo(0, 9);
-    expect(stats.intervals.get(-4)?.absCentsEwma).toBeCloseTo(0, 9);
+    const attempt = attemptOf(TRIAD, [0, 0, -50, 0, 0]);
+    const stats = recordAttempt(emptyStats(), "t", TRIAD, attempt, 1);
+    expect(stats.intervals.get(3)?.absCentsEwma).toBeCloseTo(asSeen(attempt, -50), 9);
+    expect(stats.intervals.get(-3)?.absCentsEwma).toBeCloseTo(asSeen(attempt, 0), 9);
+    expect(stats.intervals.get(4)?.absCentsEwma).toBeCloseTo(asSeen(attempt, 0), 9);
+    expect(stats.intervals.get(-4)?.absCentsEwma).toBeCloseTo(asSeen(attempt, 0), 9);
+    // The rising third is still the one that carries the error, by a mile.
+    expect(stats.intervals.get(3)!.absCentsEwma).toBeGreaterThan(
+      10 * stats.intervals.get(-3)!.absCentsEwma,
+    );
   });
 
   it("starts the average at the first observation, not at zero", () => {
     // Seeded at zero, a first attempt 60 cents flat would read as 15 and take
     // half a dozen attempts to tell the truth — which is most of the sessions
     // anyone will ever do.
-    const one = recordAttempt(emptyStats(), "t", TRIAD, attemptOf(TRIAD, [0, -60, 0, 0, 0]), 1);
-    expect(one.intervals.get(4)?.absCentsEwma).toBeCloseTo(60, 9);
+    const first = attemptOf(TRIAD, [0, -60, 0, 0, 0]);
+    const one = recordAttempt(emptyStats(), "t", TRIAD, first, 1);
+    expect(one.intervals.get(4)?.absCentsEwma).toBeCloseTo(asSeen(first, -60), 9);
 
-    const two = recordAttempt(one, "t", TRIAD, attemptOf(TRIAD, [0, -20, 0, 0, 0]), 2);
-    expect(two.intervals.get(4)?.absCentsEwma).toBeCloseTo(60 + EWMA_ALPHA * (20 - 60), 9);
+    const second = attemptOf(TRIAD, [0, -20, 0, 0, 0]);
+    const two = recordAttempt(one, "t", TRIAD, second, 2);
+    expect(two.intervals.get(4)?.absCentsEwma).toBeCloseTo(
+      asSeen(first, -60) + EWMA_ALPHA * (asSeen(second, -20) - asSeen(first, -60)),
+      9,
+    );
     expect(two.intervals.get(4)?.centsObservations).toBe(2);
   });
 
@@ -186,10 +211,11 @@ describe("per-target slot tallies", () => {
   });
 
   it("forgets a deleted target but not what it taught us", () => {
-    const stats = recordAttempt(emptyStats(), "t", TRIAD, attemptOf(TRIAD, [0, -50, 0, 0, 0]), 1);
+    const attempt = attemptOf(TRIAD, [0, -50, 0, 0, 0]);
+    const stats = recordAttempt(emptyStats(), "t", TRIAD, attempt, 1);
     const after = forgetTarget(stats, "t");
     expect(after.targets.has("t")).toBe(false);
-    expect(after.intervals.get(4)?.absCentsEwma).toBeCloseTo(50, 9);
+    expect(after.intervals.get(4)?.absCentsEwma).toBeCloseTo(asSeen(attempt, -50), 9);
     // A target that was never there is not a change.
     expect(forgetTarget(after, "t")).toBe(after);
   });

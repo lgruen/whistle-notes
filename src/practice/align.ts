@@ -130,15 +130,14 @@
  *
  * Two things have to be true of it, and neither is free:
  *
- * 1. **One tempo, not two.** Both sides are put on the *same* scale — the
- *    attempt's durations divided by the ratio of the two total lengths — rather
- *    than each being normalised by its own median. Normalising separately means
- *    the same physical note reads as 4.0 on one side and 1.6 on the other the
- *    moment a note is missing, because the two medians are taken over different
- *    lists; the tie-break then points at the wrong slot in about a quarter of
- *    the drops it is supposed to explain. A common scale keeps the tempo
- *    invariance (a slow echo of a fast phrase still costs nothing) and makes
- *    the comparison mean what it says.
+ * 1. **One tempo, not two.** Both sides are put on the *same* scale — see
+ *    {@link tempoScale} — rather than each being normalised by its own median.
+ *    Normalising separately means the same physical note reads as 4.0 on one
+ *    side and 1.6 on the other the moment a note is missing, because the two
+ *    medians are taken over different lists; the tie-break then points at the
+ *    wrong slot in about a quarter of the drops it is supposed to explain. A
+ *    common scale keeps the tempo invariance (a slow echo of a fast phrase
+ *    still costs nothing) and makes the comparison mean what it says.
  * 2. **A total budget, not just a per-pair one.** 0.02 per pair is negligible
  *    against 2 × GAP_COST until there are a hundred pairs, at which point the
  *    accumulated 2.4 is worth more than opening a missing/extra pair and
@@ -146,6 +145,50 @@
  *    cost design exists to forbid. So the per-pair cost is scaled down past
  *    {@link DURATION_TIEBREAK_PAIRS} notes, holding the total under 1.28
  *    however long the melody is.
+ *
+ * ## The whistler's own reference (and why the DSP's correction is undone)
+ *
+ * **Decision, 2026-09-01.** The aligner is fed the *uncorrected* pitches — the
+ * caller undoes the segmenter's global tuning correction with
+ * {@link undoTuningCorrection} first — and estimates its own continuous
+ * {@link Alignment.offsetCents} over the pairs it made. Verdicts, residuals and
+ * everything the ledger learns are measured around that reference.
+ *
+ * Two things went wrong when recall consumed the corrected notes instead.
+ *
+ * *It could not see the thing it was measuring.* `src/dsp` takes each take's
+ * global tuning bias out before rounding to note names, which is what rescues a
+ * consistently-sharp whistler from coin-flip note names. Handed the result, the
+ * aligner sees residuals near zero for somebody who is 45 cents sharp on every
+ * note, and reports a flawless attempt. The hold drill deliberately bypasses
+ * that correction for exactly this reason (`scoreHold`'s docblock carries the
+ * argument), and the two exercises then said different things about one
+ * whistle.
+ *
+ * *And it was a cliff.* The DSP's correction is gated on a concentration
+ * threshold, and below it switches off outright. So a whistler 45 cents sharp
+ * with ±20 cents of jitter scored seven notes clean, and the same whistler at
+ * ±30 scored two clean, five off and one wrong, with 48-cent residuals. Nothing
+ * about the whistling changed by a factor of six; a threshold was crossed.
+ *
+ * So: no gate, no cliff. {@link referenceOffset} is the mean of the paired
+ * residuals, weighted by a taper that runs from 1 at dead-on to 0 at
+ * {@link OFF_CENTS}. The taper is the continuous form of the rule `stats.ts`
+ * already states in words — *a wrong note's residual is not about aim* — and it
+ * is what keeps the estimate honest in both directions: a note an octave out,
+ * or a semitone out, weighs nothing rather than dragging the reference a
+ * twelfth of the way to itself, and a note that drifts across the boundary
+ * changes the answer by nothing at all, because its weight is already zero when
+ * it gets there. A whistler consistently sharp comes through whole; a scattered
+ * one is pulled gently back towards the register that played, which is the
+ * right direction to be wrong in.
+ *
+ * The division of labour that falls out of it: **recall scores shape, and the
+ * deviation around the whistler's own reference; the hold drill scores absolute
+ * aim.** That split is the honest one — a single held note has no shape to be
+ * scored, and a melody's worth of notes is what turns "you ran forty cents
+ * sharp" from one reading into a fact — and both exercises put the number into
+ * words through the same `distanceText`.
  */
 
 /** One note as whistled. Structurally a subset of `src/dsp`'s `Note`. */
@@ -221,6 +264,17 @@ export interface Alignment {
   /** Semitones added to every attempt note to make it line up with the target;
    *  the register the attempt was whistled in, relative to the target's. */
   transposition: number;
+  /**
+   * The whistler's own reference for this attempt, in cents: positive means
+   * they ran sharp of what played, all the way through.
+   *
+   * Subtracted from every pitch before the verdicts are decided, so `clean`
+   * means "the right note relative to where this person was singing" rather
+   * than "the right note relative to A = 440". `0` when there is nothing to
+   * measure it from. See the reference note in the module docblock for why this
+   * exists and why it is continuous.
+   */
+  offsetCents: number;
   /** Total alignment cost at that transposition. Comparable across attempts at
    *  the same target, meaningless across different targets. */
   cost: number;
@@ -279,6 +333,26 @@ export const EARLY_GAP_COST = 0.001;
  *  target is allowed to be, and therefore the length at which the tie-break is
  *  still worth its full 0.02. */
 const DURATION_TIEBREAK_PAIRS = 64;
+
+/**
+ * Paired slots needed before the attempt is allowed a reference of its own.
+ *
+ * Two, because one note is a pitch rather than a reference: taking a single
+ * note's own residual as the reference would report every one-note attempt as
+ * dead on, which is a tautology and not a measurement.
+ */
+const MIN_REFERENCE_NOTES = 2;
+
+/**
+ * Backstop on {@link referenceOffset}.
+ *
+ * A whistler more than half a semitone out is absorbed by the *transposition*
+ * instead — the search would rather move a semitone than pay for every note
+ * being 60 cents away — so in practice the estimate lives well inside this. It
+ * is here so that a target with a pathological shape cannot hand the screen a
+ * reference nobody could have whistled.
+ */
+const MAX_REFERENCE_CENTS = 60;
 
 /** Pitch distance at which the substitution cost saturates, in semitones. */
 const SUB_SATURATION_SEMITONES = 2;
@@ -406,6 +480,77 @@ function durationCost(attemptSec: number, targetSec: number, weight: number): nu
   return weight * Math.min(1, ratio);
 }
 
+/**
+ * Give the pitches back the global tuning bias `src/dsp` took out of them.
+ *
+ * A `Note` reports `midi + centsOffset/100 = measured − tuningOffsetCents/100`;
+ * adding it back and re-snapping to the nearest semitone returns the note to
+ * what the microphone actually heard, which is what {@link alignAttempt} has to
+ * be given. See the reference note in the module docblock for why.
+ *
+ * Generic in the note type so a transcription's `Note` — which carries start
+ * and end times the overlay needs — survives the round trip with only its two
+ * pitch fields rewritten.
+ */
+export function undoTuningCorrection<T extends AttemptNote>(
+  notes: readonly T[],
+  tuningOffsetCents: number,
+): T[] {
+  if (!Number.isFinite(tuningOffsetCents) || tuningOffsetCents === 0) return [...notes];
+  const shift = tuningOffsetCents / 100;
+  return notes.map((note) => {
+    const measured = note.midi + note.centsOffset / 100 + shift;
+    const midi = Math.round(measured);
+    return { ...note, midi, centsOffset: (measured - midi) * 100 };
+  });
+}
+
+/**
+ * How much a slot's residual says about the whistler's reference: 1 dead on,
+ * 0 once it is far enough out to be a different note.
+ *
+ * A linear taper rather than a threshold, and that is the whole design. A hard
+ * "ignore anything past 70 cents" would put a cliff back in — one note drifting
+ * across it would move the reference several cents, and with it every other
+ * note's verdict. Weight zero *at* the boundary means a note arriving there
+ * changes nothing, whichever side of it the note lands on.
+ */
+function referenceWeight(residualCents: number): number {
+  return Math.max(0, 1 - Math.abs(residualCents) / OFF_CENTS);
+}
+
+/**
+ * The reference this attempt was whistled against, in cents.
+ *
+ * The tapered mean of the residuals of every slot that was actually sung — see
+ * {@link referenceWeight} and the reference note in the module docblock.
+ *
+ * Deliberately *not* a circular mean, which was the first thing tried: it folds
+ * an octave-out note onto zero for free, but it is undefined for an attempt
+ * whose residuals sit at opposite ends of a semitone. One note whistled halfway
+ * between two targets a semitone apart gives residuals of +50 and −50, which as
+ * angles are the *same* direction — and the app would then claim a confident
+ * half-semitone reference in a sign chosen by floating-point noise, turning "you
+ * split the difference" into "one clean note and one wrong one".
+ */
+function referenceOffset(slots: readonly SlotResult[]): number {
+  let weighted = 0;
+  let weights = 0;
+  let count = 0;
+  for (const slot of slots) {
+    if (slot.residualCents === null || !Number.isFinite(slot.residualCents)) continue;
+    const weight = referenceWeight(slot.residualCents);
+    if (weight <= 0) continue;
+    weighted += weight * slot.residualCents;
+    weights += weight;
+    count++;
+  }
+  if (count < MIN_REFERENCE_NOTES || weights <= 0) return 0;
+
+  const offset = weighted / weights;
+  return Math.max(-MAX_REFERENCE_CENTS, Math.min(MAX_REFERENCE_CENTS, offset));
+}
+
 /** Back-pointer codes. */
 const DIAGONAL = 1;
 const CONSUME_ATTEMPT = 2;
@@ -463,8 +608,9 @@ export function alignAttempt(
    * `back` is left holding this candidate's decisions, so a caller that wants
    * to keep them has to copy before filling again.
    */
-  const fill = (transposition: number): number => {
+  const fill = (transposition: number, referenceCents: number): number => {
     const prior = transpositionPrior(transposition);
+    const shift = transposition - referenceCents / 100;
     // Every row but the last still has attempt notes to come, so a slot skipped
     // in it is a slot skipped *over* rather than never reached — the unlikely
     // kind of gap. See the prior note in the module docblock.
@@ -479,7 +625,7 @@ export function alignAttempt(
       dp[i * width] = i * GAP_COST;
       back[i * width] = CONSUME_ATTEMPT;
       for (let j = 1; j <= m; j++) {
-        const distance = pitches[i - 1] + transposition - target[j - 1].midi;
+        const distance = pitches[i - 1] + shift - target[j - 1].midi;
         // Diagonal first, and only replaced on a *strict* improvement: on a tie
         // the aligner pairs notes up rather than dropping them, which is the
         // same preference the cost constants encode.
@@ -518,7 +664,7 @@ export function alignAttempt(
   // first in an arbitrary sweep. The prior above settles most of those ties on
   // its own; the order still decides the ones it cannot reach.
   for (const transposition of candidates(centre, radius)) {
-    const cost = fill(transposition);
+    const cost = fill(transposition, 0);
     if (cost < bestCost - EPSILON) {
       bestCost = cost;
       bestTransposition = transposition;
@@ -530,9 +676,20 @@ export function alignAttempt(
   // the loop always runs and always records a best, even for two empty
   // sequences (cost 0). Kept because it narrows the type, and because an
   // honest empty answer beats a non-null assertion if it ever became reachable.
-  if (!bestBack) return { transposition: 0, cost: 0, slots: [], extras: [] };
+  if (!bestBack) return { transposition: 0, offsetCents: 0, cost: 0, slots: [], extras: [] };
 
-  return traceback(bestBack, width, n, m, pitches, target, bestTransposition, bestCost);
+  const first = traceback(bestBack, width, n, m, pitches, target, bestTransposition, 0, bestCost);
+  const offsetCents = referenceOffset(first.slots);
+  if (offsetCents === 0) return first;
+
+  // One more pass, at the register already chosen: the reference was measured
+  // from that alignment, so scoring against it has to be that alignment's
+  // register or the two numbers would be about different things. The pairings
+  // themselves can still move — a note that read as its neighbour's flat side
+  // may sit inside its own once the whistler's own centre is taken out, and
+  // that is the point.
+  const cost = fill(bestTransposition, offsetCents);
+  return traceback(back, width, n, m, pitches, target, bestTransposition, offsetCents, cost);
 }
 
 /**
@@ -560,17 +717,21 @@ function traceback(
   pitches: readonly number[],
   target: readonly TargetNote[],
   transposition: number,
+  offsetCents: number,
   cost: number,
 ): Alignment {
   const slots = new Array<SlotResult>(m);
   const extras: ExtraNote[] = [];
+  // Every pitch on the way out is in one reference: the register the aligner
+  // chose, with the whistler's own centre taken off it.
+  const shift = transposition - offsetCents / 100;
 
   let i = n;
   let j = m;
   while (i > 0 || j > 0) {
     const code = back[i * width + j];
     if (code === DIAGONAL && i > 0 && j > 0) {
-      const heard = pitches[i - 1] + transposition;
+      const heard = pitches[i - 1] + shift;
       const residualCents = (heard - target[j - 1].midi) * 100;
       slots[j - 1] = {
         slot: j - 1,
@@ -587,7 +748,7 @@ function traceback(
       // backwards and everything below `j` is still unassigned.
       extras.push({
         attemptIndex: i - 1,
-        heardMidi: Math.round(pitches[i - 1] + transposition),
+        heardMidi: Math.round(pitches[i - 1] + shift),
         afterSlot: j - 1,
       });
       i--;
@@ -605,7 +766,7 @@ function traceback(
   }
 
   extras.reverse();
-  return { transposition, cost, slots, extras };
+  return { transposition, offsetCents, cost, slots, extras };
 }
 
 export interface VerdictCounts {

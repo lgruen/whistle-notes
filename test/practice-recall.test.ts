@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { alignAttempt, type Alignment, type TargetNote } from "../src/practice/align.js";
+import {
+  alignAttempt,
+  countVerdicts,
+  undoTuningCorrection,
+  type Alignment,
+  type TargetNote,
+} from "../src/practice/align.js";
+import { holdScoreText, scoreHold } from "../src/practice/drill.js";
 import {
   TARGET_GAP_SEC,
   intervalName,
@@ -10,11 +17,13 @@ import {
   takeawayText,
   targetPlayback,
   transpositionText,
+  tuningText,
   verdictChips,
   type HeardNote,
 } from "../src/practice/recall.js";
 import { drawDiffOverlay, trailFromFrames } from "../src/ui/diffroll.js";
-import { midiToHz, type PitchFrame } from "../src/dsp/index.js";
+import { midiToHz, transcribe, type PitchFrame } from "../src/dsp/index.js";
+import { sequence } from "./fixtures/synth.js";
 
 /**
  * The recall exercise, tested where it is arithmetic and words.
@@ -137,8 +146,14 @@ describe("the overlay", () => {
 
     const slot = model.items[2];
     expect(slot.outcome).toBe("off");
-    expect(slot.residualCents).toBeCloseTo(-40, 6);
-    expect((slot.heardMidi ?? 0) - (slot.targetMidi ?? 0)).toBeCloseTo(-0.4, 9);
+    // Around the attempt's own reference, which one flat note in five pulls a
+    // couple of cents — and the ghost moves with it, so the vertical distance
+    // on the picture is still exactly the residual on the chip.
+    expect(slot.residualCents! + alignment.offsetCents).toBeCloseTo(-40, 6);
+    expect((slot.heardMidi ?? 0) - (slot.targetMidi ?? 0)).toBeCloseTo(
+      slot.residualCents! / 100,
+      9,
+    );
   });
 
   it("wedges a missed note into the silence where it should have been", () => {
@@ -228,7 +243,7 @@ describe("the overlay", () => {
 
   it("has a shape even with nothing in it", () => {
     const model = overlayModel({
-      alignment: { transposition: 0, cost: 0, slots: [], extras: [] },
+      alignment: { transposition: 0, offsetCents: 0, cost: 0, slots: [], extras: [] },
       attempt: [],
     });
     expect(model.items).toEqual([]);
@@ -433,11 +448,100 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/**
+ * The whistler's own reference, end to end through the real pipeline.
+ *
+ * These are the only tests in this file that synthesise audio and run
+ * `transcribe`, and they have to: the decision they pin is about what the
+ * *segmenter* hands the aligner. `src/dsp` removes each take's global tuning
+ * bias before rounding to note names, so a recall screen fed the corrected
+ * notes measures residuals that have already been taken out — and then falls
+ * off a cliff the moment that correction's concentration gate stops firing.
+ * See the reference note in `practice/align.ts` for the decision itself.
+ */
+describe("a whistler who runs sharp all the way through", () => {
+  const MELODY = [84, 86, 88, 86, 84, 83, 85];
+
+  /** One take through the real pipeline, scored the way `main.ts` scores it. */
+  function attemptAt(cents: (i: number) => number): Alignment {
+    const target: TargetNote[] = MELODY.map((midi) => ({ midi, durSec: 0.5 }));
+    const signal = sequence(
+      target.map((note, i) => ({
+        midi: note.midi,
+        detuneCents: cents(i),
+        durSec: 0.5,
+        gapSec: 0.12,
+      })),
+      { sampleRate: 48000 },
+    );
+    const result = transcribe(signal.samples, signal.sampleRate);
+    // Exactly what `applyAttemptTake` does: the correction goes back on before
+    // the aligner sees anything.
+    const heard = undoTuningCorrection(result.notes, result.tuningOffsetCents);
+    return alignAttempt(heard, target);
+  }
+
+  it("is told so, and scored against it", () => {
+    const alignment = attemptAt(() => 45);
+    expect(alignment.offsetCents).toBeCloseTo(45, 0);
+    expect(countVerdicts(alignment).clean).toBe(MELODY.length);
+    expect(tuningText(alignment.offsetCents)).toBe(
+      "You ran about 45 cents sharp throughout — scored against that.",
+    );
+  });
+
+  it("hears the same number from the hold drill, in the same words", () => {
+    // The two exercises measure different things — shape here, absolute aim
+    // there — but the same habit, so they must not describe it differently.
+    const held = sequence([{ midi: 84, detuneCents: 45, durSec: 2.5 }], { sampleRate: 48000 });
+    const frames = transcribe(held.samples, held.sampleRate).frames;
+    const score = scoreHold(trailFromFrames(frames, 0), 84);
+    expect(holdScoreText(score!)).toContain("45 cents sharp");
+    expect(tuningText(attemptAt(() => 45).offsetCents)).toContain("45 cents sharp");
+  });
+
+  it("loses the reference gradually as the whistling scatters, with no step", () => {
+    // The cliff, measured. The DSP's own correction switches off somewhere
+    // between ±20 and ±25 cents of jitter here, and used to take the scoring
+    // with it: seven clean notes became two clean, five off and one wrong, with
+    // 48-cent residuals. Nothing may step now.
+    const jitter = (i: number, spread: number): number => spread * Math.sin(i * 2.399963);
+    const mean = (alignment: Alignment): number =>
+      alignment.slots.reduce((total, slot) => total + Math.abs(slot.residualCents ?? 0), 0) /
+      alignment.slots.length;
+
+    let previous: Alignment | null = null;
+    for (const spread of [0, 10, 20, 25, 30, 35, 40]) {
+      const alignment = attemptAt((i) => 45 + jitter(i, spread));
+      expect(countVerdicts(alignment).wrong, `spread ${spread}`).toBe(0);
+      expect(countVerdicts(alignment).missing, `spread ${spread}`).toBe(0);
+      // The reference is still most of the bias even at the far end, and the
+      // residual it leaves behind grows in step with the scatter rather than
+      // jumping when a threshold is crossed.
+      expect(alignment.offsetCents, `spread ${spread}`).toBeGreaterThan(20);
+      if (previous) {
+        expect(previous.offsetCents - alignment.offsetCents, `spread ${spread}`).toBeGreaterThan(0);
+        expect(mean(alignment) - mean(previous), `spread ${spread}`).toBeLessThan(10);
+      }
+      previous = alignment;
+    }
+    expect(mean(previous!)).toBeLessThan(40);
+  });
+});
+
 describe("drawing the diff", () => {
-  /** An octave below {@link PHRASE}, so the drawn range spans two octave
-   *  gridlines — which is what {@link mapping} needs to recover the renderer's
-   *  private geometry without hard-coding a copy of it. */
-  const attempt = whistled([74, 76, 77.6, 81, 79]);
+  /**
+   * An octave below {@link PHRASE}, so the drawn range spans two octave
+   * gridlines — which is what {@link mapping} needs to recover the renderer's
+   * private geometry without hard-coding a copy of it.
+   *
+   * The second note is 40 cents *sharp* against the third's 40 flat, so the
+   * attempt's own reference is zero by symmetry and the ghosts sit at whole
+   * semitones. Otherwise the reference moves them a fraction and the padded
+   * range slides off one of the two gridlines this test reads its geometry
+   * from.
+   */
+  const attempt = whistled([74, 76.4, 77.6, 81, 79]);
   const alignment = alignAttempt(attempt, melody([74, 76, 78, 81, 79]));
   const model = overlayModel({ alignment, attempt });
 

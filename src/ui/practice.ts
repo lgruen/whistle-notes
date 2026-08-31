@@ -46,6 +46,7 @@ import {
   scoreText,
   takeawayText,
   transpositionText,
+  tuningText,
   verdictChips,
   type OverlayModel,
   type VerdictChip,
@@ -1333,8 +1334,17 @@ export function createPracticeView(
             trail: shown.trail,
           });
           elements.resultStrip.innerHTML = verdictStripHtml(verdictChips(overlay));
-          elements.resultSummary.textContent =
-            `${scoreText(shown.alignment)}. ` + transpositionText(shown.alignment.transposition);
+          // The register, and then the fraction of a semitone underneath it —
+          // the app scored this attempt against the reference the whistler was
+          // actually using, and a correction it makes and never mentions is one
+          // the user cannot learn anything from. Empty below the point where it
+          // changed something audible.
+          elements.resultSummary.textContent = [
+            `${scoreText(shown.alignment)}. ` + transpositionText(shown.alignment.transposition),
+            tuningText(shown.alignment.offsetCents),
+          ]
+            .filter((line) => line !== "")
+            .join(" ");
           // The drill adds what the ramp just did. Not *instead* of the
           // takeaway — which jump went wrong is the whole point of a three-note
           // phrase — but after it, so a phrase getting longer reads as progress

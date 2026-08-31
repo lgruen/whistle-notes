@@ -1101,6 +1101,33 @@ describe("the recall screen, after the attempt", () => {
     expect(el.resultTakeaway.textContent).toMatch(/note/);
   });
 
+  it("says out loud when it scored the attempt against the whistler's own reference", () => {
+    const { el, render } = mountPractice();
+    // The same melody, whistled 45 cents sharp from end to end. The aligner
+    // scores the shape around that rather than calling five notes wrong — and a
+    // correction the app makes and never mentions is one the user cannot learn
+    // anything from, so the summary carries it.
+    const sharp: HeardNote[] = AS_PLAYED.map((note, i) => ({
+      midi: note.midi,
+      centsOffset: 45,
+      durationSec: 0.4,
+      startSec: i * 0.5,
+      endSec: i * 0.5 + 0.4,
+    }));
+    const attempt: RecallAttempt = {
+      notes: sharp,
+      trail: [],
+      alignment: alignAttempt(sharp, AS_PLAYED),
+    };
+    render({ screen: "recall", targets: [TARGET], recall: session({ attempt }) });
+    expect(el.resultSummary.textContent).toMatch(/5 of 5 notes clean/);
+    expect(el.resultSummary.textContent).toMatch(/45 cents sharp throughout/);
+
+    // ...and stays quiet about a reference too small to have changed anything.
+    render({ screen: "recall", targets: [TARGET], recall: session({ attempt: ATTEMPT }) });
+    expect(el.resultSummary.textContent).not.toMatch(/throughout/);
+  });
+
   it("draws one chip per note of the melody, plus anything extra", () => {
     const { el, render } = mountPractice();
     render({ screen: "recall", targets: [TARGET], recall: session({ attempt: ATTEMPT }) });
