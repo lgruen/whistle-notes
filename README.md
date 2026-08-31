@@ -383,6 +383,7 @@ everything, and their *relationships* matter far more than their values:
 |---|---|---|
 | gap | 1 | a target note left unsung, or a note that answers to nothing |
 | substitution | 0 → 1.5 | zero within 30 cents, rising, flat past a whole tone |
+| register | ≤ 0.25 | per pairing, for moving off the register that played |
 | duration | ≤ 0.02 | a tie-break, never a verdict |
 
 **`substitution_max < 2 × gap` is the anti-cascade guarantee.** Pairing two notes
@@ -391,13 +392,29 @@ a tritone apart, anything. So the aligner can never answer "you missed a note an
 added one" where the honest answer is "you sang one wrong note". That failure is
 the one that makes a diff useless, because it turns one mistake into two and
 pushes the error's location off by a slot. It is a theorem here rather than a
-hope, and the test suite sweeps it directly.
+hope, and the test suite sweeps it directly. Both tie-breakers are bounded to
+keep it: substitution + register + duration is 1.77, still under two gaps.
+
+The register cost is the interesting one, because without it the search is
+*symmetric* and symmetry is wrong here. The app chose the pitch it played the
+melody at, so "the register it played in" is the null hypothesis and every other
+one is a claim that you moved. Whistle six notes and crack the first three an
+octave: three notes are wrong at the played register, the *other* three are wrong
+an octave down, the two cost exactly the same, and the tie went to whichever the
+sweep happened to reach first — so half the time the verdicts came back inverted,
+with the notes you got right marked as the wrong ones. A small surcharge per
+paired note settles it, and being per note is what keeps it a tie-breaker rather
+than a wall: a whole melody genuinely echoed an octave up still wins its register
+six to one, while a bare majority of cracked notes does not.
 
 Rhythm never fails a note. Duration enters only as a tie-break worth two
-hundredths of a gap, after both sides have been normalised by their own median —
-so a slow echo of a fast phrase costs nothing, and the only thing rhythm decides
-is genuinely undecidable on pitch alone: which of three identical repeated notes
-was the one you dropped.
+hundredths of a gap, with both sides put on **one** tempo — the level in
+log-duration space — so a slow echo of a fast phrase costs nothing. (Normalising
+each side by its own median, which is the obvious thing, puts the same physical
+note at two different numbers the moment one is missing, and then names the wrong
+slot in about a quarter of the drops it exists to explain.) The only thing rhythm
+decides is genuinely undecidable on pitch alone: which of three identical
+repeated notes was the one you dropped.
 
 What comes out is a verdict per slot:
 
@@ -429,10 +446,17 @@ cents average only ever averages slots that came out as the *right* note, since 
 wrong note's residual can be 1200 cents and is not a fact about aim at all.
 
 And the exercises line up with the causes. **Hold a note** is production with
-memory and intervals removed — one reference tone, held back, scored as a median
-offset and a wobble width. **Echo a phrase** is interval knowledge with memory
-removed — the phrase is generated, so there is nothing to have practised.
-**Melody recall** is all three at once, which is why it needs the diff.
+memory and intervals removed — one reference tone, held back, scored as three
+numbers that fail in different directions: where the middle of it sat, how wide
+it wandered, and how far it *travelled* end to end. The third is not a nicety.
+The first two are both positional, and a note that sinks a whole semitone over
+two seconds has its median halfway down the slide and an interquartile range of
+half the excursion — so the drill called a hundred-cent failure "±19 cents,
+steady and close", under-stating it four times over and offering advice for the
+wrong problem, since a slide wants more air behind it and a wobble wants less.
+**Echo a phrase** is interval knowledge with memory removed — the phrase is
+generated, so there is nothing to have practised. **Melody recall** is all three
+at once, which is why it needs the diff.
 
 ### Drills that follow the weakness
 
@@ -444,22 +468,51 @@ units of the 70 cents where off-pitch stops being off-pitch.
 
 The phrase generator turns that into a **bias, not a filter**. Every step from a
 semitone to an octave keeps a base weight (small steps common, leaps rare), and a
-weak interval's weight is multiplied up — at most about five and a half times, so
-a weak 6th gets drilled roughly as often as an ordinary step and never crowds
-everything else out. Three reasons it is a multiplier rather than a whitelist:
-with no history every multiplier is 1 and the generator *is* a plain random walk,
-so the cold-start fallback is not a second code path; a drill that only played
-your three worst intervals would stop being an ear test; and over-sampling an
-interval is what *changes* its average, so the bias has to be gentle enough for
-the statistic to climb back out. Phrases ramp from three notes to six as you get
-them.
+weak interval's weight is multiplied up. Three reasons it is a multiplier rather
+than a whitelist: with no history every multiplier is 1 and the generator *is* a
+plain random walk, so the cold-start fallback is not a second code path; a drill
+that only played your three worst intervals would stop being an ear test; and
+over-sampling an interval is what *changes* its average, so the bias has to be
+gentle enough for the statistic to climb back out. Phrases ramp from three notes
+to six as you get them.
 
-One detail worth knowing, because getting it wrong would be invisible: the hold
-drill scores the **raw** pitch trail. The transcriber measures each take's global
-tuning bias and takes it out before rounding to note names — which is exactly the
-bias the hold drill exists to report. Feed it a corrected trail and a whistler who
-sits 40 cents sharp on every single note is told they are perfect, by a machine
-that quietly moved the target to meet them.
+A weight is not a frequency, though, and that gap is where the drill quietly
+failed at the thing it was built for. The walk drops the steps that would leave
+your register and re-normalises what is left, so a step's share of the phrases
+actually drawn is its weight times the fraction of notes it is *legal* from — and
+a ninth is legal from four of the thirteen notes in a default register against
+eleven for a whole tone. The multiplier alone therefore kept about a third of its
+bias: a maximally weak 6th reached 4.8% of drawn steps where an ordinary step
+gets around 10%. Dividing the gain by that availability is the cancellation, and
+takes it to 11.6% — which is what "as often as an ordinary step" was always meant
+to mean, and it is the whole reason the third tier of leaps exists.
+
+### Two ways of being 40 cents sharp
+
+One detail worth knowing, because getting it wrong is invisible. The transcriber
+measures each take's global tuning bias and takes it out before rounding to note
+names — which is what rescues a consistently-sharp whistler from coin-flip note
+names, and is *exactly* the bias practice mode is trying to report. So both
+exercises are handed the **raw** pitch, with that correction put back on, and
+they do different things with it:
+
+- **The hold drill** reports it as it stands. That is its whole question: one
+  note, absolute aim, "you held it 45 cents sharp". Feed it a corrected trail and
+  a whistler who sits 40 cents sharp on every note is told they are perfect, by a
+  machine that quietly moved the target to meet them.
+- **Recall and the echo drill** estimate it and then score the *shape* around it,
+  because 45 cents sharp on every note of a melody is one fact about a whistle
+  rather than five wrong notes — and the screen says which reference it used, in
+  the same words the hold drill uses for the same number.
+
+The estimate has no threshold in it anywhere, and that is deliberate: the
+transcriber's own correction switches off below a concentration gate, and when
+recall inherited that gate it inherited a *cliff*. The same whistler with ten
+cents more jitter went from seven clean notes to two clean, five off and one
+wrong. Here each note's contribution is weighted by a taper that falls to zero at
+the boundary where a note stops being that note, so a wrong note weighs nothing
+rather than dragging the reference towards itself, and a note drifting across the
+line changes the answer by nothing at all.
 
 ### Whistling along
 
