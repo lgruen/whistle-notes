@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AudioFileError,
   DECODE_SAMPLE_RATE,
-  MAX_FILE_BYTES,
+  MAX_COMPRESSED_BYTES,
+  MAX_UNCOMPRESSED_BYTES,
   capSamples,
   decodeAudioFile,
+  isUncompressedContainer,
   mixToMono,
 } from "../src/audio/decode.js";
 
@@ -53,10 +55,16 @@ type DecodeOutcome =
 let outcome: DecodeOutcome = { kind: "promise", buffer: new FakeAudioBuffer([], 48000) };
 
 class FakeOfflineAudioContext {
-  static lastArgs: number[] | null = null;
+  /** Every construction ever, across the whole file. Deliberately *not* reset
+   *  between tests: the module caches one context for the life of the module,
+   *  and these tests share one import of it, so "how many were built" is a
+   *  file-wide fact rather than a per-test one. */
+  static built: number[][] = [];
+  /** Reset per test: how many times the codec was actually reached. */
+  static decodeCalls = 0;
 
   constructor(channels: number, length: number, sampleRate: number) {
-    FakeOfflineAudioContext.lastArgs = [channels, length, sampleRate];
+    FakeOfflineAudioContext.built.push([channels, length, sampleRate]);
   }
 
   decodeAudioData(
@@ -64,6 +72,7 @@ class FakeOfflineAudioContext {
     success: (buffer: FakeAudioBuffer) => void,
     failure: (error: Error) => void,
   ): Promise<FakeAudioBuffer> | undefined {
+    FakeOfflineAudioContext.decodeCalls++;
     switch (outcome.kind) {
       case "promise":
         return Promise.resolve(outcome.buffer);
@@ -83,14 +92,30 @@ class FakeOfflineAudioContext {
   }
 }
 
-/** A file of `bytes` bytes whose contents never matter — the fake decoder does
- *  not look at them. Built as a stub rather than a real Blob so the oversize
- *  case does not have to allocate 32 MB to be tested. */
-function fakeFile(bytes: number): File {
+/**
+ * A file of `bytes` bytes whose *contents* never matter to the fake decoder —
+ * but whose first twelve bytes do, because that is what decides which size cap
+ * applies. `header` is written at offset 0 as ASCII; the default is a
+ * compressed-looking file.
+ *
+ * Built as a stub rather than a real Blob so the oversize cases do not have to
+ * allocate tens of megabytes to be tested.
+ */
+function fakeFile(bytes: number, header = "\0\0\0\0\0\0\0\0\0\0\0\0"): File {
+  const head = new Uint8Array(12);
+  for (let i = 0; i < Math.min(12, header.length); i++) head[i] = header.charCodeAt(i);
   return {
     size: bytes,
+    slice: (start: number, end: number) => ({
+      arrayBuffer: () => Promise.resolve(head.slice(start, end).buffer),
+    }),
     arrayBuffer: () => Promise.resolve(new ArrayBuffer(Math.min(bytes, 8))),
   } as unknown as File;
+}
+
+/** A RIFF/WAVE file of `bytes` bytes — what this app's own Save button writes. */
+function fakeWav(bytes: number): File {
+  return fakeFile(bytes, "RIFF\0\0\0\0WAVE");
 }
 
 function ramp(length: number, from: number, to: number): Float32Array {
@@ -100,7 +125,7 @@ function ramp(length: number, from: number, to: number): Float32Array {
 }
 
 beforeEach(() => {
-  FakeOfflineAudioContext.lastArgs = null;
+  FakeOfflineAudioContext.decodeCalls = 0;
   vi.stubGlobal("OfflineAudioContext", FakeOfflineAudioContext);
 });
 
@@ -138,6 +163,28 @@ describe("channel mixdown", () => {
     // being true, stop at the shortest rather than read past the end.
     expect([...mixToMono([new Float32Array([1, 1, 1]), new Float32Array([0])])]).toEqual([0.5]);
   });
+
+  it("drops the LFE and keeps the centre when the file is 5.1", () => {
+    // A flat 1/6 average would fold a subwoofer channel of pure rumble into the
+    // signal a pitch tracker is about to look at, and push the front content
+    // ~6 dB below where the same material lands in stereo. Web Audio's own
+    // coefficients say otherwise, so we use those.
+    const ch = (value: number): Float32Array => new Float32Array([value]);
+    // [L, R, C, LFE, Ls, Rs] — only the LFE is loud, and it is the one channel
+    // that must not survive.
+    const lfeOnly = mixToMono([ch(0), ch(0), ch(0), ch(1), ch(0), ch(0)]);
+    expect(lfeOnly[0]).toBe(0);
+
+    // Silence everywhere but the centre: it comes through at its full weight
+    // relative to the others, not at a sixth.
+    const centreOnly = mixToMono([ch(0), ch(0), ch(1), ch(0), ch(0), ch(0)]);
+    expect(centreOnly[0]).toBeCloseTo(1 / 3.4142, 4);
+
+    // And the result is normalised, so a full-scale 5.1 mix does not come out
+    // over 1.0 and trip the clipping detector on audio that never clipped.
+    const full = mixToMono([ch(1), ch(1), ch(1), ch(1), ch(1), ch(1)]);
+    expect(full[0]).toBeCloseTo(1, 6);
+  });
 });
 
 describe("the duration cap", () => {
@@ -174,7 +221,7 @@ describe("decoding a file", () => {
     // it decodes to its own rate, so the same file transcribes identically on
     // every device and in the Node harness. A device-dependent rate would make
     // a bug report reproduce differently on the phone that filed it.
-    expect(FakeOfflineAudioContext.lastArgs).toEqual([1, 1, DECODE_SAMPLE_RATE]);
+    expect(FakeOfflineAudioContext.built[0]).toEqual([1, 1, DECODE_SAMPLE_RATE]);
     expect(decoded.sampleRate).toBe(DECODE_SAMPLE_RATE);
     expect(decoded.samples).toHaveLength(4800);
     expect(decoded.truncated).toBe(false);
@@ -222,18 +269,99 @@ describe("decoding a file", () => {
     await expect(decodeAudioFile(fakeFile(1024))).rejects.toThrow(/no audio/i);
   });
 
-  it("refuses a file too big to decode before it tries", async () => {
-    // `decodeAudioData` decodes the whole file before anything can be
-    // truncated — an hour of audio is most of a gigabyte of float, and a phone
-    // answers that with a tab crash rather than an error.
-    await expect(decodeAudioFile(fakeFile(MAX_FILE_BYTES + 1))).rejects.toBeInstanceOf(
-      AudioFileError,
-    );
-    expect(FakeOfflineAudioContext.lastArgs).toBeNull();
-  });
-
   it("says so when the browser cannot decode at all", async () => {
     vi.stubGlobal("OfflineAudioContext", undefined);
     await expect(decodeAudioFile(fakeFile(1024))).rejects.toBeInstanceOf(AudioFileError);
+  });
+
+  it("reuses one decode context across imports", async () => {
+    // WebKit caps how many live audio contexts a page may hold and does not
+    // reclaim them promptly, so a context per import means the import-tweak-
+    // import loop stops working after a handful of tries — silently, and only
+    // on a phone. One context, built once, is the whole fix.
+    const built = FakeOfflineAudioContext.built.length;
+    outcome = { kind: "promise", buffer: new FakeAudioBuffer([ramp(480, 0, 1)], 48000) };
+    for (let i = 0; i < 5; i++) await decodeAudioFile(fakeFile(1024));
+    expect(FakeOfflineAudioContext.built).toHaveLength(built);
+    expect(FakeOfflineAudioContext.decodeCalls).toBe(5);
+  });
+});
+
+/**
+ * The size cap, which is the one guard here that cannot be exact.
+ *
+ * A compressed file's decoded size is its duration times the rate, and nothing
+ * before the decode knows the duration — so the cap has to be sized for the
+ * worst *bitrate* instead, and the arithmetic behind that number is worth
+ * pinning: the old cap was 32 MB of anything, which at 32 kbps is 133 minutes
+ * and about 1.5 GB of float, i.e. a dead tab rather than a message.
+ */
+describe("the size cap", () => {
+  /** Peak float bytes per second of source: a stereo decode at 48 kHz plus the
+   *  mono copy that is alive at the same time. */
+  const PEAK_BYTES_PER_SEC = DECODE_SAMPLE_RATE * 4 * 3;
+
+  it("keeps the worst plausible compressed file inside a phone's memory", () => {
+    // 32 kbps is about what a voice-memo app produces in its compressed mode.
+    const seconds = MAX_COMPRESSED_BYTES / (32000 / 8);
+    expect(seconds * PEAK_BYTES_PER_SEC).toBeLessThanOrEqual(512 * 1024 * 1024);
+    // The old 32 MB cap, for contrast: two hours of it, and well over a
+    // gigabyte of float.
+    expect((32 * 1024 * 1024) / (32000 / 8) * PEAK_BYTES_PER_SEC).toBeGreaterThan(
+      1024 * 1024 * 1024,
+    );
+  });
+
+  it("still admits a three-minute voice memo, which is the documented use", () => {
+    // 128 kbps × 180 s. Truncating one of these to its first minute is the
+    // behaviour the module is built around, so rejecting them would be a
+    // regression dressed as a safety fix.
+    expect((128000 / 8) * 180).toBeLessThan(MAX_COMPRESSED_BYTES);
+  });
+
+  it("gives an uncompressed file its own, much larger cap", async () => {
+    // PCM's expansion factor is known and small, so the same memory budget buys
+    // far more of it. This is not a nicety: this app's own Save button writes
+    // 16-bit mono WAV, and a 60 s take is ~5.8 MB of it — over the compressed
+    // cap. A single cap would have made the app unable to re-import its own
+    // debug export.
+    const ownExport = 44 + 60 * 48000 * 2;
+    expect(ownExport).toBeGreaterThan(MAX_COMPRESSED_BYTES);
+    expect(ownExport).toBeLessThan(MAX_UNCOMPRESSED_BYTES);
+
+    outcome = { kind: "promise", buffer: new FakeAudioBuffer([ramp(480, 0, 1)], 48000) };
+    await expect(decodeAudioFile(fakeWav(ownExport))).resolves.toBeDefined();
+  });
+
+  it("sniffs the container rather than trusting a name or a MIME type", () => {
+    const bytes = (text: string): Uint8Array =>
+      Uint8Array.from(text, (character) => character.charCodeAt(0));
+    expect(isUncompressedContainer(bytes("RIFF\0\0\0\0WAVE"))).toBe(true);
+    expect(isUncompressedContainer(bytes("FORM\0\0\0\0AIFF"))).toBe(true);
+    expect(isUncompressedContainer(bytes("FORM\0\0\0\0AIFC"))).toBe(true);
+    // A RIFF that is not WAVE (an AVI, say) gets the conservative cap.
+    expect(isUncompressedContainer(bytes("RIFF\0\0\0\0AVI "))).toBe(false);
+    // An m4a mislabelled `.wav` would otherwise be handed the 32 MB cap and
+    // decode to a gigabyte.
+    expect(isUncompressedContainer(bytes("\0\0\0 ftypM4A "))).toBe(false);
+    expect(isUncompressedContainer(bytes("RIFF"))).toBe(false);
+  });
+
+  it("refuses an oversize file before it reaches the codec", async () => {
+    const calls = FakeOfflineAudioContext.decodeCalls;
+    await expect(decodeAudioFile(fakeFile(MAX_COMPRESSED_BYTES + 1))).rejects.toBeInstanceOf(
+      AudioFileError,
+    );
+    await expect(decodeAudioFile(fakeWav(MAX_UNCOMPRESSED_BYTES + 1))).rejects.toThrow(/too large/i);
+    expect(FakeOfflineAudioContext.decodeCalls).toBe(calls);
+  });
+
+  it("turns an allocation failure into advice rather than a blank screen", async () => {
+    // The cap bounds the plausible worst case, not the actual one, so this
+    // really can happen — and it arrives as a RangeError from an allocation,
+    // which is nothing a codec-shaped error message would fit.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    outcome = { kind: "reject", error: new RangeError("Array buffer allocation failed") };
+    await expect(decodeAudioFile(fakeFile(1024))).rejects.toThrow(/more memory/i);
   });
 });

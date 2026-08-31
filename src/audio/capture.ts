@@ -140,12 +140,36 @@ export function setCaptureHandlers(next: Partial<CaptureHandlers>): void {
   handlers = next;
 }
 
-/** End this take exactly once, whatever noticed first. */
+/**
+ * End this take exactly once, whatever noticed first.
+ *
+ * The microphone is released *here*, before the handler is called and whether
+ * or not it does anything, and that ordering is the point. This is the one path
+ * where the module decides a take is over without being asked, so it is also
+ * the one path where a handler that declines to act — `main.ts` returns early
+ * if the phase disagrees — would leave the microphone open, the recording
+ * indicator lit and `recording` true, with no tap anywhere in the UI that gets
+ * back to a `stopRecording()`. Owning the release removes that dependency: the
+ * handler decides what to *show*, never whether the hardware is freed.
+ *
+ * If the handler really does nothing, the take is closed out entirely rather
+ * than left half-open. That loses the audio, which is the honest cost: the
+ * alternative is a module that says it is recording through a microphone it no
+ * longer holds. The handler is therefore expected to call
+ * {@link stopRecording} *synchronously* if it wants the samples.
+ */
 function signalEnd(reason: "limit" | "interrupted", message: string): void {
   if (!recording || endSignalled) return;
   endSignalled = true;
-  if (reason === "limit") handlers.onLimitReached?.();
-  else handlers.onInterrupted?.(message);
+  // Just the tracks: the context, the blocks and the sample rate all have to
+  // survive for `stopRecording()` to hand back what was captured.
+  for (const track of stream?.getTracks() ?? []) track.stop();
+  try {
+    if (reason === "limit") handlers.onLimitReached?.();
+    else handlers.onInterrupted?.(message);
+  } finally {
+    if (recording) void teardown();
+  }
 }
 
 export function isRecording(): boolean {
@@ -457,6 +481,13 @@ export interface CapturedAudio {
  * back an empty `Float32Array` at a *guessed* 48 kHz, which the caller then
  * transcribed into a confident "no notes found" — a made-up answer about audio
  * that never existed. `null` says what actually happened.
+ *
+ * A take that *did* start but captured no blocks at all comes back `null` for
+ * the same reason. That is the shape of the WebKit failure this module's header
+ * warns about — a graph that is wired up correctly and simply never pulls — and
+ * an empty buffer would launder it into "no notes found", plus a 44-byte WAV if
+ * the user then tapped Save. There is nothing to analyse and nothing to save,
+ * so there is nothing to hand back.
  */
 export function stopRecording(): CapturedAudio | null {
   const wasRecording = recording;
@@ -481,9 +512,21 @@ export function stopRecording(): CapturedAudio | null {
   blocks = [];
 
   void teardown();
-  // `sampleRate` is null exactly when there was no context to read it from, so
-  // the two conditions cannot disagree; both are checked so the type narrows.
-  if (!wasRecording || sampleRate === null) return null;
+  /*
+   * Three separate questions, and they really can disagree — the tempting
+   * simplification here reintroduces a bug that was already fixed once.
+   *
+   * `wasRecording` is false and `sampleRate` is *set* on the Stop-during-the-
+   * permission-prompt path: `startRecording` publishes `audioCtx` in its first
+   * few lines, before the first `await`, because iOS only unlocks a context
+   * created inside the gesture. So by the time Stop is tapped there is a
+   * context to read a rate off and no take behind it. Collapsing the two
+   * conditions would hand that case back an empty buffer at a real-looking
+   * sample rate, which is exactly what the docblock above says must not happen.
+   *
+   * `total === 0` is the third: a take that ran but was never fed a block.
+   */
+  if (!wasRecording || sampleRate === null || total === 0) return null;
   return { samples, sampleRate };
 }
 

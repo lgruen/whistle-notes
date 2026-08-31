@@ -265,13 +265,21 @@ describe("starting a take", () => {
   it("clears the previous take before it publishes anything (the 60 s brick)", async () => {
     const capture = await loadCapture();
     const limits: number[] = [];
-    capture.setCaptureHandlers({ onLimitReached: () => limits.push(1), onInterrupted: () => {} });
+    let first: Float32Array | null = null;
+    // Exactly what main.ts does: the handler finishes the take.
+    capture.setCaptureHandlers({
+      onLimitReached: () => {
+        limits.push(1);
+        first = capture.stopRecording()?.samples ?? null;
+      },
+      onInterrupted: () => {},
+    });
 
     // A take that runs into the cap.
     await capture.startRecording();
     feed(CAP_SEC);
-    expect(capture.getLiveStatus().elapsedSec).toBe(CAP_SEC);
-    expect(capture.stopRecording()?.samples.length).toBe(CAP_SEC * SAMPLE_RATE);
+    expect(first).not.toBeNull();
+    expect(first!.length).toBe(CAP_SEC * SAMPLE_RATE);
 
     // Now tap Record again. The animation loop starts as soon as the tap
     // handler returns and reads this *while the permission prompt is still up*.
@@ -383,27 +391,80 @@ describe("the 60 s cap", () => {
   it("is enforced in the audio callback, not the animation loop", async () => {
     const capture = await loadCapture();
     let limitCalls = 0;
-    capture.setCaptureHandlers({ onLimitReached: () => limitCalls++, onInterrupted: () => {} });
+    let captured: Float32Array | null = null;
+    capture.setCaptureHandlers({
+      onLimitReached: () => {
+        limitCalls++;
+        captured = capture.stopRecording()?.samples ?? null;
+      },
+      onInterrupted: () => {},
+    });
 
     // A hidden tab gets no animation frames at all — but it keeps getting
     // audio. There is deliberately no rAF anywhere in this test.
     vi.stubGlobal("document", { addEventListener: () => {}, visibilityState: "hidden" });
     await capture.startRecording();
 
+    // Three minutes in one uninterrupted run of audio callbacks.
+    feed(3 * CAP_SEC);
+
+    expect(limitCalls).toBe(1);
+    expect(captured).not.toBeNull();
+    expect(captured!.length).toBe(CAP_SEC * SAMPLE_RATE);
+
+    // Before the fix the extra two minutes kept appending samples, kept running
+    // a full FFT per hop on audio nobody would ever hear, and grew the frame
+    // buffer without bound.
+    const frames = capture.getLiveFrames();
+    expect(frames.length).toBeGreaterThan(100);
+    expect(frames[frames.length - 1].tSec).toBeLessThanOrEqual(CAP_SEC);
+    expect(capture.isRecording()).toBe(false);
+    expect(openTracks.size).toBe(0);
+  });
+
+  it("closes the take itself when the handler ignores the signal", async () => {
+    const capture = await loadCapture();
+    let limitCalls = 0;
+    // `main.ts` returns early from this handler if the app's phase disagrees
+    // with the capture module's. The module cannot assume the handler acts:
+    // the signal is one-shot, so a dropped one used to leave the microphone
+    // open, the recording indicator lit and `recording` true, with no tap in
+    // the UI that reaches a `stopRecording()`.
+    capture.setCaptureHandlers({ onLimitReached: () => limitCalls++, onInterrupted: () => {} });
+
+    await capture.startRecording();
     feed(CAP_SEC);
-    const framesAtCap = capture.getLiveFrames().length;
-    expect(framesAtCap).toBeGreaterThan(100);
-    expect(limitCalls).toBe(1);
+    await settle();
 
-    // Two more minutes arrive. Before the fix this kept appending samples,
-    // kept running a full FFT per hop on audio nobody would ever hear, and
-    // grew the frame buffer without bound.
-    feed(2 * CAP_SEC);
-    expect(capture.getLiveFrames()).toHaveLength(framesAtCap);
-    expect(capture.getLiveStatus().elapsedSec).toBe(CAP_SEC);
     expect(limitCalls).toBe(1);
+    expect(capture.isRecording()).toBe(false);
+    expect(openTracks.size).toBe(0);
+    expect(FakeAudioContext.instances.filter((ctx) => ctx.state !== "closed")).toHaveLength(0);
 
-    expect(capture.stopRecording()?.samples.length).toBe(CAP_SEC * SAMPLE_RATE);
+    // ...and the module is still usable, which is the part that was missing.
+    await capture.startRecording();
+    feed(1);
+    expect(capture.stopRecording()?.samples.length).toBe(SAMPLE_RATE);
+  });
+
+  it("releases the microphone before the handler runs, not after", async () => {
+    const capture = await loadCapture();
+    let openWhenCalled = -1;
+    capture.setCaptureHandlers({
+      onLimitReached: () => {
+        openWhenCalled = openTracks.size;
+      },
+      onInterrupted: () => {},
+    });
+
+    await capture.startRecording();
+    expect(openTracks.size).toBe(1);
+    feed(CAP_SEC);
+
+    // The handler decides what to *show*; whether the hardware is freed is not
+    // its call. At the cap no further audio is kept anyway, so there is nothing
+    // to wait for.
+    expect(openWhenCalled).toBe(0);
   });
 
   it("can stop the take from inside the audio callback", async () => {
@@ -431,9 +492,15 @@ describe("an interrupted audio session", () => {
   it("ends the take when the context stays suspended and the mic is gone", async () => {
     const capture = await loadCapture();
     const interruptions: string[] = [];
+    let rescued: Float32Array | null = null;
     capture.setCaptureHandlers({
       onLimitReached: () => {},
-      onInterrupted: (message) => interruptions.push(message),
+      // As in main.ts: an interruption still finishes the take, on whatever was
+      // captured before it.
+      onInterrupted: (message) => {
+        interruptions.push(message);
+        rescued = capture.stopRecording()?.samples ?? null;
+      },
     });
 
     await capture.startRecording();
@@ -450,7 +517,8 @@ describe("an interrupted audio session", () => {
     // UI stuck on "recording" until the user gives up and reloads.
     expect(interruptions).toHaveLength(1);
     expect(interruptions[0]).toMatch(/interrupted/i);
-    expect(capture.stopRecording()?.samples.length).toBe(SAMPLE_RATE);
+    expect(rescued).not.toBeNull();
+    expect(rescued!.length).toBe(SAMPLE_RATE);
   });
 
   it("says nothing when the context comes back", async () => {
@@ -536,6 +604,18 @@ describe("stopping when there is no take", () => {
     // Idempotent by phase in the caller, and now honest here too: a second
     // stop has no take to report.
     expect(capture.stopRecording()).toBeNull();
+  });
+
+  it("returns null for a take that started but was never fed a block", async () => {
+    const capture = await loadCapture();
+    await capture.startRecording();
+    // The graph is wired up and simply never pulls — the shape of the WebKit
+    // bug this module's header warns about. An empty buffer at a real sample
+    // rate would launder that into a confident "no notes found", plus a
+    // 44-byte WAV if the user then tapped Save.
+    expect(capture.isRecording()).toBe(true);
+    expect(capture.stopRecording()).toBeNull();
+    expect(openTracks.size).toBe(0);
   });
 });
 
