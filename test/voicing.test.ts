@@ -1,21 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG, PitchTracker, transcribe, type Note } from "../src/dsp/index.js";
+import { DEFAULT_CONFIG, PitchTracker, mergeConfig, transcribe, type Note } from "../src/dsp/index.js";
 import { prepare } from "../src/dsp/segment.js";
 import { addNoise, sequence, type SynthSignal } from "./fixtures/synth.js";
 
 /**
- * Voicing: the adaptive noise floor, and the two ways it used to go wrong.
+ * Voicing: the adaptive noise floor, and the four ways it has gone wrong.
  *
- * Both failures share a mechanism. The floor is a low percentile of "frames
- * that are not a whistle", and *any* frame that fails the tone tests used to
- * qualify — however loud. A cough, a door or the microphone's own warm-up
- * therefore counted as a measurement of the room, and once one of them was in
- * the sample set the floor rose to its level and stayed there for as long as
- * the trailing window remembered it. What that looks like from outside is
- * notes going missing *after* an event rather than during it, or a take that
- * starts whistling immediately transcribing to nothing at all — symptoms with
- * no visible connection to their cause, which is why they need tests that look
- * at the floor itself and not only at the notes.
+ * The floor is a percentile of "frames that are not a whistle", and the whole
+ * difficulty is in the words *which frames*. Admit too much and a cough, a
+ * door or the microphone's own warm-up counts as a measurement of the room, so
+ * the floor rises to its level and stays there for as long as the window
+ * remembers it. Admit too little and a room that genuinely changes level can
+ * never be believed again, so the floor stays where the room used to be. And
+ * one file can contain both a room and no room at all: digital silence is not
+ * a level, but a percentile taken over it is happy to report −240 dBFS as one.
+ *
+ * From outside, every one of those looks the same — notes missing *after* an
+ * event rather than during it, a take that starts whistling immediately
+ * transcribing to nothing, a level gate that silently stopped existing. None of
+ * them has a visible connection to its cause, which is why these tests look at
+ * the floor itself and not only at the notes.
  *
  * These cases are all synthetic and seeded: a flaky voicing test is
  * indistinguishable from a real regression.
@@ -58,6 +62,17 @@ function toneWithBurst(burstAtSec: number | null): Float32Array {
     }
   }
   return samples;
+}
+
+/** Pink room tone that steps from one level to another partway through. */
+function roomStep(quietDb: number, loudDb: number, stepSec: number, totalSec: number): Float32Array {
+  const blank = (): SynthSignal => sequence([], { leadInSec: totalSec });
+  const quiet = addNoise(blank(), { type: "pink", levelDb: quietDb, seed: 11 }).samples;
+  const loud = addNoise(blank(), { type: "pink", levelDb: loudDb, seed: 12 }).samples;
+  const out = new Float32Array(quiet.length);
+  const step = Math.round(stepSec * SR);
+  for (let i = 0; i < out.length; i++) out[i] = i < step ? quiet[i] : loud[i];
+  return out;
 }
 
 describe("adaptive noise floor", () => {
@@ -134,8 +149,81 @@ describe("adaptive noise floor", () => {
         ).samples,
       ],
     ] as const) {
-      expect(maxFloorJump(samples), name).toBeLessThan(3);
+      expect(maxFloorJump(samples), name).toBeLessThan(1);
     }
+  });
+
+  it("follows a room that changes level, in both directions", () => {
+    // One recording can contain two rooms: a window opens, a fan starts, the
+    // phone is put down on a different table. An earlier version compared every
+    // frame against a single number for the whole take, so a room that stepped
+    // by more than `backgroundAboveFloorDb` could never be believed again —
+    // measured on this exact signal, *zero* of the 730 frames after the step
+    // were admitted as background, the floor stayed 19 dB low for the rest of
+    // the take, and the onset gate under-gated by the same amount.
+    for (const [quietDb, loudDb] of [
+      [-60, -42],
+      [-42, -60],
+    ] as const) {
+      const label = `${quietDb} → ${loudDb} dB at t=8s`;
+      const samples = roomStep(quietDb, loudDb, 8, 16);
+      const frames = new PitchTracker(SR, DEFAULT_CONFIG).push(samples);
+      const { voicing } = prepare(frames, DEFAULT_CONFIG, SR);
+
+      // Two seconds after the step and thereafter, the floor is the new room.
+      // Compared against the frames' own measured level rather than against the
+      // level the noise was *asked* for, so this tests the estimator and not
+      // the fixture's calibration.
+      for (let i = 0; i < frames.length; i++) {
+        if (frames[i].tSec < 10 || frames[i].tSec > 15.5) continue;
+        expect(
+          Math.abs(voicing.floorDb[i] - frames[i].bandRmsDb),
+          `${label}, frame at ${frames[i].tSec.toFixed(2)}s`,
+        ).toBeLessThan(3.5);
+      }
+      // And it is genuinely tracking, not merely landing in the right place:
+      // the two halves must differ by about the step.
+      const at = (t: number): number => voicing.floorDb[frames.findIndex((f) => f.tSec >= t)];
+      expect(Math.abs(at(6) - at(14)) - Math.abs(quietDb - loudDb), label).toBeGreaterThan(-3);
+    }
+  });
+
+  it("a muted stretch cannot switch the level gate off", () => {
+    // Any imported file can have digital zeroes in it — an editor's trimmed
+    // tail, a moment where the phone dropped the microphone. Those frames are
+    // −240 dBFS, and a fifth of a take at that level used to drag the whole
+    // file's floor there. `floor + 12` is then −228, which every frame in the
+    // file clears: the level gate stopped existing, silently, for the whole
+    // take. There are two independent defences now and this asserts both.
+    //
+    // The signal: room tone and one whistled E6, then everything from t=4s
+    // muted, with a −75 dBFS ghost of a G6 sitting in the muted stretch. Not a
+    // realistic recording — it is the two failure modes side by side.
+    const room = addNoise(sequence([{ midi: 88, durSec: 0.8, amp: 0.25 }], { leadInSec: 1.0, tailSec: 8.0 }), {
+      type: "pink",
+      levelDb: -50,
+      seed: 5,
+    });
+    const samples = new Float32Array(room.samples);
+    for (let i = Math.round(4.0 * SR); i < samples.length; i++) samples[i] = 0;
+    const ghost = sequence([{ midi: 91, durSec: 1.0, amp: 0.00025 }], {}).samples;
+    for (let i = 0; i < ghost.length; i++) samples[Math.round(6.0 * SR) + i] += ghost[i];
+
+    // One: the floor is *local*, so the muted tail says nothing about the room
+    // three seconds earlier. It used to say −240 there.
+    const { floorDb, tSec } = floorTrace(samples);
+    for (let i = 0; i < floorDb.length; i++) {
+      if (tSec[i] > 3.0) break;
+      expect(floorDb[i], `frame at ${tSec[i].toFixed(2)}s`).toBeGreaterThan(-70);
+      expect(floorDb[i], `frame at ${tSec[i].toFixed(2)}s`).toBeLessThan(-45);
+    }
+
+    // Two: inside the muted stretch the floor genuinely *is* −240, because that
+    // genuinely is the level there — and `absoluteFloorDb` is what stops that
+    // from being a licence. Switch it off and the ghost becomes a note.
+    expect(NAMES(transcribe(samples, SR).notes)).toEqual(["E6"]);
+    const ungated = mergeConfig(DEFAULT_CONFIG, { voicing: { absoluteFloorDb: -Infinity } });
+    expect(NAMES(transcribe(samples, SR, ungated).notes)).toEqual(["E6", "G6"]);
   });
 });
 

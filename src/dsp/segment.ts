@@ -28,11 +28,13 @@ import type { DspConfig, Note, NoteFlags, PitchFrame } from "./types.js";
  *  a noise floor. Fewer than this and one unlucky frame sets the threshold. */
 const MIN_FLOOR_SAMPLES = 8;
 
-/** How many times the global background estimate is refined by discarding the
- *  samples that turned out to be too loud to be background. Two passes is
- *  enough to walk down from a sample set containing a burst to the true floor;
- *  more never moved the answer on any signal tried. */
-const FLOOR_REFINE_PASSES = 3;
+/** Percentile of the nearby shapeless frames taken as the provisional level of
+ *  the room, against which a frame is judged too loud to be evidence about it.
+ *  The *median*, deliberately: it is the statistic that flips exactly when the
+ *  majority of the window does, which is what makes "a loud event" and "a
+ *  louder room" separable by their duration alone. A low percentile would sit
+ *  in the quiet tail and could not be moved by a room change at all. */
+const BACKGROUND_SEED_PERCENTILE = 50;
 
 /** What one pass of segmentation concluded. */
 export interface SegmentationResult {
@@ -102,44 +104,57 @@ export interface Voicing {
 }
 
 /**
- * Estimate the level the room sits at when nobody is whistling.
+ * Percentile `p` of `level` over the frames in `sample` nearest to each frame.
  *
- * The subtle part is deciding *which* frames are evidence. "Not tone-shaped"
- * is necessary but nowhere near sufficient: a cough, a door, a chair scrape and
- * a hand over the microphone all fail the shape tests at 40 dB above the room,
- * and letting them into the sample set drags the floor up to their level for as
- * long as they stay inside the trailing window — which blanks the transcription
- * *after* the event, seconds later, where nobody would think to look for the
- * cause. The microphone warm-up is the same bug wearing a different hat: a take
- * that starts whistling at t=0 has its opening frames excluded from voicing,
- * and if those frames then count as "background" the floor is set to the level
- * of the whistle itself and the whole take disappears.
+ * `sample` is a sorted list of frame indices — whichever frames the caller
+ * believes are evidence. The window is centred and `windowFrames` wide, and
+ * where it holds fewer than `minSamples` of them it reaches outwards for the
+ * nearest evidence in either direction rather than swapping in a different
+ * estimator. The sample set then changes by at most a frame or two from one
+ * position to the next, so the result moves continuously. That matters more
+ * than it sounds: a floor that jumps tens of dB between one frame and the next
+ * takes `isTrueSilence` with it, and a spurious "silence" is what turns one
+ * held note into a stutter of re-articulated ones.
  *
- * So background evidence has to be *quiet as well as shapeless*, which is
- * circular — quiet relative to what? — and the way out of the circle is to
- * iterate. Start from the naive estimate, throw away everything more than
- * `backgroundAboveFloorDb` above it, re-estimate, repeat. Loud events are a
- * minority of any real recording, so the first estimate is already in the right
- * basin and the refinement only sharpens it. When it converges on nothing
- * (a file that is wall-to-wall whistling), the honest answer is that there is
- * no evidence for a floor at all, and the level gate stands down rather than
- * inventing one.
+ * `-Infinity` everywhere when there is not enough evidence to have an opinion.
  */
-function backgroundFloor(level: number[], tonal: boolean[], cfg: DspConfig): number {
-  const v = cfg.voicing;
-  const shapeless: number[] = [];
-  for (let i = 0; i < level.length; i++) if (!tonal[i]) shapeless.push(level[i]);
-  if (shapeless.length < MIN_FLOOR_SAMPLES) return -Infinity;
+function nearestPercentile(
+  level: number[],
+  sample: number[],
+  frameCount: number,
+  windowFrames: number,
+  minSamples: number,
+  p: number,
+): number[] {
+  const out = new Array<number>(frameCount).fill(-Infinity);
+  if (sample.length < MIN_FLOOR_SAMPLES) return out;
 
-  let floor = percentile(shapeless, v.noiseFloorPercentile);
-  for (let pass = 0; pass < FLOOR_REFINE_PASSES; pass++) {
-    const kept = shapeless.filter((l) => l <= floor + v.backgroundAboveFloorDb);
-    if (kept.length < MIN_FLOOR_SAMPLES) break;
-    const next = percentile(kept, v.noiseFloorPercentile);
-    if (Math.abs(next - floor) < 0.01) break;
-    floor = next;
+  const half = Math.max(1, windowFrames >> 1);
+  const values: number[] = [];
+  let lo = 0;
+  let hi = 0;
+  for (let i = 0; i < frameCount; i++) {
+    // [i - half, i + half] as a half-open range of positions into `sample`.
+    // Both pointers only ever advance, so the whole loop is linear.
+    while (lo < sample.length && sample[lo] < i - half) lo++;
+    while (hi < sample.length && sample[hi] <= i + half) hi++;
+
+    let left = lo;
+    let right = hi;
+    let count = right - left;
+    while (count < minSamples && (left > 0 || right < sample.length)) {
+      const distanceLeft = left > 0 ? i - sample[left - 1] : Infinity;
+      const distanceRight = right < sample.length ? sample[right] - i : Infinity;
+      if (distanceLeft <= distanceRight) left--;
+      else right++;
+      count++;
+    }
+
+    values.length = 0;
+    for (let q = left; q < right; q++) values.push(level[sample[q]]);
+    out[i] = percentile(values, p);
   }
-  return floor;
+  return out;
 }
 
 /**
@@ -159,13 +174,39 @@ function backgroundFloor(level: number[], tonal: boolean[], cfg: DspConfig): num
  * being chopped into a stutter of fragments, while still requiring conviction
  * before a new note is allowed to begin.
  *
- * The floor itself is a percentile of the *nearest* background frames rather
- * than of a fixed trailing window. Those two agree wherever the recording has
- * background to spare, and where it does not the window simply reaches further
- * out instead of falling off a cliff onto a global estimate. That matters more
- * than it sounds: a floor that jumps tens of dB between one frame and the next
- * takes `isTrueSilence` with it, and a spurious "silence" is what turns one
- * held note into a stutter of re-articulated ones.
+ * Deciding *which* frames are evidence about the room is the subtle part.
+ * "Not tone-shaped" is necessary and nowhere near sufficient: a cough, a door,
+ * a chair scrape and a hand over the microphone all fail the shape tests at
+ * 40 dB above the room, and letting one into the sample set drags the floor up
+ * to its level for as long as the window remembers it — which blanks the
+ * transcription *after* the event, seconds later, where nobody would think to
+ * look for the cause. The microphone warm-up is the same bug wearing a
+ * different hat: a take that starts whistling at t=0 has its opening frames
+ * excluded from voicing, and if those then count as "background" the floor is
+ * set to the level of the whistle and the whole take disappears.
+ *
+ * So background evidence has to be *quiet as well as shapeless*, which is
+ * circular — quiet relative to what? — and the way out of the circle is a
+ * **local** answer. Every frame gets a seed: the median level of the shapeless
+ * frames around it, over the same span the floor itself is measured on. A frame
+ * more than `backgroundAboveFloorDb` above its own seed is an event and not
+ * evidence.
+ *
+ * Making that comparison local rather than global is what lets the floor follow
+ * a room that *changes*. An earlier version compared every frame against one
+ * number for the whole take, which meant no recording could contain two rooms:
+ * step the noise up by 18 dB at t=8s — a window opening, a fan starting, a
+ * phone put down on a different table — and not one frame after the step was
+ * ever believed as background again. The floor stayed 19 dB low for the rest of
+ * the take, the onset gate under-gated by the same amount, and `isTrueSilence`
+ * stopped being able to fire at all. Against a local median the same step is
+ * tracked in about a second and a half.
+ *
+ * A median, and a span of seconds, is also exactly what separates the two cases
+ * the paragraphs above want separated, and it says so honestly: an event
+ * shorter than half the window cannot move the median and is rejected; a shift
+ * that outlasts it becomes the new room. "Loud" and "sustained" are the only
+ * two facts available, and this uses both.
  */
 function computeVoicing(frames: PitchFrame[], cfg: DspConfig, framePeriod: number): Voicing {
   const v = cfg.voicing;
@@ -187,50 +228,41 @@ function computeVoicing(frames: PitchFrame[], cfg: DspConfig, framePeriod: numbe
   // here and not to `tonal` above.
   const candidate = tonal.map((t, i) => t && frames[i].tSec >= v.warmupSec);
 
-  const globalFloor = backgroundFloor(level, tonal, cfg);
+  const windowFrames = Math.max(1, Math.round(v.noiseFloorWindowSec / framePeriod));
+  const shapeless: number[] = [];
+  for (let i = 0; i < n; i++) if (!tonal[i]) shapeless.push(i);
+
+  // The seed insists on a *quota* of evidence, not just a span of time, and
+  // that is what keeps it honest where the room is barely observable. Under a
+  // note that never stops, the only shapeless frames for seconds around may be
+  // the very burst being judged — and a median of the burst says the burst is
+  // the room. Demanding a window's worth of samples makes the estimate reach
+  // back to the last time the room was actually audible instead.
+  const seed = nearestPercentile(
+    level,
+    shapeless,
+    n,
+    windowFrames,
+    windowFrames,
+    BACKGROUND_SEED_PERCENTILE,
+  );
   const background = new Array<boolean>(n).fill(false);
   const backgroundIndices: number[] = [];
   for (let i = 0; i < n; i++) {
-    if (!tonal[i] && level[i] <= globalFloor + v.backgroundAboveFloorDb) {
+    if (!tonal[i] && level[i] <= seed[i] + v.backgroundAboveFloorDb) {
       background[i] = true;
       backgroundIndices.push(i);
     }
   }
 
-  const floorDb = new Array<number>(n).fill(-Infinity);
-  if (backgroundIndices.length >= MIN_FLOOR_SAMPLES) {
-    const windowFrames = Math.max(1, Math.round(v.noiseFloorWindowSec / framePeriod));
-    const values: number[] = [];
-    let lo = 0;
-    let hi = 0;
-    for (let i = 0; i < n; i++) {
-      // Trailing window [i - windowFrames, i), as a half-open range of
-      // positions into `backgroundIndices`. Both pointers only ever advance,
-      // so the whole loop is linear.
-      while (lo < backgroundIndices.length && backgroundIndices[lo] < i - windowFrames) lo++;
-      while (hi < backgroundIndices.length && backgroundIndices[hi] < i) hi++;
-
-      // Starved of trailing evidence, reach outwards for the nearest frames in
-      // either direction rather than swapping in a different estimator. The
-      // sample set then changes by at most one frame from here to the next, so
-      // the floor moves continuously.
-      let left = lo;
-      let right = hi;
-      let count = right - left;
-      while (count < MIN_FLOOR_SAMPLES && (left > 0 || right < backgroundIndices.length)) {
-        const distanceLeft = left > 0 ? i - backgroundIndices[left - 1] : Infinity;
-        const distanceRight =
-          right < backgroundIndices.length ? backgroundIndices[right] - i : Infinity;
-        if (distanceLeft <= distanceRight) left--;
-        else right++;
-        count++;
-      }
-
-      values.length = 0;
-      for (let p = left; p < right; p++) values.push(level[backgroundIndices[p]]);
-      floorDb[i] = percentile(values, v.noiseFloorPercentile);
-    }
-  }
+  const floorDb = nearestPercentile(
+    level,
+    backgroundIndices,
+    n,
+    windowFrames,
+    MIN_FLOOR_SAMPLES,
+    v.noiseFloorPercentile,
+  );
 
   const voiced = new Array<boolean>(n).fill(false);
   let holding = false;
@@ -240,7 +272,7 @@ function computeVoicing(frames: PitchFrame[], cfg: DspConfig, framePeriod: numbe
       continue;
     }
     const required = holding ? v.sustainAboveFloorDb : v.onsetAboveFloorDb;
-    if (frames[i].bandRmsDb >= floorDb[i] + required) {
+    if (frames[i].bandRmsDb >= levelGate(floorDb[i], required, cfg)) {
       voiced[i] = true;
       holding = true;
     } else {
@@ -249,6 +281,28 @@ function computeVoicing(frames: PitchFrame[], cfg: DspConfig, framePeriod: numbe
   }
 
   return { tonal, candidate, background, floorDb, voiced };
+}
+
+/**
+ * The level a frame has to clear here, in dBFS.
+ *
+ * Two thresholds, and the *higher* wins. The adaptive one is the interesting
+ * one and does the work on any ordinary recording. The absolute one is a
+ * backstop against the adaptive one being nonsense, and it has to exist because
+ * "nonsense" is not hypothetical: an imported file with a muted stretch in it —
+ * an editor's trimmed tail, a phone that dropped the mic for a second — puts
+ * digital zeroes in the sample set, and a fifth of a take at −240 dBFS drags
+ * the percentile there too. `floor + 12` is then −228, every frame in the file
+ * clears it, and the level gate silently stops existing for the whole take. It
+ * also quietly made most of the synthetic segmentation tests vacuous with
+ * respect to that gate, because the gaps `sequence()` leaves between notes are
+ * digital silence.
+ *
+ * The same maximum is what `isTrueSilence` compares against, so the two agree
+ * on where the background is by construction.
+ */
+function levelGate(floorDb: number, aboveFloorDb: number, cfg: DspConfig): number {
+  return Math.max(cfg.voicing.absoluteFloorDb, floorDb + aboveFloorDb);
 }
 
 /** Everything stages A–D worked out about a frame track. */
@@ -1049,7 +1103,9 @@ function isTrueSilence(
   cfg: DspConfig,
 ): boolean {
   for (let i = from; i <= to; i++) {
-    if (frames[i].bandRmsDb < voicing.floorDb[i] + cfg.voicing.sustainAboveFloorDb) return true;
+    if (frames[i].bandRmsDb < levelGate(voicing.floorDb[i], cfg.voicing.sustainAboveFloorDb, cfg)) {
+      return true;
+    }
   }
   return false;
 }

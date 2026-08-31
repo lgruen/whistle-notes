@@ -158,9 +158,21 @@ export interface VoicingConfig {
    *  stays inside the trailing window — silencing the transcription seconds
    *  *after* the noise, where the cause is invisible. */
   backgroundAboveFloorDb: number;
-  /** Trailing span used to estimate that floor, in seconds. Adaptive because
-   *  a quiet room and a café differ by more than any fixed threshold. */
+  /** Span the floor and its seed are measured over, in seconds, centred on the
+   *  frame being judged. Adaptive because a quiet room and a café differ by
+   *  more than any fixed threshold — and *local*, because one recording can
+   *  contain both. It doubles as the line between a loud event and a louder
+   *  room: a shapeless stretch shorter than half of this cannot move the seed
+   *  and is treated as an event; one that outlasts it becomes the new room. */
   noiseFloorWindowSec: number;
+  /** Hard minimum on the level gate, in dBFS, whatever the adaptive floor
+   *  says. Purely a backstop against an adaptive floor that has gone nonsense:
+   *  a file with a muted stretch in it puts digital zeroes into the sample set,
+   *  and a floor of −240 dBFS would otherwise disable the level gate outright
+   *  for the whole take. Set below anything a real recording contains as
+   *  signal, so that on ordinary material the adaptive floor is always the one
+   *  that decides. */
+  absoluteFloorDb: number;
   /** A note may *start* only this far above the noise floor, in dB. */
   onsetAboveFloorDb: number;
   /** ...but may *continue* at only this much above it. The asymmetry is

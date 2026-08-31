@@ -48,12 +48,24 @@ export const DEFAULT_CONFIG: DspConfig = {
     // quiet part of the distribution, high enough not to chase a single
     // anomalously silent frame.
     noiseFloorPercentile: 20,
+    // Three seconds, centred. Long enough that a cough cannot move the median
+    // of it, short enough that a room which genuinely changes level is tracked
+    // in about a second and a half. Those are the same property read two ways,
+    // and this number is where the line between them sits.
     noiseFloorWindowSec: 3,
-    // A shapeless frame more than 12 dB over the floor is an *event*, not the
-    // room: the same margin a note needs to start is the margin past which
-    // "background" stops being a plausible description. Wide enough that the
-    // ordinary few-dB breathing of room tone is all still evidence.
+    // A shapeless frame more than 12 dB over the local room level is an
+    // *event*, not the room: the same margin a note needs to start is the
+    // margin past which "background" stops being a plausible description. Wide
+    // enough that the ordinary few-dB breathing of room tone is all still
+    // evidence.
     backgroundAboveFloorDb: 12,
+    // −70 dBFS. A backstop, not a gate — see `absoluteFloorDb`. Chosen from
+    // the reference recording rather than from taste: its quietest in-note
+    // frame measures −63.8 dBFS in band (a note's dying fall) and its room
+    // sits around −67, so −70 is below everything that recording contains as
+    // signal and the adaptive floor decides every frame of it. What it does
+    // catch is digital silence at −240, which is not a room at all.
+    absoluteFloorDb: -70,
     // Asymmetric by design — see VoicingConfig. Starting a note demands
     // 12 dB over the floor; holding one needs only 6.
     onsetAboveFloorDb: 12,

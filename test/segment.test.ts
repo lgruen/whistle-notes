@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_CONFIG,
+  PitchTracker,
   durationClasses,
   hasRestBefore,
   mergeConfig,
@@ -9,6 +10,7 @@ import {
   type DspConfig,
   type Note,
 } from "../src/dsp/index.js";
+import { prepare } from "../src/dsp/segment.js";
 import { addNoise, sequence } from "./fixtures/synth.js";
 
 /**
@@ -236,6 +238,58 @@ describe("segmentation", () => {
     const notes = run(signal, { minNoteMs: 250 });
     expect(NOTE_NAMES(notes)).toEqual(["E6"]);
     expect(notes[0].durationSec).toBeGreaterThan(0.7);
+  });
+
+  // Every other case in this file is whistled into *digital silence* — the gaps
+  // `sequence()` leaves are literal zeroes — and that made them all vacuous with
+  // respect to the level gate, in two compounding ways: a fifth of the take at
+  // −240 dBFS used to drag the noise floor there, and `floor + 12` is a
+  // threshold nothing can fail. These two put a room in the recording, so the
+  // gate has a real floor to work against and a real decision to get wrong.
+  describe("with room noise, so the level gate is actually a gate", () => {
+    const MELODY = [84, 86, 88, 89, 91, 89, 88, 84];
+
+    /** The melody at a chosen amplitude over −45 dBFS of pink room tone. */
+    const inRoom = (amp: number) =>
+      addNoise(
+        sequence(
+          MELODY.map((midi) => ({ midi, durSec: 0.35, gapSec: 0.12, amp })),
+          { leadInSec: 0.4, tailSec: 0.4 },
+        ),
+        { type: "pink", levelDb: -45, seed: 2 },
+      );
+
+    it("hears the melody, with the adaptive floor doing the deciding", () => {
+      const signal = inRoom(0.05);
+      expect(MIDIS(run(signal))).toEqual(MELODY);
+
+      // The point of the test: the floor is a real measurement of this room,
+      // not the −240 dBFS of an empty buffer and not the absolute backstop
+      // either. If it were, the assertion above would be proving nothing.
+      const { voicing } = prepare(
+        new PitchTracker(48000, DEFAULT_CONFIG).push(signal.samples),
+        DEFAULT_CONFIG,
+        48000,
+      );
+      for (const floor of voicing.floorDb) {
+        expect(floor).toBeGreaterThan(DEFAULT_CONFIG.voicing.absoluteFloorDb + 10);
+        expect(floor).toBeLessThan(-45);
+      }
+    });
+
+    it("stops hearing it exactly where the onset margin says it should", () => {
+      // Loud enough to clear the floor by a shade over `onsetAboveFloorDb`, and
+      // then not: measured margins are 12.1 dB and 8.5 dB against a floor of
+      // −51 dB. Nothing else about the two signals differs, so the gate is the
+      // only thing that can be making the difference — and lowering the margin
+      // brings the quieter take straight back.
+      expect(MIDIS(run(inRoom(0.015)))).toEqual(MELODY);
+      expect(run(inRoom(0.01))).toEqual([]);
+
+      const lenient = mergeConfig(DEFAULT_CONFIG, { voicing: { onsetAboveFloorDb: 8 } });
+      const quiet = inRoom(0.01);
+      expect(MIDIS(transcribe(quiet.samples, quiet.sampleRate, lenient).notes)).toEqual(MELODY);
+    });
   });
 
   it("finds no notes in silence or breath", () => {
