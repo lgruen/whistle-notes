@@ -8,16 +8,18 @@ import {
   MAX_RECORD_SEC,
   getLiveFrames,
   getLiveStatus,
+  isRecording,
   processingWarning,
+  setCaptureHandlers,
   startRecording,
   stopRecording,
 } from "./audio/capture.js";
 import { isPlaying, startPlayback, stopPlayback } from "./audio/synth.js";
-import { transposeMidi } from "./notes/format.js";
+import { a4FromOffsetCents, formatCents, transposeMidi } from "./notes/format.js";
 import { createControls } from "./ui/controls.js";
 import { createLiveView } from "./ui/live.js";
 import { highlightNoteList, initNoteList, renderNoteList } from "./ui/notelist.js";
-import { drawPianoRoll, resetRollRange } from "./ui/pianoroll.js";
+import { drawPianoRoll, invalidateRollSize, resetRollRange } from "./ui/pianoroll.js";
 import { highlightStaff, renderStaff } from "./ui/staff.js";
 import {
   applyResult,
@@ -38,6 +40,7 @@ function element<T extends HTMLElement>(id: string): T {
 const canvas = element<HTMLCanvasElement>("roll");
 const noteListElement = element("notelist");
 const staffElement = element("staff");
+const tuningElement = element("tuning");
 
 const live = createLiveView({
   note: element("live-note"),
@@ -81,8 +84,37 @@ const controls = createControls(
 let renderedNotes: readonly Note[] | null = null;
 let renderedTranspose = NaN;
 
+/**
+ * Below this, saying anything would be noise: ±10 cents is inside the wobble of
+ * a good whistle and well inside the rounding margin, so the correction changed
+ * nothing anybody can hear.
+ */
+const TUNING_NOTICE_CENTS = 10;
+
+/**
+ * "Your whistle ran sharp, and here is the A that implies."
+ *
+ * The segmenter measures each take's global tuning bias and takes it out before
+ * rounding — that is what rescues a consistently-40-cents-sharp whistler from
+ * coin-flip note names. Silently correcting someone's pitch and never
+ * mentioning it would be the app knowing something about the user that it
+ * refuses to tell them, so when the correction is big enough to matter it is
+ * reported in the reference every musician already owns: the frequency of A.
+ */
+function renderTuning(state: AppState): void {
+  const cents = state.tuningOffsetCents;
+  const show =
+    state.phase === "result" && state.notes.length > 0 && Math.abs(cents) >= TUNING_NOTICE_CENTS;
+  tuningElement.hidden = !show;
+  tuningElement.textContent = show
+    ? `Whistle ran ${formatCents(cents)} cents (${cents > 0 ? "sharp" : "flat"}) — ` +
+      `snapped to A = ${Math.round(a4FromOffsetCents(cents))} Hz.`
+    : "";
+}
+
 function render(state: AppState): void {
   controls.render(state);
+  renderTuning(state);
 
   if (state.notes !== renderedNotes || state.transpose !== renderedTranspose) {
     renderedNotes = state.notes;
@@ -152,8 +184,11 @@ function loop(): void {
     live: true,
   });
 
-  // The 60 s cap is enforced here rather than in the capture module so that
-  // stopping goes through exactly the same path as tapping Stop.
+  // Backstop only. The cap is enforced authoritatively inside the audio
+  // callback (see `capture.ts`), because this loop does not run at all while
+  // the tab is hidden — and a hidden tab is exactly when a forgotten take would
+  // otherwise keep the microphone open. Both routes call `finishRecording`,
+  // which is idempotent by phase.
   if (status.elapsedSec >= MAX_RECORD_SEC) finishRecording();
 }
 
@@ -206,6 +241,24 @@ function beginRecording(): void {
   );
 }
 
+/*
+ * A take can also end without anybody tapping Stop: the 60 s cap is enforced
+ * inside the audio callback (the animation loop above is a backstop, and it is
+ * not running at all in a hidden tab), and an interrupted audio session or a
+ * revoked microphone ends it too. Both come back here so that every ending goes
+ * through the same stop-and-transcribe as a tap.
+ */
+setCaptureHandlers({
+  onLimitReached: finishRecording,
+  onInterrupted(message) {
+    if (getState().phase !== "recording") return;
+    finishRecording();
+    // Not `message`: `finishRecording` clears that, and `applyResult` sets it
+    // again. The warning line survives both and is where non-fatal news goes.
+    setState({ warning: message });
+  },
+});
+
 function finishRecording(): void {
   if (getState().phase !== "recording") return;
   stopLoop();
@@ -222,7 +275,7 @@ function finishRecording(): void {
     setTimeout(() => {
       try {
         const result = transcribe(samples, sampleRate);
-        applyResult(result.notes, result.frames);
+        applyResult(result.notes, result.frames, result.tuningOffsetCents);
       } catch (error) {
         console.error("[transcribe] failed", error);
         setState({ phase: "error", message: "Something went wrong analysing that take." });
@@ -249,8 +302,10 @@ function beginPlayback(): void {
 window.addEventListener("resize", () => {
   // The staff's viewBox is measured in CSS pixels and the canvas backing store
   // is sized in device pixels, so both need to hear about an orientation
-  // change; the palette cache might also be stale after a theme switch.
+  // change; the palette cache might also be stale after a theme switch, and the
+  // roll's cached element size definitely is.
   invalidatePalette();
+  invalidateRollSize();
   const state = getState();
   renderStaff(state.notes, staffElement, state.transpose, state.playingIndex);
   if (state.phase !== "recording") {
@@ -306,19 +361,56 @@ const stamp = document.getElementById("build-stamp");
 if (stamp) stamp.textContent = `build ${__BUILD__}`;
 
 /*
- * Service-worker staleness defence. `autoUpdate` + `immediate: true` installs
- * and activates a new worker as soon as one is found, but the browser only
- * *looks* on navigation — which an installed PWA resumed from the background
- * may not do for days. Re-checking whenever the app comes to the foreground is
- * what turns "deployed" into "actually running on the phone"; the build stamp
- * in the footer is how you confirm it did.
+ * ── Service-worker updates ────────────────────────────────────────────────
+ *
+ * Two failure modes, pulling in opposite directions.
+ *
+ * *Too stale*: the browser only looks for a new worker on navigation, which an
+ * installed PWA resumed from the background may not do for days. So we register
+ * with `immediate: true` and re-check on every foreground; the build stamp in
+ * the footer is how you confirm it worked.
+ *
+ * *Too eager*: the plugin's `autoUpdate` mode reloads the page the instant a new
+ * worker activates. Deploy while someone is whistling — or while a second tab of
+ * the same app triggers the update — and the take is destroyed mid-recording
+ * with no explanation. So the SW is registered in `prompt` mode (see
+ * `vite.config.ts`), which parks the new worker in `waiting`, and we apply it
+ * ourselves at a moment when a reload costs nothing: not recording, not
+ * analysing, not playing. If that moment is not now, the update simply waits —
+ * for the next phase change or the next time the app is foregrounded.
  */
-registerSW({
+let updatePending = false;
+
+const updateSW = registerSW({
   immediate: true,
+  onNeedRefresh() {
+    updatePending = true;
+    applyPendingUpdate();
+  },
   onRegisteredSW(_swUrl, registration) {
     if (!registration) return;
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") void registration.update();
+      if (document.visibilityState !== "visible") return;
+      void registration.update();
+      applyPendingUpdate();
     });
   },
 });
+
+/** A reload here must not cost the user anything they cannot get back. */
+function safeToReload(): boolean {
+  const { phase, playing } = getState();
+  if (isRecording() || playing || isPlaying()) return false;
+  return phase === "idle" || phase === "result" || phase === "error";
+}
+
+function applyPendingUpdate(): void {
+  if (!updatePending || !safeToReload()) return;
+  updatePending = false;
+  // Tells the waiting worker to take over; the plugin's registration reloads
+  // the page once it is controlling.
+  void updateSW(true);
+}
+
+// Every phase change is a chance for a deferred update to land.
+subscribe(applyPendingUpdate);

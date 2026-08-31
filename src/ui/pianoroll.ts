@@ -49,6 +49,11 @@ const MIN_SPAN_SEC = 4;
 
 const PAD = { left: 26, right: 6, top: 8, bottom: 8 };
 
+/** At most this many drawn points per CSS pixel of width. A minute of audio is
+ *  ~5600 frames across ~350 px; stroking every one of them costs a lot and
+ *  shows nothing a half-pixel step does not. */
+const TRAIL_STEP_PX = 0.5;
+
 /**
  * The vertical extent to draw, in **true** MIDI numbers.
  *
@@ -66,20 +71,33 @@ export function rollMidiRange(
   notes: readonly Note[],
   previous?: MidiRange | null,
 ): MidiRange {
-  let min = Infinity;
-  let max = -Infinity;
+  const extent = { min: Infinity, max: -Infinity };
+  extendExtent(extent, frames, 0);
+  for (const note of notes) {
+    if (note.midi < extent.min) extent.min = note.midi;
+    if (note.midi > extent.max) extent.max = note.midi;
+  }
+  return padExtent(extent, previous);
+}
 
-  for (const frame of frames) {
+/** Widen `extent` by the frames from `from` onwards. Split out from
+ *  {@link rollMidiRange} so the live path can scan only what is new. */
+function extendExtent(extent: MidiRange, frames: readonly PitchFrame[], from: number): void {
+  for (let i = from; i < frames.length; i++) {
+    const frame = frames[i];
     if (frame.hz === null || frame.clarity < TRAIL_MIN_CLARITY) continue;
     const midi = hzToMidiFloat(frame.hz);
     if (!Number.isFinite(midi)) continue;
-    if (midi < min) min = midi;
-    if (midi > max) max = midi;
+    if (midi < extent.min) extent.min = midi;
+    if (midi > extent.max) extent.max = midi;
   }
-  for (const note of notes) {
-    if (note.midi < min) min = note.midi;
-    if (note.midi > max) max = note.midi;
-  }
+}
+
+/** Turn a raw extent into a drawable range: padded, at least an octave, and
+ *  never narrower than `previous`. */
+function padExtent(extent: MidiRange, previous?: MidiRange | null): MidiRange {
+  let min = extent.min;
+  let max = extent.max;
 
   if (min > max) {
     // Nothing to show yet. Centre on C6, where whistling actually lives, so an
@@ -104,12 +122,36 @@ export function rollMidiRange(
   return { min, max };
 }
 
-/** The live range, kept across frames so it can only widen. */
+/*
+ * Live-path caches. The animation loop redraws the whole plot sixty times a
+ * second while the take grows to thousands of frames, so anything that scales
+ * with the take's length has to be incremental: the vertical extent is
+ * accumulated frame by frame instead of rescanned, and the element's size is
+ * remembered instead of being read back out of the layout engine — a
+ * `clientWidth` read inside the loop forces a synchronous layout every frame.
+ */
 let liveRange: MidiRange | null = null;
+let liveExtent: MidiRange = { min: Infinity, max: -Infinity };
+let liveScanned = 0;
+let cachedSize: { width: number; height: number } | null = null;
 
 /** Call when a new take starts, so the axis is not inherited from the last. */
 export function resetRollRange(): void {
   liveRange = null;
+  liveExtent = { min: Infinity, max: -Infinity };
+  liveScanned = 0;
+}
+
+/** Drop the cached element size — call on resize or orientation change. */
+export function invalidateRollSize(): void {
+  cachedSize = null;
+}
+
+/** The canvas's CSS size, measured at most once per resize while live. */
+function rollSize(canvas: HTMLCanvasElement, live: boolean): { width: number; height: number } {
+  if (live && cachedSize && cachedSize.width > 0 && cachedSize.height > 0) return cachedSize;
+  cachedSize = { width: canvas.clientWidth, height: canvas.clientHeight };
+  return cachedSize;
 }
 
 /** Seconds of timeline to draw for these frames. */
@@ -126,8 +168,7 @@ export function drawPianoRoll(canvas: HTMLCanvasElement, view: RollView): void {
   // its backing store has to be sized in device pixels or every line is a
   // blurry two-pixel smear on a phone.
   const dpr = Math.min(window.devicePixelRatio || 1, 3);
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
+  const { width, height } = rollSize(canvas, view.live);
   if (width === 0 || height === 0) return;
   if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
     canvas.width = Math.round(width * dpr);
@@ -139,7 +180,20 @@ export function drawPianoRoll(canvas: HTMLCanvasElement, view: RollView): void {
   const palette = readPalette(canvas);
   let range: MidiRange;
   if (view.live) {
-    liveRange = rollMidiRange(view.frames, view.notes, liveRange);
+    // The frame buffer is appended to and never rewritten, so only the tail is
+    // new. (If it ever got shorter, the take restarted without a reset — start
+    // the scan over rather than trust a stale extent.)
+    if (view.frames.length < liveScanned) resetRollRange();
+    extendExtent(liveExtent, view.frames, liveScanned);
+    liveScanned = view.frames.length;
+    // Notes are empty while live, but folding them into a copy rather than into
+    // the accumulator keeps this correct if that ever changes.
+    const extent = { ...liveExtent };
+    for (const note of view.notes) {
+      if (note.midi < extent.min) extent.min = note.midi;
+      if (note.midi > extent.max) extent.max = note.midi;
+    }
+    liveRange = padExtent(extent, liveRange);
     range = liveRange;
   } else {
     range = rollMidiRange(view.frames, view.notes);
@@ -189,7 +243,11 @@ export function drawPianoRoll(canvas: HTMLCanvasElement, view: RollView): void {
   ctx.lineJoin = "round";
   ctx.beginPath();
   let penDown = false;
-  let lastT = -Infinity;
+  /** Time of the previous voiced frame — the break test compares consecutive
+   *  frames, not consecutive *drawn points*, so decimation cannot invent a
+   *  gap that the audio does not have. */
+  let previousT = -Infinity;
+  let lastPx = -Infinity;
   for (const frame of view.frames) {
     if (frame.hz === null || frame.clarity < TRAIL_MIN_CLARITY) {
       penDown = false;
@@ -200,12 +258,17 @@ export function drawPianoRoll(canvas: HTMLCanvasElement, view: RollView): void {
       penDown = false;
       continue;
     }
+    const continues = penDown && frame.tSec - previousT <= TRAIL_BREAK_SEC;
+    previousT = frame.tSec;
     const px = x(frame.tSec);
+    // Decimation, but only *within* a continuous run: a break has to be drawn
+    // wherever it falls, or a gap in time silently becomes a line across it.
+    if (continues && px - lastPx < TRAIL_STEP_PX) continue;
     const py = y(midi);
-    if (penDown && frame.tSec - lastT <= TRAIL_BREAK_SEC) ctx.lineTo(px, py);
+    if (continues) ctx.lineTo(px, py);
     else ctx.moveTo(px, py);
     penDown = true;
-    lastT = frame.tSec;
+    lastPx = px;
   }
   ctx.stroke();
   ctx.globalAlpha = 1;

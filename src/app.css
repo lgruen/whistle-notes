@@ -71,7 +71,11 @@ button {
 
 .header {
   position: sticky;
-  top: 0;
+  /* Not `0`: a sticky element sticks to the *viewport*, which under
+     viewport-fit=cover starts behind the status bar. The body's safe-area
+     padding moves the header down only until the page scrolls, at which point
+     it would pin itself under the notch. */
+  top: var(--safe-top);
   z-index: 2;
   display: flex;
   align-items: center;
@@ -225,6 +229,15 @@ button {
 
 .message.is-error {
   color: var(--danger);
+}
+
+/* Quieter than .message: this is information about the take, not a status. */
+.tuning {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  text-align: center;
+  opacity: 0.85;
 }
 
 /* ── Piano roll ─────────────────────────────────────────────────────── */

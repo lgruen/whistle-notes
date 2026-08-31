@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { midiToHz, midiToName, type Note, type PitchFrame } from "../src/dsp/index.js";
+import {
+  DEFAULT_CONFIG,
+  durationClasses,
+  hasRestBefore,
+  midiToHz,
+  midiToName,
+  type Note,
+  type PitchFrame,
+} from "../src/dsp/index.js";
 import { playbackSchedule, scheduleDuration } from "../src/audio/synth.js";
 import { formatClock } from "../src/ui/live.js";
-import { durationClass, medianDuration, sequenceText } from "../src/ui/notelist.js";
+import { sequenceText } from "../src/ui/notelist.js";
 import { rollMidiRange, rollSpanSec } from "../src/ui/pianoroll.js";
 
 /**
@@ -48,22 +56,40 @@ function frame(tSec: number, hz: number | null, clarity = 0.9): PitchFrame {
   };
 }
 
-describe("duration classes", () => {
-  it("is relative to the take's own median, not to absolute seconds", () => {
+/**
+ * The chip list used to carry its own copies of these two rules, with a
+ * different long-note ratio and a different boundary on the rest gap than the
+ * segmenter's. Two definitions of "long" in one screen is one too many, so the
+ * UI now consumes `src/dsp`'s — and these tests pin the behaviour the chips
+ * actually get, at the boundaries where a second implementation would show.
+ */
+describe("duration classes come from the segmenter", () => {
+  it("are relative to the take's own median, not to absolute seconds", () => {
     // The same 0.3 s note is "long" in a fast take and "short" in a slow one.
-    expect(durationClass(0.3, 0.15)).toBe("long");
-    expect(durationClass(0.3, 0.8)).toBe("short");
-    expect(durationClass(0.3, 0.3)).toBe("medium");
+    const fast = [note(72, 0, 0.15), note(74, 0.2, 0.15), note(76, 0.4, 0.3)];
+    expect(durationClasses(fast)[2]).toBe("long");
+
+    const slow = [note(72, 0, 0.8), note(74, 1, 0.8), note(76, 2, 0.3)];
+    expect(durationClasses(slow)[2]).toBe("short");
   });
 
-  it("has no opinion when there is no median to compare against", () => {
-    expect(durationClass(0.4, 0)).toBe("medium");
+  it("call 1.6× the median long — the UI's old copy of this said 1.7×", () => {
+    const notes = [note(72, 0, 0.2), note(74, 0.3, 0.2), note(76, 0.6, 0.32)];
+    expect(durationClasses(notes)[2]).toBe("long");
   });
 
-  it("takes the median so one held final note cannot rescale everything", () => {
-    expect(medianDuration([note(72, 0, 0.2), note(74, 0.3, 0.2), note(76, 0.6, 4)])).toBe(0.2);
-    expect(medianDuration([])).toBe(0);
-    expect(medianDuration([note(72, 0, 0.2), note(74, 0.3, 0.4)])).toBeCloseTo(0.3, 12);
+  it("has nothing to say about an empty take", () => {
+    expect(durationClasses([])).toEqual([]);
+  });
+});
+
+describe("rests come from the segmenter", () => {
+  it("uses the configured gap, exclusively", () => {
+    const gap = DEFAULT_CONFIG.segment.restGapMs / 1000;
+    // Exactly at the threshold is *not* a rest — the UI's old copy used `>=`
+    // and disagreed with the notes it was describing at the boundary.
+    expect(hasRestBefore(note(72, 0, 0.2, gap), DEFAULT_CONFIG)).toBe(false);
+    expect(hasRestBefore(note(72, 0, 0.2, gap + 0.01), DEFAULT_CONFIG)).toBe(true);
   });
 });
 

@@ -94,7 +94,7 @@ export function renderStaff(
   }
   element.hidden = false;
 
-  const width = Math.max(260, element.clientWidth || 320);
+  const width = Math.max(260, contentWidth(element) || 320);
   const layout = staffLayout(notes.length, width);
   const positions = notes.map((note) => staffPosition(transposeMidi(note.midi, transpose)));
 
@@ -157,6 +157,25 @@ export function renderStaff(
     `preserveAspectRatio="xMinYMin meet" role="img" aria-label="Transcribed notes on a treble staff">` +
     parts.join("") +
     `</svg>`;
+}
+
+/**
+ * The width the SVG actually gets, in CSS pixels.
+ *
+ * `clientWidth` includes the element's padding, and the container has some, so
+ * measuring with it draws a viewBox a few pixels wider than the box the SVG is
+ * scaled into — every staff comes out uniformly under-scaled with a sliver of
+ * dead space on the right. Small, but it is the kind of error that compounds
+ * with every layout tweak, so measure the content box.
+ */
+function contentWidth(element: HTMLElement): number {
+  // Guarded the way `theme.ts` guards `matchMedia`: the layout tests render
+  // this module against a plain object with no stylesheet behind it, and there
+  // is no padding to subtract in that world.
+  if (typeof getComputedStyle !== "function") return element.clientWidth;
+  const styles = getComputedStyle(element);
+  const padding = (parseFloat(styles.paddingLeft) || 0) + (parseFloat(styles.paddingRight) || 0);
+  return Math.max(0, element.clientWidth - padding);
 }
 
 /** Move the playback highlight without rebuilding the SVG. */

@@ -68,6 +68,9 @@ let maxSamples = Infinity;
 let recording = false;
 let wakeLock: WakeLockSentinel | null = null;
 let visibilityHooked = false;
+/** One take ends once. Guards the cap and the interruption path against each
+ *  other and against re-entry from a second audio block. */
+let endSignalled = false;
 
 /** The hot buffer. Appended to ~94×/s; read directly by the rAF loop. */
 const liveFrames: PitchFrame[] = [];
@@ -92,6 +95,40 @@ export class CaptureAborted extends Error {}
  *  by the time an await resolves knows it has been overtaken. */
 let session = 0;
 
+/**
+ * How a take can end without anybody tapping Stop.
+ *
+ * Both of these are decided inside the audio callback or an audio-session
+ * event, which is precisely where the animation loop that normally drives the
+ * UI is *not* running: a backgrounded tab gets no `requestAnimationFrame`, and
+ * a suspended context gets no frames at all. Handing the app a callback keeps
+ * the ending on one code path — whatever ends the take, `main.ts` runs the same
+ * stop-and-transcribe it runs for a tap.
+ */
+export interface CaptureHandlers {
+  /** {@link MAX_RECORD_SEC} was reached. The module has already stopped keeping
+   *  audio; the handler is expected to call {@link stopRecording}. */
+  onLimitReached(): void;
+  /** The take cannot continue — the audio session was interrupted or the
+   *  microphone went away. Carries a line for the screen. */
+  onInterrupted(message: string): void;
+}
+
+let handlers: Partial<CaptureHandlers> = {};
+
+/** Install the end-of-take callbacks. Call once, at start-up. */
+export function setCaptureHandlers(next: Partial<CaptureHandlers>): void {
+  handlers = next;
+}
+
+/** End this take exactly once, whatever noticed first. */
+function signalEnd(reason: "limit" | "interrupted", message: string): void {
+  if (!recording || endSignalled) return;
+  endSignalled = true;
+  if (reason === "limit") handlers.onLimitReached?.();
+  else handlers.onInterrupted?.(message);
+}
+
 export function isRecording(): boolean {
   return recording;
 }
@@ -109,8 +146,35 @@ export function getLiveStatus(): LiveStatus {
     frame,
     voiced: lastVoiced,
     clipped: now - lastClippedSec < CLIP_HOLD_SEC,
-    elapsedSec: audioCtx ? totalSamples / audioCtx.sampleRate : 0,
+    // Clamped: a block that straddles the cap overshoots it by up to 128
+    // samples, and a clock that reads 1:00 while the cap is 1:00 is the honest
+    // answer either way.
+    elapsedSec: audioCtx ? Math.min(totalSamples, maxSamples) / audioCtx.sampleRate : 0,
   };
+}
+
+/**
+ * Forget everything the previous take accumulated.
+ *
+ * Called **synchronously** at the top of {@link startRecording}, before the
+ * context is published and before anything is awaited. This ordering is
+ * load-bearing: the caller starts its animation loop the moment the tap handler
+ * returns, and that loop reads {@link getLiveStatus} while `getUserMedia` is
+ * still showing a permission prompt. Leave the previous take's counters in
+ * place and the mildest symptom is the old trail flashing on screen — while a
+ * previous take that reached the 60 s cap would make the new one stop itself on
+ * its very first frame, hand `transcribe()` a minute of zeroes, and go on doing
+ * that for every subsequent tap until the page is reloaded.
+ */
+function resetTakeState(): void {
+  liveFrames.length = 0;
+  lastVoiced = null;
+  lastClippedSec = -Infinity;
+  blocks = [];
+  totalSamples = 0;
+  maxSamples = Infinity;
+  endSignalled = false;
+  tracker = null;
 }
 
 /**
@@ -132,15 +196,21 @@ export async function startRecording(): Promise<void> {
   if (recording) return;
   const mine = ++session;
 
+  // Before the context is published, before the first await: see resetTakeState.
+  resetTakeState();
+
   if (typeof AudioContext === "undefined") {
     throw new CaptureError("This browser has no Web Audio support.");
   }
 
   const ctx = new AudioContext();
   // Not awaited: the *call* has to happen inside the gesture, the promise does
-  // not have to settle there.
-  void ctx.resume();
+  // not have to settle there. The rejection is swallowed rather than left
+  // floating — Safari rejects `resume()` outright when it disagrees about the
+  // gesture, and an unhandled rejection there is noise, not news.
+  ctx.resume().catch(() => undefined);
   audioCtx = ctx;
+  maxSamples = Math.ceil(MAX_RECORD_SEC * ctx.sampleRate);
 
   if (!ctx.audioWorklet) {
     await teardown();
@@ -173,6 +243,13 @@ export async function startRecording(): Promise<void> {
       },
     });
   } catch (err) {
+    // A *stale* failure must behave exactly like a stale success: quietly. The
+    // prompt this rejection belongs to was abandoned when the user tapped Stop
+    // or tapped Record again, and a live granted session may be running on the
+    // other side of it. Tearing down globally here would kill that session, and
+    // throwing a `CaptureError` would put "Microphone blocked" on screen over a
+    // recording that is working perfectly.
+    if (mine !== session) throw await abandonContext(ctx);
     await teardown();
     throw new CaptureError(micErrorMessage(err));
   }
@@ -184,53 +261,102 @@ export async function startRecording(): Promise<void> {
     // it never enters the module graph; Workbox precaches it via the `js` glob.
     await ctx.audioWorklet.addModule(`${import.meta.env.BASE_URL}pcm-recorder.worklet.js`);
   } catch {
-    await abandon(ctx, opened);
+    const overtaken = await abandon(ctx, opened);
+    if (mine !== session) throw overtaken;
     throw new CaptureError("Could not load the audio recorder module. Try reloading the page.");
   }
   if (mine !== session) throw await abandon(ctx, opened);
 
   stream = opened;
-  liveFrames.length = 0;
-  lastVoiced = null;
-  lastClippedSec = -Infinity;
-  blocks = [];
-  totalSamples = 0;
-  maxSamples = Math.ceil(MAX_RECORD_SEC * ctx.sampleRate);
   // The pipeline is rate-agnostic and reads whatever the device gave us; iOS
   // ignores a sampleRate constraint anyway, so asking for one only invites a
   // resampler into the path.
   tracker = new PitchTracker(ctx.sampleRate, DEFAULT_CONFIG);
 
-  source = ctx.createMediaStreamSource(stream);
-  worklet = new AudioWorkletNode(ctx, "pcm-recorder");
-  // Silent sink. Safari only pulls a graph that reaches the destination, so an
-  // unconnected worklet never runs; a gain of 0 keeps the pull without feeding
-  // the microphone back into the room.
-  sink = ctx.createGain();
-  sink.gain.value = 0;
-  source.connect(worklet).connect(sink).connect(ctx.destination);
+  /*
+   * From here on the microphone is open, so every failure has to give it back.
+   * `new AudioWorkletNode` throws for real — an `InvalidStateError` whenever
+   * the processor name is not registered, which is what a half-updated
+   * service-worker cache produces — and without this the tracks and the context
+   * would leak one per attempt, with the recording indicator burning until the
+   * tab is closed.
+   */
+  try {
+    source = ctx.createMediaStreamSource(stream);
+    worklet = new AudioWorkletNode(ctx, "pcm-recorder");
+    // Silent sink. Safari only pulls a graph that reaches the destination, so
+    // an unconnected worklet never runs; a gain of 0 keeps the pull without
+    // feeding the microphone back into the room.
+    sink = ctx.createGain();
+    sink.gain.value = 0;
+    source.connect(worklet).connect(sink).connect(ctx.destination);
 
-  worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
-    const block = event.data;
-    if (!tracker) return;
+    worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
+      const block = event.data;
+      // Past the cap the take is over: no more audio is kept and — just as
+      // importantly — no more FFTs are run on audio nobody will ever hear.
+      if (!recording || !tracker || totalSamples >= maxSamples) return;
 
-    if (totalSamples < maxSamples) {
       blocks.push(block);
       totalSamples += block.length;
-    }
 
-    // `PitchTracker` is chunk-size independent, so 128-sample blocks produce
-    // exactly the frames the offline pass will produce from the whole buffer.
-    for (const frame of tracker.push(block)) {
-      liveFrames.push(frame);
-      if (frame.clipped) lastClippedSec = frame.tSec;
-      if (frame.hz !== null && frame.clarity >= LIVE_MIN_CLARITY) lastVoiced = frame;
-    }
-  };
+      // `PitchTracker` is chunk-size independent, so 128-sample blocks produce
+      // exactly the frames the offline pass will produce from the whole buffer.
+      for (const frame of tracker.push(block)) {
+        liveFrames.push(frame);
+        if (frame.clipped) lastClippedSec = frame.tSec;
+        if (frame.hz !== null && frame.clarity >= LIVE_MIN_CLARITY) lastVoiced = frame;
+      }
+
+      /*
+       * The cap is enforced *here*, in the audio callback, rather than only in
+       * the animation loop that watches the clock. A hidden tab gets no
+       * animation frames but keeps getting audio, so a rAF-only cap means a
+       * backgrounded take runs the microphone, the analyser and an unbounded
+       * frame buffer for as long as the phone is in a pocket.
+       */
+      if (totalSamples >= maxSamples) signalEnd("limit", "");
+    };
+
+    ctx.addEventListener("statechange", onContextStateChange);
+    for (const track of stream.getAudioTracks()) track.addEventListener("ended", onTrackEnded);
+  } catch (error) {
+    console.error("[capture] could not build the audio graph", error);
+    await teardown();
+    throw new CaptureError("Could not start the audio pipeline on this device. Try reloading.");
+  }
 
   recording = true;
   void requestWakeLock();
   hookVisibility();
+
+  /**
+   * An interrupted audio session — a phone call, a route change, iOS deciding
+   * the app has been in the background long enough — suspends the context. The
+   * graph then stops pulling with no error anywhere: no frames, no samples, and
+   * a UI that says "recording" forever. Try to bring it back; if the microphone
+   * itself is gone there is nothing to come back to, so end the take on what we
+   * have rather than pretending.
+   */
+  function onContextStateChange(): void {
+    if (!recording || audioCtx !== ctx || ctx.state === "running") return;
+    void ctx
+      .resume()
+      .catch(() => undefined)
+      .then(() => {
+        if (!recording || audioCtx !== ctx || ctx.state === "running") return;
+        const track = stream?.getAudioTracks()[0];
+        if (!track || track.readyState === "ended" || track.muted) {
+          signalEnd("interrupted", "Recording was interrupted — here is what was captured.");
+        }
+      });
+  }
+
+  /** The microphone was revoked, unplugged or taken by another app. */
+  function onTrackEnded(): void {
+    if (!recording || audioCtx !== ctx) return;
+    signalEnd("interrupted", "The microphone stopped — here is what was captured.");
+  }
 }
 
 /**
@@ -293,6 +419,11 @@ export function stopRecording(): { samples: Float32Array; sampleRate: number } {
 /** Release what a start opened but will never use, and say why it stopped. */
 async function abandon(ctx: AudioContext, opened: MediaStream): Promise<CaptureAborted> {
   for (const track of opened.getTracks()) track.stop();
+  return abandonContext(ctx);
+}
+
+/** The same, for a start that never got as far as a stream. */
+async function abandonContext(ctx: AudioContext): Promise<CaptureAborted> {
   // Only disown the module reference if it is still ours — a newer start may
   // already have published its own context over the top of it.
   if (audioCtx === ctx) audioCtx = null;

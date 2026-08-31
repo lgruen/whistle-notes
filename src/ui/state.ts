@@ -57,38 +57,53 @@ export interface AppState {
   /** A non-fatal warning that outlives a single frame, e.g. the browser
    *  refusing to switch its noise suppression off. */
   warning: string | null;
+  /** Global tuning bias the segmenter took out of this take, in cents. Positive
+   *  means the whistler ran sharp of A440. Surfaced in the result view when it
+   *  is big enough to be worth knowing about. */
+  tuningOffsetCents: number;
 }
 
 const TRANSPOSE_KEY = "whistle-notes:transpose";
 
-/** localStorage throws outright in some privacy modes, so every access is
+/** The stored octave preference, or `null` when there isn't a usable one.
+ *  localStorage throws outright in some privacy modes, so every access is
  *  wrapped: a missing preference must never take the app down with it. */
-function loadTranspose(): number {
+function loadTranspose(): number | null {
   try {
-    const stored = Number(localStorage.getItem(TRANSPOSE_KEY));
-    return OCTAVE_SHIFTS.includes(stored) ? stored : 0;
+    const raw = localStorage.getItem(TRANSPOSE_KEY);
+    if (raw === null) return null;
+    const stored = Number(raw);
+    return OCTAVE_SHIFTS.includes(stored) ? stored : null;
   } catch {
-    return 0;
+    return null;
   }
 }
+
+const restoredTranspose = loadTranspose();
 
 let state: AppState = {
   phase: "idle",
   notes: [],
   frames: [],
-  transpose: loadTranspose(),
+  transpose: restoredTranspose ?? 0,
   playing: false,
   playingIndex: null,
   message: "",
   warning: null,
+  tuningOffsetCents: 0,
 };
 
 /**
- * Whether the user has touched the octave toggle *in this session*. It gates
- * the auto-default: guessing an octave for someone who already told us what
- * they want would be the app arguing with its user.
+ * Whether the user has ever explicitly chosen an octave — this session, or a
+ * previous one. It gates the auto-default: guessing an octave for someone who
+ * already told us what they want would be the app arguing with its user.
+ *
+ * A restored preference counts as chosen, which is the entire point of storing
+ * it. Treating it as un-chosen would let `suggestOctaveShift` overwrite it on
+ * the first result of every session, and the persistence would be a no-op that
+ * only *looked* like a feature.
  */
-let transposeChosen = false;
+let transposeChosen = restoredTranspose !== null;
 
 type Listener = (state: AppState) => void;
 const listeners = new Set<Listener>();
@@ -135,7 +150,11 @@ export function setTranspose(shift: number): void {
  * beginner under ledger lines; `suggestOctaveShift` picks the shift that lands
  * the melody's median nearest the middle line.
  */
-export function applyResult(notes: readonly Note[], frames: readonly PitchFrame[]): void {
+export function applyResult(
+  notes: readonly Note[],
+  frames: readonly PitchFrame[],
+  tuningOffsetCents = 0,
+): void {
   const transpose = transposeChosen
     ? state.transpose
     : suggestOctaveShift(notes.map((note) => note.midi));
@@ -147,5 +166,6 @@ export function applyResult(notes: readonly Note[], frames: readonly PitchFrame[
     playing: false,
     playingIndex: null,
     message: notes.length === 0 ? "No notes found — try whistling louder or closer." : "",
+    tuningOffsetCents,
   });
 }

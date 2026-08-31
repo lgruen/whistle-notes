@@ -11,13 +11,18 @@ permissions:
   pages: write
   id-token: write
 
-concurrency:
-  group: pages-${{ github.ref }}
-  cancel-in-progress: true
+# Concurrency is per job, deliberately: superseding a test run is free, but
+# cancelling a deploy is not. `actions/deploy-pages` talks to the Pages API in
+# several steps, and killing it between them can leave the deployment stuck —
+# GitHub's own Pages template says never to cancel it. So pushes queue here.
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A superseded test run has nothing to say; cancel it and start the new one.
+    concurrency:
+      group: test-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -29,12 +34,21 @@ jobs:
         run: npx tsc --noEmit
       - name: Unit tests
         run: npx vitest run
+      # Also on PRs and branches. `vite build` is the only thing that exercises
+      # the PWA plugin, the Rollup pass and the CommonJS fft.js interop, so
+      # without it a breakage in any of them stays green until it reaches main.
+      - name: Build
+        run: npm run build
 
   deploy:
     # Deploying is gated on the tests: a red build must never reach the site.
     needs: test
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    # Queued, never cancelled: see the note above.
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

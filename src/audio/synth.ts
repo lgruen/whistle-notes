@@ -119,7 +119,9 @@ export function startPlayback(
   if (scheduled.length === 0) return;
 
   ctx = new AudioContext();
-  void ctx.resume();
+  // Swallowed, not left floating: Safari rejects `resume()` when it disagrees
+  // about the gesture, and the schedule below is what actually matters.
+  ctx.resume().catch(() => undefined);
   handlers = playbackHandlers;
 
   const t0 = ctx.currentTime + LEAD_SEC;

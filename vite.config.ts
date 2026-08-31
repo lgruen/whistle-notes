@@ -24,13 +24,41 @@ export default defineConfig({
   define: { __BUILD__: JSON.stringify(buildStamp()) },
   plugins: [
     VitePWA({
-      registerType: "autoUpdate",
+      /*
+       * `prompt`, not `autoUpdate` — and nothing actually prompts.
+       *
+       * `autoUpdate` compiles to `window.location.reload()` the moment a new
+       * worker activates. A deploy landing while the user is whistling would
+       * then throw the take away mid-recording, with no warning and no way to
+       * get it back. In `prompt` mode the new worker parks itself in `waiting`
+       * and `main.ts` applies it at the first moment a reload is free (idle or
+       * a finished result, nothing playing). Same freshness, no lost takes.
+       */
+      registerType: "prompt",
       workbox: {
         // `js` matters: public/pcm-recorder.worklet.js is copied through
         // unhashed, so it only gets a precache revision (and therefore works
         // offline, and updates when it changes) if the glob catches it.
         globPatterns: ["**/*.{js,css,html,png,svg,webmanifest}"],
-        navigateFallback: "index.html",
+        // First install still takes over immediately, so the app is offline-
+        // ready without a reload; only *updates* wait for a safe moment.
+        clientsClaim: true,
+        /*
+         * No `navigateFallback` — and it has to be turned off explicitly,
+         * because the plugin defaults it to `index.html`.
+         *
+         * With `base: "./"` every asset URL in index.html is relative, so
+         * serving that page for a deeper URL — a mis-shared or mistyped
+         * `…/whistle-notes/foo/` — resolves every script and stylesheet against
+         * the wrong directory. The result is a blank page with a fistful of
+         * silent 404s, which is a far worse answer than the server's own 404.
+         *
+         * Nothing is lost: this is a single-page app with no client-side
+         * routing, and the app's own URL is served straight out of the precache
+         * (Workbox's `directoryIndex` maps `…/` to the precached `index.html`),
+         * so an offline reload still works.
+         */
+        navigateFallback: undefined,
       },
       manifest: {
         name: "Whistle Notes",

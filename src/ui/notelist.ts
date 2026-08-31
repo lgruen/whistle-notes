@@ -8,40 +8,23 @@
  * the playback highlight — is a class toggle, and has its own function.
  */
 
-import { DEFAULT_CONFIG, midiToName, type Note } from "../dsp/index.js";
-import { transposeMidi } from "../notes/format.js";
+import { DEFAULT_CONFIG, durationClasses, hasRestBefore, midiToName, type Note } from "../dsp/index.js";
+import { formatCents, transposeMidi } from "../notes/format.js";
 
-/**
- * Rough length relative to the take's median note. v1 deliberately does not
- * transcribe rhythm — the goal is finding the notes on a keyboard — but "that
- * one was long" is cheap to show and helps a reader follow along.
+/*
+ * "How long was that note, roughly?" and "is there a rest before it?" are both
+ * answered by `src/dsp` — `durationClasses()` and `hasRestBefore()`. This module
+ * used to reimplement both, with a different long-note ratio (1.7 vs 1.5) and a
+ * different boundary condition on the rest gap, which meant the chips and the
+ * staff could disagree with the segmenter about the take they were describing.
+ * One definition, in the module that owns the notes; the UI only paints it.
+ *
+ * `durationClasses` wants a mutable array, so the readonly view is copied.
+ * The list is rebuilt once per transcription, so the copy is free.
  */
-export type DurationClass = "short" | "medium" | "long";
-
-const SHORT_RATIO = 0.7;
-const LONG_RATIO = 1.7;
-
-export function durationClass(durationSec: number, medianSec: number): DurationClass {
-  if (!(medianSec > 0)) return "medium";
-  const ratio = durationSec / medianSec;
-  if (ratio < SHORT_RATIO) return "short";
-  if (ratio > LONG_RATIO) return "long";
-  return "medium";
+function classesFor(notes: readonly Note[]): ReturnType<typeof durationClasses> {
+  return durationClasses([...notes]);
 }
-
-/** Median note length, the reference every duration class is relative to. A
- *  median rather than a mean so one long held final note cannot rescale the
- *  entire transcript. */
-export function medianDuration(notes: readonly Note[]): number {
-  if (notes.length === 0) return 0;
-  const sorted = notes.map((note) => note.durationSec).sort((a, b) => a - b);
-  const mid = sorted.length >> 1;
-  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
-/** Gap that counts as a rest in the transcript, from the segmenter's own
- *  definition so the chips and the notes agree about what a rest is. */
-const REST_GAP_SEC = DEFAULT_CONFIG.segment.restGapMs / 1000;
 
 /**
  * The paste-friendly line: note names separated by spaces, rests by a slash.
@@ -52,7 +35,7 @@ const REST_GAP_SEC = DEFAULT_CONFIG.segment.restGapMs / 1000;
 export function sequenceText(notes: readonly Note[], transpose: number): string {
   const parts: string[] = [];
   for (const note of notes) {
-    if (parts.length > 0 && note.gapBeforeSec >= REST_GAP_SEC) parts.push("/");
+    if (parts.length > 0 && hasRestBefore(note, DEFAULT_CONFIG)) parts.push("/");
     parts.push(midiToName(transposeMidi(note.midi, transpose)));
   }
   return parts.join(" ");
@@ -91,17 +74,20 @@ export function renderNoteList(
   }
   container.hidden = false;
 
-  const median = medianDuration(notes);
+  const lengths = classesFor(notes);
   const chips: string[] = [];
   for (let i = 0; i < notes.length; i++) {
     const note = notes[i];
-    if (i > 0 && note.gapBeforeSec >= REST_GAP_SEC) {
+    if (i > 0 && hasRestBefore(note, DEFAULT_CONFIG)) {
       chips.push(`<span class="chip-rest" aria-label="rest">/</span>`);
     }
     const name = midiToName(transposeMidi(note.midi, transpose));
-    const length = durationClass(note.durationSec, median);
+    const length = lengths[i];
+    // The measurement behind the chip, for anyone who wants to know why a note
+    // was rounded the way it was. Numbers only — nothing here can be markup.
+    const detail = `${note.pitchHz.toFixed(1)} Hz, ${formatCents(note.centsOffset)} cents, ${note.durationSec.toFixed(2)} s`;
     chips.push(
-      `<span class="chip chip-${length}" data-i="${i}">` +
+      `<span class="chip chip-${length}" data-i="${i}" title="${detail}">` +
         `<span class="chip-name">${name}</span>` +
         `<span class="chip-len">${length}</span>` +
         `</span>`,
