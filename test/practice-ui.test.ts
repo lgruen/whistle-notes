@@ -1534,6 +1534,40 @@ describe("the follow-along warm-up", () => {
   });
 });
 
+/**
+ * The one failure in this app that takes the whole thing down.
+ *
+ * `element()` in `main.ts` throws on a missing id, at module scope, before
+ * anything renders — so a typo in an id is not a broken screen, it is a blank
+ * app with a stack trace in a console nobody has open on a phone. Nothing else
+ * in the suite would notice: the view tests mount stubs, and a build succeeds
+ * happily with a string that matches nothing.
+ *
+ * It is also the check that keeps markup and wiring from drifting the other
+ * way — a section left in `index.html` after the code that drove it was
+ * deleted looks exactly like a section that still works.
+ */
+describe("every screen the app reaches for", () => {
+  const read = (name: string): string =>
+    readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
+
+  const declared = new Set([...read("index.html").matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
+  const wanted = [...read("src/main.ts").matchAll(/element(?:<[^>]+>)?\("([^"]+)"\)/g)].map(
+    (m) => m[1],
+  );
+
+  it("exists in the markup", () => {
+    // Not vacuous: the app really does reach for a hundred-odd elements.
+    expect(wanted.length).toBeGreaterThan(80);
+    expect(wanted.filter((id) => !declared.has(id))).toEqual([]);
+  });
+
+  it("has no practice markup left behind by code that went away", () => {
+    const asked = new Set(wanted);
+    expect([...declared].filter((id) => id.startsWith("practice-") && !asked.has(id))).toEqual([]);
+  });
+});
+
 describe("polish", () => {
   it("nudges towards the range check on the screen where it is about to matter", () => {
     const { el, render } = mountPractice();

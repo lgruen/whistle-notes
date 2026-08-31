@@ -615,6 +615,11 @@ function startFollowAlong(): void {
   followHandle = requestAnimationFrame(followLoop);
 }
 
+/** How long a reading lingers after the whistle stops — the same quarter second
+ *  the live readout uses, so a held note draws one line rather than a dotted
+ *  one. */
+const FOLLOW_HOLD_SEC = 0.25;
+
 /**
  * One clock, not two.
  *
@@ -626,11 +631,6 @@ function startFollowAlong(): void {
  * context's clock with the playback context's. Nothing here is measured, which
  * is what makes that trade honest.
  */
-/** How long a reading lingers after the whistle stops — the same quarter second
- *  the live readout uses, so a held note draws one line rather than a dotted
- *  one. */
-const FOLLOW_HOLD_SEC = 0.25;
-
 function followLoop(timestampMs: number): void {
   followHandle = requestAnimationFrame(followLoop);
   const model = followRoll;
@@ -645,7 +645,11 @@ function followLoop(timestampMs: number): void {
     voiced.hz !== null &&
     (status.frame?.tSec ?? 0) - voiced.tSec <= FOLLOW_HOLD_SEC;
   if (elapsed >= 0) {
-    appendFollowPoint(followTrail, elapsed, fresh && voiced.hz !== null ? hzToMidiFloat(voiced.hz) : null);
+    appendFollowPoint(
+      followTrail,
+      elapsed,
+      fresh && voiced.hz !== null ? hzToMidiFloat(voiced.hz) : null,
+    );
   }
 
   drawFollowRoll(followCanvas, {
