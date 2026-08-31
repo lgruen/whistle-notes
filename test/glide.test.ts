@@ -157,18 +157,18 @@ describe("scoops into a note", () => {
   });
 });
 
-describe("vibrato", () => {
-  /** One held note with a wobble on it, and nothing else. */
-  const wobble = (cents: number, hz: number, cfg = DEFAULT_CONFIG): Note[] =>
-    transcribe(
-      sequence([{ midi: 88, durSec: 1.2, vibratoCents: cents, vibratoHz: hz }], {
-        leadInSec: 0.3,
-        tailSec: 0.3,
-      }).samples,
-      SR,
-      cfg,
-    ).notes;
+/** One held note with a wobble on it, and nothing else. */
+const wobble = (cents: number, hz: number, cfg = DEFAULT_CONFIG): Note[] =>
+  transcribe(
+    sequence([{ midi: 88, durSec: 1.2, vibratoCents: cents, vibratoHz: hz }], {
+      leadInSec: 0.3,
+      tailSec: 0.3,
+    }).samples,
+    SR,
+    cfg,
+  ).notes;
 
+describe("vibrato", () => {
   it("hears one note through a wobble far wider than the tolerance", () => {
     // ±90 cents peaks at 1.8 semitones peak to peak — three times the 60-cent
     // wobble tolerance, and wide enough that each extreme dwells long enough to
@@ -224,5 +224,107 @@ describe("vibrato", () => {
     // And the knob does move it, in the documented direction.
     expect(wobble(90, 4, presetConfig("forgiving")).map((n) => n.noteName)).toEqual(["E6"]);
     expect(wobble(60, 5, mergeConfig(DEFAULT_CONFIG, { segment: { toleranceCents: 40 } })).length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+/**
+ * A melody with vibrato on it — the case where reuniting a wobble and reading a
+ * melody are the *same* evidence pointing opposite ways.
+ *
+ * Under a wobble as wide as the interval, the two notes' pitch ranges overlap
+ * by more than half: every frame of the arriving note is individually within
+ * the departing note's tolerance, and every swing of the arriving note's
+ * vibrato "undoes" the step by more than half of it. So both of the pipeline's
+ * repairs fire on it — the state machine's reference slides across the boundary
+ * and stage G reunites what it did split — and an adversarial review measured
+ * exactly that: 73 of these 125 came out wrong, a *worse* score than before the
+ * repairs existed. What was missing was the one measurement that is not
+ * ambiguous, the pitch the wobble is centred on.
+ */
+describe("a wobble on a melody", () => {
+  const MELODIES = [
+    [88, 90, 88, 91, 88],
+    [84, 86, 88, 89, 91],
+    [88, 87, 88, 87, 88],
+    [91, 89, 88, 86, 84],
+    [88, 91, 88, 91, 88],
+  ];
+
+  /** Legato: no gaps at all, so nothing but pitch marks the boundaries. */
+  const legato = (melody: number[], vibratoCents: number, vibratoHz: number, durSec = 0.4): number[] =>
+    MIDIS(
+      transcribe(
+        sequence(
+          melody.map((midi) => ({ midi, durSec, vibratoCents, vibratoHz })),
+          { leadInSec: 0.3, tailSec: 0.3 },
+        ).samples,
+        SR,
+      ).notes,
+    );
+
+  // 125 signals is well past the default 5 s budget on a CI runner.
+  it("reads five legato melodies through vibrato of 40–80 cents at 4–6 Hz", { timeout: 60_000 }, () => {
+    let wrong = 0;
+    const failures: string[] = [];
+    for (const melody of MELODIES) {
+      for (const vibratoCents of [40, 50, 60, 70, 80]) {
+        for (const vibratoHz of [4, 4.5, 5, 5.5, 6]) {
+          const heard = legato(melody, vibratoCents, vibratoHz);
+          if (heard.join(",") !== melody.join(",")) {
+            wrong++;
+            failures.push(`${melody.join(",")} ±${vibratoCents}c@${vibratoHz}Hz → ${heard.join(",")}`);
+          }
+        }
+      }
+    }
+    // Measured: 125 of 125. Before the centre track, 52 — and 67 with both
+    // repairs removed, which is the number that says the repairs were the
+    // problem rather than an incomplete solution.
+    expect(wrong, failures.slice(0, 8).join(" | ")).toBeLessThanOrEqual(5);
+  });
+
+  it("does not let a merge chain walk up a scale", () => {
+    // The failure this pins is a *chain*: merging two fragments moves the
+    // running median a little, which brings the next fragment within reach,
+    // which moves it again. Twelve merges once walked from 84.4 to 86.6 and
+    // reported six chromatic notes as two. Nothing local can catch that, which
+    // is why the bound is on the whole chain and the test is on the whole run.
+    expect(legato([84, 85, 86, 87, 88, 89], 60, 5, 0.3)).toEqual([84, 85, 86, 87, 88, 89]);
+
+    // And the mirror image: the *first* note being absorbed into the second.
+    for (const cents of [50, 60, 70]) {
+      expect(legato([88, 90, 88, 91, 88], cents, 5), `±${cents}c`).toEqual([88, 90, 88, 91, 88]);
+    }
+  });
+
+  it("still hears a lone wobbling note as one note", () => {
+    // The other half of the same rule, and the reason it cannot simply be "stop
+    // merging". Nothing here changed: a wobble whose centre holds still is one
+    // note however wide it is.
+    for (const [cents, hz] of [
+      [60, 5],
+      [70, 4],
+      [80, 4],
+    ] as const) {
+      const notes = wobble(cents, hz);
+      expect(notes.map((n) => n.noteName), `±${cents}c at ${hz} Hz`).toEqual(["E6"]);
+      expect(Math.abs(notes[0].centsOffset), `±${cents}c at ${hz} Hz`).toBeLessThan(30);
+    }
+  });
+
+  it("reads an ascending legato run rather than collapsing it", () => {
+    // Runs are the worst case for a chain: every merge moves the median the
+    // same way as the melody. Six notes, two-semitone steps, wobble up to
+    // ±70 cents. Before this round, ten of these twelve came out short — one
+    // of them as `84 88 92 94`.
+    for (const vibratoCents of [50, 60, 70]) {
+      for (const vibratoHz of [4.5, 5, 5.5]) {
+        const melody = [84, 86, 88, 90, 92, 94];
+        expect(
+          legato(melody, vibratoCents, vibratoHz, 0.35),
+          `±${vibratoCents}c@${vibratoHz}Hz`,
+        ).toEqual(melody);
+      }
+    }
   });
 });

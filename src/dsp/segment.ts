@@ -11,7 +11,8 @@
  *   A. **Voicing** — which frames are a whistle rather than a room.
  *   B. **Pitch representation** — Hz to fractional MIDI. Never rounded early.
  *   C. **Smoothing** — drop specks, median-filter *within* voiced runs.
- *   D. **Glide marking** — steep slopes are transitions, not notes.
+ *   D. **Glide marking** — steep slopes are transitions, not notes; and the
+ *      wobble-free *centre* of the trail, with the steps in it.
  *   E. **State machine** — a running median reference, with confirmation.
  *   F. **Per-note pitch** — trim the attack, take the median.
  *   G. **Gaps** — dropout versus silence, short-note merges, rests.
@@ -261,6 +262,12 @@ export interface Prepared {
   /** Frames belonging to a movement that *was* recognised as a transition and
    *  then immediately undone — i.e. to a wobble rather than to a glide. */
   oscillating: boolean[];
+  /** Per frame: the pitch the trail is locally *centred* on, with any wobble
+   *  averaged out. NaN outside voiced runs. See `centreTrack`. */
+  centre: number[];
+  /** Per frame: this is where the centre stepped from one pitch to another —
+   *  one frame per step, at the moment it happened. See `markSteps`. */
+  stepped: boolean[];
 }
 
 /**
@@ -304,8 +311,10 @@ export function prepare(frames: PitchFrame[], cfg: DspConfig, sampleRate: number
   // D — glide marking. The frames of a transition still count towards duration
   // and continuity, but their pitch is excluded from the estimate.
   const { transitional, oscillating } = markTransitional(runs, smoothed, framePeriod, cfg);
+  const centre = centreTrack(runs, smoothed, framePeriod);
+  const stepped = markSteps(runs, centre, framePeriod, cfg);
 
-  return { voicing, runs, smoothed, transitional, oscillating };
+  return { voicing, runs, smoothed, transitional, oscillating, centre, stepped };
 }
 
 // ---------------------------------------------------------------------------
@@ -383,12 +392,25 @@ const MOVEMENT_STALL_MS = 80;
  *  two halves have each been measured at their own *extreme* — the distance
  *  between them is the wobble's full peak-to-peak, not its amplitude.
  *
- *  Applied per merge, against the *running* merged pitch, which converges on
- *  the centre of the wobble as halves are absorbed — so a wobble of up to
- *  roughly ±2 semitones about its centre is still reunited, and one wider than
- *  that comes apart. Measured: one note through ±200 cents at 4 Hz, three
- *  notes at ±300. */
+ *  Applied to the *whole chain*, not per merge: twice this is the widest the
+ *  reported pitches of all the fragments being reunited may span between them,
+ *  so a wobble of up to roughly ±2 semitones about its centre is still put back
+ *  together and one wider than that comes apart. Measured against the chain's
+ *  own extremes rather than its running median, because a bound that moves as
+ *  the median moves is not a bound at all — see `mergeWobbles`. Measured: one
+ *  note through ±200 cents at 4 Hz, several at ±300. */
 const MAX_WOBBLE_SEMITONES = 2;
+
+/** How far the pitch an oscillation is centred on may wander across the
+ *  material being reunited, in semitones.
+ *
+ *  This is the test that tells a wobbling note from a wobbling *melody*, and it
+ *  needs no margin for the wobble itself — `centreTrack` has already removed
+ *  that — so what is left to allow for is the whistler's own unsteadiness
+ *  within one note. Half a semitone is comfortably under the smallest interval
+ *  anyone plays and comfortably over the few tens of cents a held note drifts
+ *  by. */
+const WOBBLE_CENTRE_SEMITONES = 0.6;
 
 /**
  * Cut a voiced run into movements: stretches over which the pitch travels
@@ -481,10 +503,18 @@ function movementLegs(
  *
  * What does separate them is *shape*: an oscillation comes back and a
  * transition does not. So a movement immediately followed or preceded by a
- * comparable movement the other way is vibrato, and its frames keep their
- * pitch. Between two real notes there is a note in the way — several times
- * longer than the couple of frames a wobble spends turning around — so a
- * genuine step is never mistaken for half a wobble.
+ * comparable movement the other way keeps its pitch rather than being blanked.
+ *
+ * Note what that test can and cannot claim. "Something comparable happened the
+ * other way within a couple of frames" is good enough to decide *not to blank*
+ * — being half of something is reason enough to keep a frame's pitch — and it
+ * is nowhere near good enough to conclude "this is one note wobbling". A
+ * legato semitone step wearing a ±80-cent vibrato passes it easily: the climb
+ * runs from the departing note's trough to the arriving note's peak and the
+ * swing back covers most of it. The `oscillating` map it produces is therefore
+ * a *hint* for stage G and not a licence; stage G tests the centre of the
+ * material itself before acting on it, which is the measurement that can tell
+ * these two apart. See `centreTrack`.
  */
 function markTransitional(
   runs: Run[],
@@ -511,6 +541,7 @@ function markTransitional(
       const rate = distance / leg.seconds;
       if (distance < s.glideMinSemitones && rate <= s.glideSlopeStPerSec) continue;
 
+      /** Is there a comparable movement the other way right next to this one? */
       const undone = (other: Leg | undefined, gapFrames: number): boolean =>
         other !== undefined &&
         other.direction !== leg.direction &&
@@ -521,10 +552,11 @@ function markTransitional(
       const undoneBefore = undone(before, before ? leg.start - before.end - 1 : Infinity);
       const undoneAfter = undone(after, after ? after.start - leg.end - 1 : Infinity);
       if (undoneBefore || undoneAfter) {
-        // Not a transition — but worth remembering *where* the wobbling was,
-        // because the state machine cannot tell an oscillation's extreme from
-        // a new note and will happily report a wide slow vibrato as a trill.
-        // Stage G uses this to put such a note back together.
+        // Not a transition — but worth remembering *where* the wobbling might
+        // have been, because the state machine cannot tell an oscillation's
+        // extreme from a new note and will happily report a wide slow vibrato
+        // as a trill. Stage G takes this as its list of places to *look*, and
+        // decides for itself.
         for (let i = leg.start; i <= leg.end; i++) oscillating[i] = true;
         // Include the turning point itself: the couple of frames where the
         // pitch is neither climbing nor falling belong to the wobble as much
@@ -548,6 +580,166 @@ function markTransitional(
   }
 
   return { transitional, oscillating };
+}
+
+/** Window the local pitch centre is measured over, in milliseconds. Chosen to
+ *  span a whole cycle of the slowest wobble anyone produces (human vibrato
+ *  bottoms out around 4 Hz, so 250 ms), because a half-cycle window would
+ *  report the wobble's own swing as movement of its centre. */
+const CENTRE_WINDOW_MS = 300;
+
+/**
+ * The pitch the trail is locally centred on, with any wobble averaged out.
+ *
+ * This is the one measurement the rest of the file cannot make for itself:
+ * whether a stretch of trail is *one* pitch being wobbled around or two. A
+ * ±80-cent vibrato on a legato semitone step looks, frame to frame and swing to
+ * swing, exactly like a ±80-cent vibrato on a held note — the two notes' pitch
+ * ranges overlap by more than half, so every local test is ambiguous and the
+ * running median simply slides across the boundary. The centres are not
+ * ambiguous at all: one moves by a semitone and the other does not.
+ *
+ * Two choices make it work.
+ *
+ * **Midpoint of the extremes**, not a mean or a median. Over any window
+ * spanning at least one full cycle, the highest and lowest points of an
+ * oscillation *are* its two extremes whatever the phase, so their midpoint is
+ * the centre exactly — no leakage of the wobble's amplitude, no dependence on
+ * where in the cycle the window happens to land. A mean or a median over a
+ * non-integer number of cycles has neither property and reports a centre that
+ * wobbles in its own right.
+ *
+ * **The least-spread window containing the frame**, not the one centred on it.
+ * A window centred on a note change straddles both notes, so its extremes are
+ * the low of one and the high of the other and its midpoint is halfway between
+ * — which would smear every boundary across the window's whole width and put a
+ * long false plateau at the halfway pitch, exactly where the boundary needs to
+ * be sharp. Straddling is visible without knowing where the boundary is: a
+ * window inside one note spans the wobble, one across a boundary spans the
+ * wobble *plus the interval*. Preferring the narrowest available window
+ * therefore snaps the estimate to whichever note the frame mostly belongs to,
+ * and the centre steps at the boundary instead of ramping through it. It also
+ * makes the estimate ignore a scoop or a glide for free: those are the widest
+ * windows around, and never the ones chosen.
+ */
+function centreTrack(runs: Run[], smoothed: number[], framePeriod: number): number[] {
+  const centre = new Array<number>(smoothed.length).fill(NaN);
+  const width = Math.max(3, Math.round(CENTRE_WINDOW_MS / 1000 / framePeriod));
+
+  for (const run of runs) {
+    const length = run.end - run.start + 1;
+    const w = Math.min(width, length);
+    const positions = length - w + 1;
+    const spreads = new Array<number>(positions);
+    const middles = new Array<number>(positions);
+    for (let p = 0; p < positions; p++) {
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let j = run.start + p; j < run.start + p + w; j++) {
+        if (smoothed[j] < lo) lo = smoothed[j];
+        if (smoothed[j] > hi) hi = smoothed[j];
+      }
+      spreads[p] = hi - lo;
+      middles[p] = 0.5 * (lo + hi);
+    }
+
+    for (let i = run.start; i <= run.end; i++) {
+      const from = Math.max(0, i - run.start - w + 1);
+      const to = Math.min(positions - 1, i - run.start);
+      let best = from;
+      for (let p = from + 1; p <= to; p++) if (spreads[p] < spreads[best]) best = p;
+      centre[i] = middles[best];
+    }
+  }
+
+  return centre;
+}
+
+/** How far the centre must move for the movement to have been a note change
+ *  rather than an unsteady hand, in semitones. The smallest interval anybody
+ *  plays is one semitone and the widest a held note wanders is a few tens of
+ *  cents, so this sits between them — and deliberately below `glideMinSemitones`,
+ *  because by the time the centre has moved this far the *pitch* has already
+ *  moved further, and it is the pitch that stage D was measuring. */
+const STEP_CENTRE_SEMITONES = 0.6;
+
+/** Stillness on each side of a step, in milliseconds. A note change has a note
+ *  on either side of it; the run-up into the very first note of a phrase has
+ *  only one, which is what keeps this from firing on a scoop. */
+const STEP_PLATEAU_MS = 120;
+
+/**
+ * Where did the pitch the trail is centred on step from one note to another?
+ *
+ * The state machine works frame by frame against a running median, and there is
+ * a class of note change it structurally cannot see: a legato semitone step
+ * underneath a wobble at least as wide as the step. The arriving note's low
+ * swings land inside `toleranceCents` of the departing note's centre, so every
+ * frame is individually "consistent" and the reference simply slides across
+ * the boundary. Measured on a wobbling `84 86 88 89 91`: the 88 and the 89 came
+ * out as one note of 88.65, a pitch nobody whistled.
+ *
+ * The centre track has the wobble removed, so on it the same passage is a
+ * staircase and the boundaries are exactly the risers. Finding them is stage
+ * D's own movement machinery run over the centre instead of the raw pitch —
+ * same question, asked of a signal where it has an answer.
+ *
+ * Two guards keep this from firing where the state machine was already right.
+ * A step must *land*: the centre has to be as still after it as before it, for
+ * about the length of the shortest note anyone whistles. That is what separates
+ * a note change from a scoop (which has no note before it, only a run-up) and
+ * from a whistler drifting slowly across a semitone (which never stops moving).
+ * And a step is reported as the single frame where the centre moved fastest —
+ * the riser's midpoint, which is where the note actually changed — rather than
+ * as the whole smeared ramp, so no frame loses its pitch to this.
+ */
+function markSteps(
+  runs: Run[],
+  centre: number[],
+  framePeriod: number,
+  cfg: DspConfig,
+): boolean[] {
+  const stepped = new Array<boolean>(centre.length).fill(false);
+  const plateau = Math.max(2, Math.round(STEP_PLATEAU_MS / 1000 / framePeriod));
+  const slope = new Array<number>(centre.length).fill(0);
+
+  for (const run of runs) {
+    for (let i = run.start; i <= run.end; i++) {
+      const previous = Math.max(run.start, i - 1);
+      const next = Math.min(run.end, i + 1);
+      if (next === previous) continue;
+      slope[i] = (centre[next] - centre[previous]) / ((next - previous) * framePeriod);
+    }
+
+    for (const leg of movementLegs(run, centre, slope, framePeriod, cfg)) {
+      if (Math.abs(leg.semitones) < STEP_CENTRE_SEMITONES) continue;
+      // A step is *abrupt*. The centre is a plateau-and-riser affair by
+      // construction, so a real note change moves it within a frame or two and
+      // reads as tens of semitones per second; a whistler sliding across a
+      // semitone over a whole second moves it just as far but a hundred times
+      // more slowly, and that is drift, which `driftCapSemitones` already has
+      // an opinion about. `glideSlopeStPerSec` is the existing statement of
+      // where "too fast to be a note" begins, so it is the one used here.
+      if (Math.abs(leg.semitones) / leg.seconds < cfg.segment.glideSlopeStPerSec) continue;
+      // Still on both sides? Compare the centre a plateau's width out from each
+      // end of the movement with the movement's own endpoints: if the centre
+      // is still travelling out there, this was not a step but part of a longer
+      // journey, and stage D's raw-pitch pass is the right judge of it.
+      const before = leg.start - plateau;
+      const after = leg.end + plateau;
+      if (before < run.start || after > run.end) continue;
+      if (Math.abs(centre[before] - centre[leg.start]) > STEP_CENTRE_SEMITONES / 2) continue;
+      if (Math.abs(centre[after] - centre[leg.end]) > STEP_CENTRE_SEMITONES / 2) continue;
+
+      let at = leg.start;
+      for (let i = leg.start; i <= leg.end; i++) {
+        if (Math.abs(slope[i]) > Math.abs(slope[at])) at = i;
+      }
+      stepped[at] = true;
+    }
+  }
+
+  return stepped;
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +772,8 @@ interface StateMachineInput {
   runs: Run[];
   smoothed: number[];
   transitional: boolean[];
+  /** Frames where stage D saw the centre of the trail step to a new pitch. */
+  stepped: boolean[];
 }
 
 function runStateMachine(cfg: DspConfig, input: StateMachineInput): Draft[] {
@@ -641,6 +835,32 @@ function runStateMachine(cfg: DspConfig, input: StateMachineInput): Draft[] {
       // Every frame in a run belongs to *some* note for timing purposes. Only
       // its contribution to a pitch is in question below.
       current.endIndex = Math.max(current.endIndex, i);
+
+      // Stage D saw the pitch this passage is centred on step to a new one
+      // here. That is a note boundary the running reference cannot find on its
+      // own — under a wobble wider than the step, every individual frame of the
+      // arriving note is still "consistent" with the departing one, so the
+      // reference slides across the boundary and reports a pitch between the
+      // two that nobody whistled. It is therefore imposed rather than inferred:
+      // close the note and start the next from a clean slate here. Checked
+      // *before* the glide rule below, because a legato step is a glide, and a
+      // short one at that: the couple of frames where the pitch is in motion
+      // are exactly where the boundary is.
+      //
+      // It applies whether or not the note has settled on a pitch, which is the
+      // case that matters most. A wobbling legato run gives the confirmation
+      // rule almost nothing to work with — the pitch is in motion nearly every
+      // frame — so a draft can run through two or three whole notes without
+      // ever settling, and everything it swallowed is then measured as approach
+      // to whichever note it finally did settle on. Measured on an ascending
+      // `84 86 88 90 92 94` under ±70 cents: three notes vanished into one.
+      if (input.stepped[i] && i > current.startIndex) {
+        current.endIndex = i - 1;
+        finish();
+        draft = { startIndex: i, endIndex: i, firstPitchIndex: -1, refSpan: 0, glidedIn: false };
+        pending = input.transitional[i] ? [] : [{ index: i, m }];
+        continue;
+      }
 
       // Glide and scoop frames carry continuity and duration but never pitch:
       // their pitch is a moving target, and including it would spawn a phantom
@@ -930,11 +1150,24 @@ function mergeDropouts(
  *
  * Stage D already knows where the wobbling was — a movement it recognised as
  * a transition by size or speed, and then declined to mark because a
- * comparable movement the other way followed within a couple of frames. Two
- * notes whose boundary sits inside that are two halves of one oscillation, and
- * the test cannot fire at a real note change, because a real note puts its own
- * sustain between the two movements and that is far more than a couple of
- * frames.
+ * comparable movement the other way brought the pitch back where it started.
+ * A boundary sitting inside that is a candidate for reassembly.
+ *
+ * A *candidate*, not a conclusion, and this is where an earlier version of
+ * this function went confidently wrong. Wobbling a melody makes the state
+ * machine emit fragments at every swing — six of them across two legato notes
+ * — and merging them pairwise against the running median walks: each merge
+ * moves the median a little, which brings the next fragment within reach,
+ * which moves it again. Twelve merges once walked from 84.4 to 86.6 and
+ * reported a six-note chromatic run as two notes. Nothing local can stop that,
+ * because locally every step of the walk is a perfectly ordinary wobble.
+ *
+ * So the test is not local. The whole of the material being reunited must be
+ * an oscillation about a centre that stays put (`centre`, whose window is a
+ * full wobble cycle, so it is blind to the wobble and sees only where the
+ * wobble sits), and the fragments must between them span no more than one
+ * wobble's width measured from where the chain *started* rather than from the
+ * median as it drifts. A melody fails both the moment it moves on.
  *
  * Measuring the reunited note over all of its frames is what makes it come out
  * right: a median over whole periods of an oscillation is its centre.
@@ -943,31 +1176,71 @@ function mergeWobbles(
   notes: Measured[],
   context: FrameContext,
   oscillating: boolean[],
-  voicing: Voicing,
+  transitional: boolean[],
+  centre: number[],
   cfg: DspConfig,
 ): Measured[] {
+  /** A merged note plus the pitch extremes of everything that went into it —
+   *  the chain's own history, which is what bounds the walk. */
+  interface Chain {
+    note: Measured;
+    lo: number;
+    hi: number;
+  }
+
+  const start = (note: Measured): Chain => ({ note, lo: note.midiFloat, hi: note.midiFloat });
+
+  /** Does the pitch this stretch is centred on hold still across all of it? */
+  const centreHolds = (from: number, to: number): boolean => {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = from; i <= to; i++) {
+      const c = centre[i];
+      if (!Number.isFinite(c)) continue;
+      if (c < lo) lo = c;
+      if (c > hi) hi = c;
+    }
+    return hi - lo <= WOBBLE_CENTRE_SEMITONES;
+  };
+
   let changed = true;
   let current = notes;
 
   while (changed && current.length > 1) {
     changed = false;
-    const out: Measured[] = [current[0]];
+    const out: Chain[] = [start(current[0])];
     for (let n = 1; n < current.length; n++) {
-      const previous = out[out.length - 1];
+      const chain = out[out.length - 1];
+      const previous = chain.note;
       const next = current[n];
       const gapFrames = next.startIndex - previous.endIndex - 1;
-      const boundaryWobbles = (): boolean => {
-        for (let i = previous.endIndex; i <= next.startIndex; i++) if (!oscillating[i]) return false;
+      const boundaryMoves = (): boolean => {
+        for (let i = previous.endIndex; i <= next.startIndex; i++) {
+          if (!oscillating[i] && !transitional[i]) return false;
+        }
         return true;
       };
 
       if (
         gapFrames <= 0 &&
-        Math.abs(previous.midiFloat - next.midiFloat) <= MAX_WOBBLE_SEMITONES &&
-        boundaryWobbles() &&
-        !isTrueSilence(previous.endIndex, next.startIndex, context.frames, voicing, cfg)
+        Math.max(chain.hi, next.midiFloat) - Math.min(chain.lo, next.midiFloat) <=
+          2 * MAX_WOBBLE_SEMITONES &&
+        boundaryMoves() &&
+        // From where the first note settled, not from where it starts: its
+        // opening frames are approach, and on a legato step they are still
+        // centred on the note being left.
+        centreHolds(
+          previous.firstPitchIndex >= 0 ? previous.firstPitchIndex : previous.startIndex,
+          next.endIndex,
+        )
+        // No silence test here, deliberately. `gapFrames <= 0` means these two
+        // notes touch, and every frame inside a note is a *voiced* frame, which
+        // by construction cleared the sustain threshold over the floor. There is
+        // no room between them for silence to be in, so a check would only look
+        // reassuring. Dropout merging, where a real gap does exist, is where
+        // that question belongs.
       ) {
-        out[out.length - 1] = measure(
+        chain.note = measure(
           {
             startIndex: previous.startIndex,
             endIndex: next.endIndex,
@@ -978,12 +1251,14 @@ function mergeWobbles(
           context,
           cfg,
         );
+        chain.lo = Math.min(chain.lo, next.midiFloat);
+        chain.hi = Math.max(chain.hi, next.midiFloat);
         changed = true;
       } else {
-        out.push(next);
+        out.push(start(next));
       }
     }
-    current = out;
+    current = out.map((c) => c.note);
   }
 
   return current;
@@ -1143,10 +1418,14 @@ export function segmentNotes(
   const a4Hz = cfg.tuning.a4Hz;
 
   // A–D.
-  const { voicing, runs, smoothed, transitional, oscillating } = prepare(frames, cfg, sampleRate);
+  const { voicing, runs, smoothed, transitional, oscillating, centre, stepped } = prepare(
+    frames,
+    cfg,
+    sampleRate,
+  );
 
   // E — the state machine.
-  const drafts = runStateMachine(cfg, { runs, smoothed, transitional });
+  const drafts = runStateMachine(cfg, { runs, smoothed, transitional, stepped });
 
   // F — per-note pitch. A draft with no usable pitch anywhere (all glide, all
   // gap) has nothing to report and is dropped rather than named.
@@ -1161,7 +1440,7 @@ export function segmentNotes(
 
   // G — gaps and lengths. Dropout merging runs twice: absorbing a short note
   // can leave two same-pitch neighbours newly adjacent.
-  measured = mergeWobbles(measured, context, oscillating, voicing, cfg);
+  measured = mergeWobbles(measured, context, oscillating, transitional, centre, cfg);
   measured = mergeDropouts(measured, context, voicing, cfg, framePeriod);
   measured = resolveShortNotes(measured, context, voicing, cfg, framePeriod);
   measured = mergeDropouts(measured, context, voicing, cfg, framePeriod);
