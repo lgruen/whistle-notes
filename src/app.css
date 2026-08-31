@@ -558,6 +558,100 @@ button {
   color: var(--danger);
 }
 
+/* ── Getting a melody in ────────────────────────────────────────────── */
+
+.add-row {
+  display: flex;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+/* Same outline language as the range buttons: these are the actions of one
+   screen, sized for a thumb, and neither of them is the loud one. */
+.btn-add {
+  flex: 1;
+  min-height: 3rem;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  font-size: 0.9rem;
+}
+
+.btn-add.is-recording {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+/* Wrapping chips rather than a list: five tunes, each a short name, and a
+   column of full-width rows would make the built-ins look like the library
+   they are meant to fill. */
+.starter-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  width: 100%;
+}
+
+.starter {
+  min-height: 2.25rem;
+  padding: 0 0.7rem;
+  border: 1px solid var(--text-dim);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.75rem;
+}
+
+/* ── The draft ──────────────────────────────────────────────────────── */
+
+.draft-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+/* Trimmed notes stay visible so the Drop buttons have something to point at,
+   and so "Keep all" reads as an undo rather than a gamble. */
+.chip.is-dropped {
+  opacity: 0.35;
+  text-decoration: line-through;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  width: 100%;
+}
+
+.field-label {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+
+/* 16px minimum: anything smaller and mobile Safari zooms the page on focus,
+   which on this screen would scroll the notes out of view mid-edit. */
+.field-input {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0 0.7rem;
+  border: 1px solid var(--surface);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 1rem;
+}
+
+.btn-save {
+  align-self: stretch;
+  min-height: 3rem;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 1rem;
+}
+
 .ghost.danger.is-armed {
   border-color: var(--danger);
   font-weight: 700;

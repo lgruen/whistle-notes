@@ -425,7 +425,11 @@ describe("the practice island", () => {
   };
 
   it("keeps the engine free of anything a browser has to provide", async () => {
-    for (const name of ["align", "stats", "range", "target"]) {
+    // `midi` and `bundled` joined the island in T2 and belong on it for the
+    // same reason: the parser has to be testable against bytes built in a test
+    // file rather than against a `.mid` a browser handed it, and a data file of
+    // melodies has no business knowing what a DOM is.
+    for (const name of ["align", "stats", "range", "target", "midi", "bundled"]) {
       const source = await read(name);
       for (const token of BROWSER_ONLY) {
         expect(source, `${name}.ts uses ${token}`).not.toMatch(new RegExp(`\\b${token}\\b`));

@@ -43,8 +43,14 @@
  */
 
 import type { Alignment, TargetNote } from "./align.js";
+import type { MidiMelody } from "./midi.js";
 import { isUsableRange, rangeFromEnds, type WhistleRange } from "./range.js";
-import { parseTarget, type PracticeTarget } from "./target.js";
+import {
+  draftTarget,
+  parseTarget,
+  type PracticeTarget,
+  type TargetDraft,
+} from "./target.js";
 import {
   emptyStats,
   forgetTarget,
@@ -66,7 +72,7 @@ const LIBRARY_VERSION = 1;
  * lands back on the library, and deleting the selected target cannot leave a
  * detail screen pointing at nothing.
  */
-export type PracticeScreen = "library" | "target" | "range";
+export type PracticeScreen = "library" | "target" | "range" | "draft" | "midi";
 
 /** Which end of the range the user is being asked for, during the check. */
 export type RangeStep = "low" | "high";
@@ -87,6 +93,20 @@ export interface RangeDraft {
   high: number | null;
 }
 
+/**
+ * A MIDI file that has been read but not yet chosen from.
+ *
+ * Held in the store rather than in the view because picking a part is a screen
+ * of its own, and because the file is gone by then — the `File` object belongs
+ * to an input that has already been cleared, so whatever the parse produced is
+ * all there will ever be.
+ */
+export interface MidiPick {
+  /** What the file was called, as the default name for whatever is picked. */
+  fileName: string;
+  melodies: readonly MidiMelody[];
+}
+
 export interface PracticeState {
   screen: PracticeScreen;
   /** Newest first. */
@@ -98,6 +118,21 @@ export interface PracticeState {
   /** The end being captured right now, or `null` when not capturing. */
   rangeStep: RangeStep | null;
   rangeDraft: RangeDraft;
+  /**
+   * The target being made right now, or `null`.
+   *
+   * Never persisted, deliberately: a half-made target is a decision in
+   * progress, and restoring one on the next launch would confront the user with
+   * a screen full of notes they no longer remember recording. The cost is
+   * honest — a take is lost if the app is closed mid-draft — and the fix is to
+   * save first and rename later, which the library allows.
+   */
+  draft: TargetDraft | null;
+  /** A parsed MIDI file waiting to be picked from, or `null`. */
+  midi: MidiPick | null;
+  /** Whether a take is being recorded *into a draft* (rather than for the
+   *  range check). Cleared the moment the notes arrive. */
+  recordingTarget: boolean;
   /** Progress or feedback for the screen on show. */
   message: string;
   /** Set when a write was refused. Visible, and never cleared silently. */
@@ -171,6 +206,9 @@ let state: PracticeState = {
   stats: loadStats(),
   rangeStep: null,
   rangeDraft: draftFrom(restored.range),
+  draft: null,
+  midi: null,
+  recordingTarget: false,
   message: "",
   storageError: null,
 };
@@ -240,7 +278,19 @@ function persistStats(stats: PracticeStats): string | null {
 /* ── Navigation ───────────────────────────────────────────────────────── */
 
 export function showLibrary(message = ""): void {
-  setPracticeState({ screen: "library", selectedId: null, rangeStep: null, message });
+  setPracticeState({
+    screen: "library",
+    selectedId: null,
+    rangeStep: null,
+    // Leaving for the library ends every half-finished thing: an abandoned
+    // draft and a picked-but-unchosen file are both about a screen that is no
+    // longer showing, and keeping either would make the next tap on "record a
+    // target" land in the middle of the last one.
+    draft: null,
+    midi: null,
+    recordingTarget: false,
+    message,
+  });
 }
 
 export function selectTarget(id: string): void {
@@ -280,6 +330,79 @@ export function setPracticeMessage(message: string): void {
 /** Acknowledge a storage failure. The only way the notice ever goes away. */
 export function clearStorageError(): void {
   if (state.storageError !== null) setPracticeState({ storageError: null });
+}
+
+/* ── Making one ───────────────────────────────────────────────────────── */
+
+/**
+ * Mark that the take now running is going to become a target.
+ *
+ * Separate from `rangeStep` because the two takes mean different things and end
+ * in different places, and because the screen has to be able to say which one
+ * is happening. Set before the notes exist and cleared when they arrive, so the
+ * button that started it is the button that stops it.
+ */
+export function beginTargetTake(): void {
+  setPracticeState({ recordingTarget: true, message: "" });
+}
+
+/** The take is over and it did not become a draft. Says why, and puts the
+ *  button that started it back to how it was. */
+export function endTargetTake(message = ""): void {
+  setPracticeState({ recordingTarget: false, message });
+}
+
+/** Open the draft screen on a melody that has just arrived. */
+export function beginDraft(draft: TargetDraft): void {
+  setPracticeState({ screen: "draft", draft, recordingTarget: false, message: "" });
+}
+
+/** Replace the draft with an edited copy. Every trim, shift and keystroke. */
+export function editDraft(draft: TargetDraft): void {
+  if (state.draft === null) return;
+  setPracticeState({ draft });
+}
+
+/**
+ * Leave the draft without saving.
+ *
+ * Back to the part picker when the draft came from one — picking the wrong
+ * part of a MIDI file is the normal mistake, and making the user find the file
+ * again to fix it would be gratuitous.
+ */
+export function discardDraft(message = ""): void {
+  if (state.midi) {
+    setPracticeState({ screen: "midi", draft: null, message });
+    return;
+  }
+  showLibrary(message);
+}
+
+/** Show the parts of a MIDI file that has just been read. */
+export function showMidiPicker(pick: MidiPick): void {
+  setPracticeState({ screen: "midi", midi: pick, draft: null, message: "" });
+}
+
+/**
+ * Save the draft on screen, and land back in the library.
+ *
+ * Goes through {@link addTarget} like every other source rather than writing
+ * the library itself: one landing point is what keeps the persistence, the
+ * sorting and the storage-error reporting from having a second copy that drifts.
+ */
+export function saveDraft(fallbackName: string, createdAt: number = Date.now()): void {
+  const draft = state.draft;
+  if (draft === null) return;
+  const target = draftTarget(draft, fallbackName, createdAt);
+  addTarget(target);
+  setPracticeState({
+    screen: "library",
+    selectedId: null,
+    draft: null,
+    midi: null,
+    recordingTarget: false,
+    message: `Saved “${target.name}”.`,
+  });
 }
 
 /* ── The library ──────────────────────────────────────────────────────── */

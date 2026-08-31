@@ -125,13 +125,191 @@ export function makeTarget(
   notes: readonly { midi: number; durationSec: number }[],
   createdAt: number = Date.now(),
 ): PracticeTarget {
+  return targetFromNotes(
+    name,
+    source,
+    notes.map((note) => ({ midi: note.midi, durSec: note.durationSec })),
+    createdAt,
+  );
+}
+
+/**
+ * The same thing, from notes that are already in the target's own shape.
+ *
+ * Which is every source that did not come out of the transcriber: a MIDI file
+ * and a bundled melody both arrive as `{midi, durSec}` and have no business
+ * being dressed up as `Note`s just to be undressed again one line later.
+ */
+export function targetFromNotes(
+  name: string,
+  source: TargetSource,
+  notes: readonly TargetNote[],
+  createdAt: number = Date.now(),
+): PracticeTarget {
   return {
     id: newTargetId(),
     name,
     source,
-    notes: notes.map((note) => ({ midi: Math.round(note.midi), durSec: note.durationSec })),
+    notes: notes.map((note) => ({ midi: Math.round(note.midi), durSec: note.durSec })),
     createdAt,
   };
+}
+
+/* ── Drafts ───────────────────────────────────────────────────────────── */
+
+/**
+ * A target that is being made, before it is one.
+ *
+ * Every source needs the same three decisions before its notes are worth
+ * keeping, and none of them can be made for the user:
+ *
+ * - **Where the melody starts and stops.** A whistled take begins with the
+ *   scoop of finding the first note and ends with whatever the breath did on
+ *   the way out; a MIDI part begins with a count-in as often as not.
+ * - **Which register it belongs in.** The transcriber reports true pitch, and
+ *   true pitch from a piano's lower half is where the pitch detector is least
+ *   sure of the octave (a low string's fundamental is quieter than its
+ *   harmonics, so the octave above can win the peak). Moving the whole melody
+ *   is the fix, and it is one the user can *hear* is right.
+ * - **What it is called**, which is the only thing the library will show.
+ *
+ * Kept as the untouched notes plus a kept range, never as a shortened array:
+ * trimming has to be undoable, and an over-trimmed target is otherwise a
+ * recording nobody can make again.
+ */
+export interface TargetDraft {
+  source: TargetSource;
+  name: string;
+  /** As heard or as imported. Never edited — {@link draftNotes} applies the
+   *  edits on the way out. */
+  notes: readonly TargetNote[];
+  /** First kept note. */
+  keepFrom: number;
+  /** One past the last kept note. */
+  keepTo: number;
+  /** Whole octaves the melody has been moved by. */
+  octaveShift: number;
+  /** One more sentence the screen should show — a chord warning, say. */
+  note: string;
+}
+
+/** How far a draft may be moved. Four octaves is past both ends of a piano
+ *  from anywhere a melody starts; the bound exists so the buttons stop. */
+const MAX_DRAFT_SHIFT = 3;
+
+export function makeDraft(
+  source: TargetSource,
+  name: string,
+  notes: readonly TargetNote[],
+  note = "",
+): TargetDraft {
+  return {
+    source,
+    name,
+    notes: notes.map((n) => ({ midi: Math.round(n.midi), durSec: n.durSec })),
+    keepFrom: 0,
+    keepTo: notes.length,
+    octaveShift: 0,
+    note,
+  };
+}
+
+/** The melody as it would be saved: trimmed, and moved. */
+export function draftNotes(draft: TargetDraft): TargetNote[] {
+  return draft.notes
+    .slice(draft.keepFrom, draft.keepTo)
+    .map((note) => ({ midi: note.midi + 12 * draft.octaveShift, durSec: note.durSec }));
+}
+
+/**
+ * Drop one note from an end.
+ *
+ * One at a time, and never the last one. Two buttons and a Reset beat any
+ * cleverer gesture here: a whistled take needs one or two notes off the front
+ * and maybe one off the back, the chips show exactly what is about to go, and
+ * there is no drag, no long-press and no way to end up with a target of nothing
+ * by accident.
+ */
+export function trimDraft(draft: TargetDraft, end: "start" | "end"): TargetDraft {
+  if (draft.keepTo - draft.keepFrom <= 1) return draft;
+  return end === "start"
+    ? { ...draft, keepFrom: draft.keepFrom + 1 }
+    : { ...draft, keepTo: draft.keepTo - 1 };
+}
+
+/** Put every note back. The undo for the two buttons above. */
+export function resetDraftTrim(draft: TargetDraft): TargetDraft {
+  return { ...draft, keepFrom: 0, keepTo: draft.notes.length };
+}
+
+/** Move the whole melody by an octave, within {@link MAX_DRAFT_SHIFT}. */
+export function shiftDraft(draft: TargetDraft, delta: number): TargetDraft {
+  const octaveShift = Math.max(
+    -MAX_DRAFT_SHIFT,
+    Math.min(MAX_DRAFT_SHIFT, draft.octaveShift + delta),
+  );
+  return octaveShift === draft.octaveShift ? draft : { ...draft, octaveShift };
+}
+
+export function canShiftDraft(draft: TargetDraft, delta: number): boolean {
+  return Math.abs(draft.octaveShift + delta) <= MAX_DRAFT_SHIFT;
+}
+
+/** How many notes a draft would save. */
+export function draftNoteCount(draft: TargetDraft): number {
+  return Math.max(0, draft.keepTo - draft.keepFrom);
+}
+
+/** The longest name worth keeping. Longer than a library row can show anyway,
+ *  and short enough that a paste accident cannot fill the storage. */
+const MAX_NAME_LENGTH = 60;
+
+/**
+ * The name as it will be stored: trimmed, bounded, and never empty.
+ *
+ * Never empty because a nameless row in the library is a row you cannot choose
+ * — and the name is deliberately the *only* thing that identifies a target,
+ * since spelling out its notes is what the ear-first rule forbids.
+ */
+export function cleanTargetName(name: string, fallback: string): string {
+  const cleaned = name.replace(/\s+/g, " ").trim().slice(0, MAX_NAME_LENGTH);
+  return cleaned === "" ? fallback : cleaned;
+}
+
+const MONTHS = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/**
+ * What a freshly recorded target is called until the user says otherwise.
+ *
+ * Hand-formatted rather than `toLocaleString`, for the reason the rest of this
+ * module avoids the platform: the same target must be named the same thing in a
+ * test, in Node and on a phone whose locale is anyone's guess. Date and time
+ * both, because the answer to "which one was that?" is nearly always "the one
+ * from just now" and two takes a minute apart are the normal case.
+ */
+export function defaultTargetName(at: number = Date.now()): string {
+  const date = new Date(at);
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  return `Recorded ${date.getDate()} ${MONTHS[date.getMonth()]}, ${hh}:${mm}`;
+}
+
+/** Finish a draft. The name is cleaned here rather than at the keystroke, so
+ *  the field stays exactly what the user typed while they are typing it. */
+export function draftTarget(
+  draft: TargetDraft,
+  fallbackName: string,
+  createdAt: number = Date.now(),
+): PracticeTarget {
+  return targetFromNotes(
+    cleanTargetName(draft.name, fallbackName),
+    draft.source,
+    draftNotes(draft),
+    createdAt,
+  );
 }
 
 /**

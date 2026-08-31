@@ -28,8 +28,18 @@
  */
 
 import { midiToName } from "../notes/format.js";
+import { BUNDLED_MELODIES } from "../practice/bundled.js";
+import { chordWarning, melodySummary, type MidiMelody } from "../practice/midi.js";
 import { isUsableRange, rangeSpanSemitones, type WhistleRange } from "../practice/range.js";
-import { targetSummary, type PracticeTarget } from "../practice/target.js";
+import {
+  canShiftDraft,
+  draftNoteCount,
+  draftNotes,
+  formatTargetDuration,
+  targetSummary,
+  type PracticeTarget,
+  type TargetDraft,
+} from "../practice/target.js";
 import type { PracticeState, RangeStep } from "../practice/store.js";
 import type { Phase } from "./state.js";
 
@@ -40,6 +50,14 @@ export interface PracticeElements {
   empty: HTMLElement;
   rangeSummary: HTMLElement;
   rangeButton: HTMLButtonElement;
+  /** "Record one" — and "Stop", while it is running. */
+  addRecord: HTMLButtonElement;
+  /** The label wrapping {@link addMidiInput}; hidden rather than disabled,
+   *  because a `<label>` has no disabled state to respect. */
+  addMidiLabel: HTMLElement;
+  addMidiInput: HTMLInputElement;
+  /** Where the built-in melodies' buttons are written. */
+  starters: HTMLElement;
 
   detail: HTMLElement;
   detailName: HTMLElement;
@@ -58,6 +76,28 @@ export interface PracticeElements {
   rangeHigh: HTMLButtonElement;
   rangeDone: HTMLButtonElement;
 
+  draft: HTMLElement;
+  draftBack: HTMLButtonElement;
+  draftHint: HTMLElement;
+  draftNotes: HTMLElement;
+  draftMeta: HTMLElement;
+  /** One extra sentence about where this melody came from — the chord warning
+   *  on an imported part. Hidden when there is nothing to say. */
+  draftNote: HTMLElement;
+  draftTrimStart: HTMLButtonElement;
+  draftTrimEnd: HTMLButtonElement;
+  draftReset: HTMLButtonElement;
+  draftLower: HTMLButtonElement;
+  draftHigher: HTMLButtonElement;
+  draftName: HTMLInputElement;
+  draftSave: HTMLButtonElement;
+
+  midi: HTMLElement;
+  midiBack: HTMLButtonElement;
+  midiTitle: HTMLElement;
+  midiHint: HTMLElement;
+  midiList: HTMLElement;
+
   message: HTMLElement;
 }
 
@@ -71,6 +111,23 @@ export interface PracticeHandlers {
   /** Stop the take that is running. */
   onStopCapture(): void;
   onCloseRange(): void;
+
+  /** Start a take that will become a target. */
+  onRecordTarget(): void;
+  onMidiFile(file: File): void;
+  /** Add one of the built-in melodies, by id. */
+  onAddBundled(id: string): void;
+  /** Pick one part out of the MIDI file on screen, by id. */
+  onPickMelody(id: string): void;
+  onCloseMidi(): void;
+
+  onTrimDraft(end: "start" | "end"): void;
+  onResetTrim(): void;
+  /** Move the whole draft by whole octaves. */
+  onShiftDraft(delta: number): void;
+  onRenameDraft(name: string): void;
+  onSaveDraft(): void;
+  onDiscardDraft(): void;
 }
 
 export interface PracticeView {
@@ -146,6 +203,109 @@ export function targetRowHtml(target: PracticeTarget): string {
   );
 }
 
+/* ── Making a target ──────────────────────────────────────────────────── */
+
+/**
+ * Where the ear-first rule stops, and why it stops exactly here.
+ *
+ * The draft screen names the notes it is showing. Everywhere else in practice
+ * mode does not, and the difference is not a lapse: **a draft is a transcript
+ * under review; a target is a melody you are going to be asked for.**
+ *
+ * A recorded draft is the app reporting what it just heard, which is the only
+ * moment the user can catch the app being wrong — the scoop into the first note
+ * that became a note of its own, or the octave error the pitch detector makes on
+ * the deepest piano keys, where the fundamental is quieter than its own
+ * harmonics. Hiding that would leave the trim and move controls with nothing to
+ * aim at, and would hide the one limitation the hint warns about. It is the same
+ * licence the range readout already takes: a name about something already
+ * played is a label, not a prompt.
+ *
+ * The moment Save is tapped it becomes a target, and from there the library, the
+ * detail screen and every exercise say only its name, its length and where it
+ * came from.
+ */
+export const DRAFT_HINT_RECORDED =
+  "This is what the app heard. Drop anything at the ends that was not part of " +
+  "the melody, and move the whole thing up or down if it came out further away " +
+  "than you played it — that happens most on the deepest piano keys.";
+
+/** The same screen, for a melody that arrived from a file rather than a
+ *  microphone: nothing was *heard*, so there is nothing to doubt. */
+export const DRAFT_HINT_IMPORTED =
+  "Drop anything at the ends you do not want, move the whole thing up or down " +
+  "if you like, then give it a name.";
+
+export function draftHint(draft: TargetDraft): string {
+  return draft.source === "recorded" ? DRAFT_HINT_RECORDED : DRAFT_HINT_IMPORTED;
+}
+
+/** "9 notes · 5.4 s · 2 dropped" — the shape of what Save would keep. */
+export function draftMetaText(draft: TargetDraft): string {
+  const kept = draftNoteCount(draft);
+  const length = draftNotes(draft).reduce((total, note) => total + note.durSec, 0);
+  const dropped = draft.notes.length - kept;
+  return (
+    `${kept} note${kept === 1 ? "" : "s"} · ${formatTargetDuration(length)}` +
+    (dropped > 0 ? ` · ${dropped} dropped` : "")
+  );
+}
+
+/**
+ * The draft's notes, as chips.
+ *
+ * Trimmed notes stay on screen, greyed, rather than disappearing: seeing what
+ * is about to go is the whole feedback loop of the two Drop buttons, and it is
+ * what makes "Keep all" a visible undo rather than a leap of faith.
+ */
+export function draftChipsHtml(draft: TargetDraft): string {
+  return draft.notes
+    .map((note, index) => {
+      const kept = index >= draft.keepFrom && index < draft.keepTo;
+      const name = midiToName(note.midi + 12 * draft.octaveShift);
+      return (
+        `<span class="chip${kept ? "" : " is-dropped"}">` +
+        `<span class="chip-name">${name}</span>` +
+        `</span>`
+      );
+    })
+    .join("");
+}
+
+/** One built-in melody's button. Its name is data in this repo, not user text,
+ *  but it goes through the same escape as everything else. */
+export function starterRowHtml(melody: { id: string; name: string }): string {
+  return (
+    `<button type="button" class="starter" data-bundled="${escapeHtml(melody.id)}">` +
+    `${escapeHtml(melody.name)}</button>`
+  );
+}
+
+/**
+ * One row of the MIDI part picker.
+ *
+ * Name, size, and — when it matters — the fact that this part is not a single
+ * line and the app took the top note of each chord. That warning belongs here
+ * rather than after the choice: it is the reason to pick a different part.
+ */
+export function midiRowHtml(melody: MidiMelody): string {
+  const warning = chordWarning(melody);
+  return (
+    `<button type="button" class="target" data-melody="${escapeHtml(melody.id)}">` +
+    `<span class="target-name">${escapeHtml(melody.name)}</span>` +
+    `<span class="target-detail">${escapeHtml(melodySummary(melody))}</span>` +
+    (warning ? `<span class="target-detail">${escapeHtml(warning)}</span>` : "") +
+    `</button>`
+  );
+}
+
+/** What the part picker says at the top. */
+export function midiHintText(count: number): string {
+  if (count === 0) return "There are no notes in that file.";
+  if (count === 1) return "One part in that file. Tap it to trim it and name it.";
+  return `${count} parts in that file — tap the one that carries the tune.`;
+}
+
 export function createPracticeView(
   elements: PracticeElements,
   handlers: PracticeHandlers,
@@ -184,6 +344,51 @@ export function createPracticeView(
 
   elements.rangeButton.addEventListener("click", () => handlers.onOpenRange());
   elements.rangeDone.addEventListener("click", () => handlers.onCloseRange());
+
+  // The same running/stop rule the range buttons use, for the same reason:
+  // there is one microphone, so the button that opened it is the only way out.
+  elements.addRecord.addEventListener("click", () => {
+    if (elements.addRecord.dataset.running === "true") handlers.onStopCapture();
+    else handlers.onRecordTarget();
+  });
+
+  elements.addMidiInput.addEventListener("change", () => {
+    const file = elements.addMidiInput.files?.[0];
+    // Cleared before the handler runs: an input still holding a file fires no
+    // `change` when the same file is picked again, and re-importing the file
+    // you just imported is exactly what you do after picking the wrong part.
+    elements.addMidiInput.value = "";
+    if (file) handlers.onMidiFile(file);
+  });
+
+  // Written once and delegated, like the target list: the built-in melodies are
+  // a constant of this build.
+  elements.starters.innerHTML = BUNDLED_MELODIES.map(starterRowHtml).join("");
+  elements.starters.addEventListener("click", (event) => {
+    const id = (event.target as HTMLElement | null)
+      ?.closest<HTMLElement>("[data-bundled]")
+      ?.getAttribute("data-bundled");
+    if (id) handlers.onAddBundled(id);
+  });
+
+  elements.midiList.addEventListener("click", (event) => {
+    const id = (event.target as HTMLElement | null)
+      ?.closest<HTMLElement>("[data-melody]")
+      ?.getAttribute("data-melody");
+    if (id) handlers.onPickMelody(id);
+  });
+  elements.midiBack.addEventListener("click", () => handlers.onCloseMidi());
+
+  elements.draftBack.addEventListener("click", () => handlers.onDiscardDraft());
+  elements.draftTrimStart.addEventListener("click", () => handlers.onTrimDraft("start"));
+  elements.draftTrimEnd.addEventListener("click", () => handlers.onTrimDraft("end"));
+  elements.draftReset.addEventListener("click", () => handlers.onResetTrim());
+  elements.draftLower.addEventListener("click", () => handlers.onShiftDraft(-1));
+  elements.draftHigher.addEventListener("click", () => handlers.onShiftDraft(1));
+  elements.draftSave.addEventListener("click", () => handlers.onSaveDraft());
+  elements.draftName.addEventListener("input", () => {
+    handlers.onRenameDraft(elements.draftName.value);
+  });
   elements.rangeLow.addEventListener("click", () => {
     if (elements.rangeLow.dataset.running === "true") handlers.onStopCapture();
     else handlers.onCaptureRange("low");
@@ -198,12 +403,68 @@ export function createPracticeView(
   elements.detailNext.textContent = EXERCISES_COMING;
 
   let renderedTargets: readonly PracticeTarget[] | null = null;
+  let renderedMelodies: readonly MidiMelody[] | null = null;
+  /** What the chips on screen were built from. Rebuilding thirty spans on every
+   *  keystroke in the name field would be silly. */
+  let renderedChips = "";
 
   return {
     render(state, phase) {
       elements.library.hidden = state.screen !== "library";
       elements.detail.hidden = state.screen !== "target";
       elements.range.hidden = state.screen !== "range";
+      elements.draft.hidden = state.screen !== "draft";
+      elements.midi.hidden = state.screen !== "midi";
+
+      // A take that is going to become a target. Both conditions, for the same
+      // reason the range buttons check both: `recordingTarget` is practice
+      // state and `phase` belongs to the transcriber, and a stale flag must
+      // never leave a Stop button over a closed microphone.
+      const recordingDraft = state.recordingTarget && phase === "recording";
+      const analysingDraft = state.recordingTarget && phase === "analyzing";
+      elements.addRecord.dataset.running = String(recordingDraft);
+      elements.addRecord.classList.toggle("is-recording", recordingDraft);
+      elements.addRecord.textContent = recordingDraft ? "Stop" : "Record one";
+      elements.addRecord.disabled = analysingDraft;
+      // A file picked mid-take would land on a draft screen the running
+      // microphone is about to replace.
+      elements.addMidiLabel.hidden = recordingDraft || analysingDraft;
+      elements.addMidiInput.disabled = recordingDraft || analysingDraft;
+
+      if (state.draft) {
+        const draft = state.draft;
+        elements.draftHint.textContent = draftHint(draft);
+        const chips = draftChipsHtml(draft);
+        if (chips !== renderedChips) {
+          renderedChips = chips;
+          elements.draftNotes.innerHTML = chips;
+        }
+        elements.draftMeta.textContent = draftMetaText(draft);
+        elements.draftNote.textContent = draft.note;
+        elements.draftNote.hidden = draft.note === "";
+        // Never down to nothing: a target with no notes is not a melody, and
+        // the buttons say so by stopping rather than by explaining.
+        const only = draftNoteCount(draft) <= 1;
+        elements.draftTrimStart.disabled = only;
+        elements.draftTrimEnd.disabled = only;
+        elements.draftReset.disabled =
+          draft.keepFrom === 0 && draft.keepTo === draft.notes.length;
+        elements.draftLower.disabled = !canShiftDraft(draft, -1);
+        elements.draftHigher.disabled = !canShiftDraft(draft, 1);
+        // Only when it actually differs: writing the value back on every render
+        // would move the caret to the end mid-word on some browsers.
+        if (elements.draftName.value !== draft.name) elements.draftName.value = draft.name;
+      }
+
+      const melodies = state.midi?.melodies ?? null;
+      if (melodies !== renderedMelodies) {
+        renderedMelodies = melodies;
+        elements.midiList.innerHTML = melodies ? melodies.map(midiRowHtml).join("") : "";
+      }
+      if (state.midi) {
+        elements.midiTitle.textContent = state.midi.fileName;
+        elements.midiHint.textContent = midiHintText(state.midi.melodies.length);
+      }
 
       if (state.targets !== renderedTargets) {
         renderedTargets = state.targets;

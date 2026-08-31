@@ -110,18 +110,98 @@
             which notes drifted.
           </p>
 
+          <!-- The three ways a melody gets in. First on the screen because an
+               empty library is a wall, and the built-in tunes underneath make
+               the very first tap a melody rather than a setup step. -->
+          <div class="card">
+            <h3 class="card-title">Add a melody</h3>
+            <div class="add-row">
+              <button type="button" class="btn btn-add" id="practice-add-record">
+                Record one
+              </button>
+              <label class="btn btn-add btn-file" id="practice-add-midi">
+                MIDI file
+                <input
+                  type="file"
+                  accept=".mid,.midi,audio/midi,audio/x-midi"
+                  id="practice-add-midi-input"
+                />
+              </label>
+            </div>
+            <p class="card-body">Or start with one of these:</p>
+            <div class="starter-list" id="practice-starters"></div>
+          </div>
+
+          <h3 class="practice-subtitle">Your melodies</h3>
+          <div class="target-list" id="practice-targets" hidden></div>
+          <p class="practice-empty" id="practice-empty">
+            Nothing saved yet — whistle one, play one at your piano, or tap a
+            built-in tune above.
+          </p>
+
           <div class="card">
             <h3 class="card-title">Your whistling range</h3>
             <p class="card-body" id="practice-range-summary"></p>
             <button type="button" class="ghost" id="practice-range-open"></button>
           </div>
+        </section>
 
-          <h3 class="practice-subtitle">Targets</h3>
-          <div class="target-list" id="practice-targets" hidden></div>
-          <p class="practice-empty" id="practice-empty">
-            No targets yet. Recording your own, importing a MIDI file and a set
-            of built-in melodies are all coming next.
-          </p>
+        <!-- The draft: a melody that has arrived but is not a target yet.
+             Trim, move, name, save. The chips here name what the app heard —
+             a transcript under review, which is the one thing that catches the
+             app's own mistakes. Once it is saved, nothing writes its notes out
+             again; see the ear-first note in src/ui/practice.ts. -->
+        <section class="practice-screen" id="practice-draft" hidden>
+          <button type="button" class="ghost" id="practice-draft-back">← Back</button>
+          <h2 class="practice-title">New melody</h2>
+          <p class="practice-lead" id="practice-draft-hint"></p>
+          <div class="chips" id="practice-draft-notes"></div>
+          <p class="practice-meta" id="practice-draft-meta"></p>
+          <p class="practice-meta" id="practice-draft-note" hidden></p>
+
+          <div class="draft-row" role="group" aria-label="Trim the ends">
+            <button type="button" class="ghost" id="practice-draft-trim-start">
+              Drop first
+            </button>
+            <button type="button" class="ghost" id="practice-draft-trim-end">
+              Drop last
+            </button>
+            <button type="button" class="ghost" id="practice-draft-reset">
+              Keep all
+            </button>
+          </div>
+
+          <div class="draft-row" role="group" aria-label="Move the whole melody">
+            <button type="button" class="ghost" id="practice-draft-lower">
+              ↓ Lower
+            </button>
+            <button type="button" class="ghost" id="practice-draft-higher">
+              ↑ Higher
+            </button>
+          </div>
+
+          <label class="field">
+            <span class="field-label">Name</span>
+            <input
+              type="text"
+              class="field-input"
+              id="practice-draft-name"
+              maxlength="60"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
+          <button type="button" class="btn btn-save" id="practice-draft-save">Save</button>
+        </section>
+
+        <!-- One MIDI file usually holds several parts. Pick the one that is the
+             tune; the app says how big each is and warns when a part is not a
+             single line. -->
+        <section class="practice-screen" id="practice-midi" hidden>
+          <button type="button" class="ghost" id="practice-midi-back">← Practice</button>
+          <h2 class="practice-title" id="practice-midi-title">MIDI file</h2>
+          <p class="practice-lead" id="practice-midi-hint"></p>
+          <div class="target-list" id="practice-midi-tracks"></div>
         </section>
 
         <section class="practice-screen" id="practice-target" hidden>

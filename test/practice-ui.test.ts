@@ -1,13 +1,27 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { makeTarget, type PracticeTarget } from "../src/practice/target.js";
+import { BUNDLED_MELODIES } from "../src/practice/bundled.js";
+import type { MidiMelody } from "../src/practice/midi.js";
+import {
+  makeDraft,
+  makeTarget,
+  type PracticeTarget,
+  type TargetDraft,
+} from "../src/practice/target.js";
 import type { PracticeState } from "../src/practice/store.js";
 import { emptyStats } from "../src/practice/stats.js";
 import {
+  DRAFT_HINT_IMPORTED,
+  DRAFT_HINT_RECORDED,
   EXERCISES_COMING,
   createPracticeView,
+  draftChipsHtml,
+  draftMetaText,
+  midiHintText,
+  midiRowHtml,
   rangeStepHint,
   rangeSummaryText,
+  starterRowHtml,
   targetRowHtml,
   type PracticeElements,
   type PracticeHandlers,
@@ -69,10 +83,35 @@ describe("the ear-first rule", () => {
       rangeStepHint(null, "low"),
       rangeStepHint(null, "high"),
       rangeStepHint({ lowMidi: 84, highMidi: 96 }, null),
+      DRAFT_HINT_RECORDED,
+      DRAFT_HINT_IMPORTED,
+      midiHintText(0),
+      midiHintText(1),
+      midiHintText(4),
+      ...BUNDLED_MELODIES.map((melody) => melody.name),
     ]) {
       expect(copy, copy).not.toMatch(PITCH_NAME);
       expect(copy, copy).not.toMatch(INTERVAL_WORDS);
     }
+  });
+
+  /**
+   * The rule has one boundary, and it is worth pinning from both sides: the
+   * *draft* screen names notes, because it is a transcript of something already
+   * played and the trim and move controls have nothing to aim at otherwise. A
+   * *target* never does, because that is the thing the app is about to ask for
+   * from memory.
+   */
+  it("names notes while a melody is being made, and never once it is saved", () => {
+    const draft = makeDraft("recorded", "Take", [
+      { midi: 84, durSec: 0.4 },
+      { midi: 88, durSec: 0.4 },
+    ]);
+    expect(draftChipsHtml(draft)).toMatch(PITCH_NAME);
+
+    const target = makeTarget("Take", "recorded", [{ midi: 84, durationSec: 0.4 }], 1);
+    expect(targetRowHtml(target).replace(/<[^>]*>/g, " ")).not.toMatch(PITCH_NAME);
+    expect(draftMetaText(draft)).not.toMatch(PITCH_NAME);
   });
 
   it("asks for a feeling rather than for a pitch", () => {
@@ -162,6 +201,10 @@ interface StubElement {
   disabled: boolean;
   textContent: string;
   innerHTML: string;
+  /** For the name field. */
+  value: string;
+  /** For the MIDI file input. */
+  files: File[] | null;
   dataset: Record<string, string>;
   classes: Set<string>;
   attributes: Record<string, string>;
@@ -172,7 +215,9 @@ interface StubElement {
   };
   setAttribute(name: string, value: string): void;
   getAttribute(name: string): string | null;
-  addEventListener(type: string, listener: () => void): void;
+  addEventListener(type: string, listener: (event: unknown) => void): void;
+  /** Fire every listener of one type, with an event of the caller's choosing. */
+  dispatch(type: string, event?: unknown): void;
   /** Fire every click listener attached to this element. */
   click(): void;
 }
@@ -180,12 +225,14 @@ interface StubElement {
 function stub(): StubElement {
   const classes = new Set<string>();
   const attributes: Record<string, string> = {};
-  const listeners: (() => void)[] = [];
-  return {
+  const listeners = new Map<string, ((event: unknown) => void)[]>();
+  const element: StubElement = {
     hidden: false,
     disabled: false,
     textContent: "",
     innerHTML: "",
+    value: "",
+    files: null,
     dataset: {},
     classes,
     attributes,
@@ -200,12 +247,33 @@ function stub(): StubElement {
     setAttribute: (name, value) => void (attributes[name] = value),
     getAttribute: (name) => attributes[name] ?? null,
     addEventListener: (type, listener) => {
-      if (type === "click") listeners.push(listener);
+      const forType = listeners.get(type) ?? [];
+      forType.push(listener);
+      listeners.set(type, forType);
     },
-    click: () => {
-      for (const listener of [...listeners]) listener();
+    dispatch: (type, event) => {
+      for (const listener of [...(listeners.get(type) ?? [])]) listener(event);
     },
+    click: () => element.dispatch("click", { target: null }),
   };
+  return element;
+}
+
+/**
+ * Click something *inside* a delegating container.
+ *
+ * The library list, the built-in melodies and the MIDI part picker are all
+ * rebuilt from strings and listen on the container, so the only thing the
+ * handler ever sees of the row is `closest("[data-x]")`. That is what this
+ * fakes — and it is worth faking, because a delegated handler that reads the
+ * wrong attribute is invisible to the type checker and to a screenshot alike.
+ */
+function clickChild(container: StubElement, attribute: string, value: string): void {
+  const child = {
+    getAttribute: (name: string) => (name === attribute ? value : null),
+    closest: (selector: string): unknown => (selector === `[${attribute}]` ? child : null),
+  };
+  container.dispatch("click", { target: child });
 }
 
 const ELEMENT_KEYS = [
@@ -214,6 +282,10 @@ const ELEMENT_KEYS = [
   "empty",
   "rangeSummary",
   "rangeButton",
+  "addRecord",
+  "addMidiLabel",
+  "addMidiInput",
+  "starters",
   "detail",
   "detailName",
   "detailMeta",
@@ -226,6 +298,24 @@ const ELEMENT_KEYS = [
   "rangeLow",
   "rangeHigh",
   "rangeDone",
+  "draft",
+  "draftBack",
+  "draftHint",
+  "draftNotes",
+  "draftMeta",
+  "draftNote",
+  "draftTrimStart",
+  "draftTrimEnd",
+  "draftReset",
+  "draftLower",
+  "draftHigher",
+  "draftName",
+  "draftSave",
+  "midi",
+  "midiBack",
+  "midiTitle",
+  "midiHint",
+  "midiList",
   "message",
 ] as const;
 
@@ -245,6 +335,17 @@ function mountPractice(): {
     onCaptureRange: vi.fn(),
     onStopCapture: vi.fn(),
     onCloseRange: vi.fn(),
+    onRecordTarget: vi.fn(),
+    onMidiFile: vi.fn(),
+    onAddBundled: vi.fn(),
+    onPickMelody: vi.fn(),
+    onCloseMidi: vi.fn(),
+    onTrimDraft: vi.fn(),
+    onResetTrim: vi.fn(),
+    onShiftDraft: vi.fn(),
+    onRenameDraft: vi.fn(),
+    onSaveDraft: vi.fn(),
+    onDiscardDraft: vi.fn(),
   };
   const view = createPracticeView(
     el as unknown as PracticeElements,
@@ -258,6 +359,9 @@ function mountPractice(): {
     stats: emptyStats(),
     rangeStep: null,
     rangeDraft: { low: null, high: null },
+    draft: null,
+    midi: null,
+    recordingTarget: false,
     message: "",
     storageError: null,
   };
@@ -275,15 +379,44 @@ const TARGET: PracticeTarget = makeTarget(
   1,
 );
 
+/** Five notes: enough to trim from both ends and still have a melody. */
+const DRAFT: TargetDraft = makeDraft("recorded", "Recorded now", [
+  { midi: 72, durSec: 0.2 },
+  { midi: 74, durSec: 0.4 },
+  { midi: 76, durSec: 0.4 },
+  { midi: 74, durSec: 0.4 },
+  { midi: 72, durSec: 0.6 },
+]);
+
+const MELODY: MidiMelody = {
+  id: "1:0",
+  trackIndex: 1,
+  channel: 0,
+  name: "Lead",
+  notes: [{ midi: 60, durSec: 0.5 }, { midi: 62, durSec: 0.5 }],
+  chordFraction: 0,
+  truncated: false,
+  durationSec: 1,
+};
+
 describe("the library screen", () => {
   it("shows exactly one screen at a time", () => {
     const { el, render } = mountPractice();
+    const showing = (): string[] =>
+      (["library", "detail", "range", "draft", "midi"] as const).filter(
+        (name) => !el[name].hidden,
+      );
+
     render({ screen: "library" });
-    expect([el.library.hidden, el.detail.hidden, el.range.hidden]).toEqual([false, true, true]);
+    expect(showing()).toEqual(["library"]);
     render({ screen: "target", selectedId: TARGET.id, targets: [TARGET] });
-    expect([el.library.hidden, el.detail.hidden, el.range.hidden]).toEqual([true, false, true]);
+    expect(showing()).toEqual(["detail"]);
     render({ screen: "range" });
-    expect([el.library.hidden, el.detail.hidden, el.range.hidden]).toEqual([true, true, false]);
+    expect(showing()).toEqual(["range"]);
+    render({ screen: "draft", draft: DRAFT });
+    expect(showing()).toEqual(["draft"]);
+    render({ screen: "midi", midi: { fileName: "tune", melodies: [MELODY] } });
+    expect(showing()).toEqual(["midi"]);
   });
 
   it("swaps the list for the empty state, and back", () => {
@@ -400,6 +533,191 @@ describe("the range check screen", () => {
     expect(el.rangeLow.classes.has("is-done")).toBe(true);
     expect(el.rangeHigh.textContent).toBe("High note");
     expect(el.rangeHigh.classes.has("is-done")).toBe(false);
+  });
+});
+
+describe("recording a melody to practise", () => {
+  it("starts a take, and becomes the only way out of it", () => {
+    const { el, handlers, render } = mountPractice();
+    render();
+    expect(el.addRecord.textContent).toBe("Record one");
+
+    el.addRecord.click();
+    expect(handlers.onRecordTarget).toHaveBeenCalledTimes(1);
+
+    render({ recordingTarget: true }, "recording");
+    expect(el.addRecord.textContent).toBe("Stop");
+    expect(el.addRecord.classes.has("is-recording")).toBe(true);
+    // A file picked mid-take would land on a draft the microphone is about to
+    // replace, so the other way in goes away while one is running.
+    expect(el.addMidiLabel.hidden).toBe(true);
+    expect(el.addMidiInput.disabled).toBe(true);
+
+    el.addRecord.click();
+    expect(handlers.onStopCapture).toHaveBeenCalledTimes(1);
+    expect(handlers.onRecordTarget).toHaveBeenCalledTimes(1);
+  });
+
+  it("never leaves a Stop over a microphone that is already closed", () => {
+    // The same split-state bug the range buttons have: `recordingTarget` is
+    // practice state, `phase` belongs to the transcriber, and a screen that
+    // trusted only the first would offer to stop a take that already ended.
+    const { el, render } = mountPractice();
+    render({ recordingTarget: true }, "idle");
+    expect(el.addRecord.textContent).toBe("Record one");
+    expect(el.addRecord.disabled).toBe(false);
+  });
+
+  it("locks the button while the take is being listened to", () => {
+    const { el, render } = mountPractice();
+    render({ recordingTarget: true }, "analyzing");
+    expect(el.addRecord.disabled).toBe(true);
+    expect(el.addMidiLabel.hidden).toBe(true);
+  });
+
+  it("offers every built-in melody, and reports which one was tapped", () => {
+    const { el, handlers } = mountPractice();
+    for (const melody of BUNDLED_MELODIES) {
+      expect(el.starters.innerHTML).toContain(`data-bundled="${melody.id}"`);
+    }
+    clickChild(el.starters, "data-bundled", "twinkle");
+    expect(handlers.onAddBundled).toHaveBeenCalledWith("twinkle");
+  });
+
+  it("hands over a picked MIDI file and forgets it immediately", () => {
+    const { el, handlers } = mountPractice();
+    const file = { name: "tune.mid" } as unknown as File;
+    el.addMidiInput.files = [file];
+    el.addMidiInput.dispatch("change");
+    expect(handlers.onMidiFile).toHaveBeenCalledWith(file);
+    // Cleared, or picking the same file again fires no `change` — which is
+    // exactly what you do after picking the wrong part out of it.
+    expect(el.addMidiInput.value).toBe("");
+  });
+});
+
+describe("the draft screen", () => {
+  it("shows every note, and greys the ones that are about to go", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "draft", draft: { ...DRAFT, keepFrom: 1, keepTo: 4 } });
+    const chips = el.draftNotes.innerHTML.split("</span></span>");
+    // Five chips, of which the first and last are struck out.
+    expect(el.draftNotes.innerHTML.match(/class="chip[ "]/g)).toHaveLength(5);
+    expect(chips[0]).toContain("is-dropped");
+    expect(chips[1]).not.toContain("is-dropped");
+    expect(el.draftMeta.textContent).toBe("3 notes · 1.2 s · 2 dropped");
+  });
+
+  it("moves the whole melody when the melody moved", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "draft", draft: DRAFT });
+    const before = el.draftNotes.innerHTML;
+    render({ screen: "draft", draft: { ...DRAFT, octaveShift: -1 } });
+    expect(el.draftNotes.innerHTML).not.toBe(before);
+    // Same shape, twelve semitones down: the first chip was C5, and is C4.
+    expect(el.draftNotes.innerHTML).toContain(">C4<");
+  });
+
+  it("stops trimming before the melody is gone", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "draft", draft: DRAFT });
+    expect(el.draftTrimStart.disabled).toBe(false);
+    expect(el.draftReset.disabled).toBe(true);
+
+    render({ screen: "draft", draft: { ...DRAFT, keepFrom: 2, keepTo: 3 } });
+    expect(el.draftTrimStart.disabled).toBe(true);
+    expect(el.draftTrimEnd.disabled).toBe(true);
+    expect(el.draftReset.disabled).toBe(false);
+  });
+
+  it("stops moving at the ends of the range it allows", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "draft", draft: { ...DRAFT, octaveShift: 3 } });
+    expect(el.draftHigher.disabled).toBe(true);
+    expect(el.draftLower.disabled).toBe(false);
+  });
+
+  it("reports every edit, and asks the caller to make it", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "draft", draft: DRAFT });
+    el.draftTrimStart.click();
+    el.draftTrimEnd.click();
+    el.draftReset.click();
+    el.draftLower.click();
+    el.draftHigher.click();
+    el.draftSave.click();
+    el.draftBack.click();
+    expect(handlers.onTrimDraft.mock.calls).toEqual([["start"], ["end"]]);
+    expect(handlers.onResetTrim).toHaveBeenCalledTimes(1);
+    expect(handlers.onShiftDraft.mock.calls).toEqual([[-1], [1]]);
+    expect(handlers.onSaveDraft).toHaveBeenCalledTimes(1);
+    expect(handlers.onDiscardDraft).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fight the user for the name field", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "draft", draft: DRAFT });
+    expect(el.draftName.value).toBe("Recorded now");
+
+    // A keystroke: the field reports it, and the render that follows must not
+    // write the old value back over what is being typed.
+    el.draftName.value = "Recorded now!";
+    el.draftName.dispatch("input");
+    expect(handlers.onRenameDraft).toHaveBeenCalledWith("Recorded now!");
+    render({ screen: "draft", draft: { ...DRAFT, name: "Recorded now!" } });
+    expect(el.draftName.value).toBe("Recorded now!");
+  });
+
+  it("says what an import had to decide, and stays quiet otherwise", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "draft", draft: DRAFT });
+    expect(el.draftNote.hidden).toBe(true);
+    expect(el.draftHint.textContent).toBe(DRAFT_HINT_RECORDED);
+
+    render({
+      screen: "draft",
+      draft: { ...makeDraft("midi", "Tune", DRAFT.notes, "Mostly chords."), source: "midi" },
+    });
+    expect(el.draftNote.hidden).toBe(false);
+    expect(el.draftNote.textContent).toBe("Mostly chords.");
+    expect(el.draftHint.textContent).toBe(DRAFT_HINT_IMPORTED);
+  });
+});
+
+describe("the MIDI part picker", () => {
+  it("lists the parts and reports the one that was tapped", () => {
+    const { el, handlers, render } = mountPractice();
+    render({ screen: "midi", midi: { fileName: "tune", melodies: [MELODY] } });
+    expect(el.midiTitle.textContent).toBe("tune");
+    expect(el.midiHint.textContent).toMatch(/One part/);
+    expect(el.midiList.innerHTML).toContain(">Lead<");
+    expect(el.midiList.innerHTML).toContain("2 notes · 1.0 s");
+
+    clickChild(el.midiList, "data-melody", "1:0");
+    expect(handlers.onPickMelody).toHaveBeenCalledWith("1:0");
+    el.midiBack.click();
+    expect(handlers.onCloseMidi).toHaveBeenCalledTimes(1);
+  });
+
+  it("warns about a part that is not a single line, before it is picked", () => {
+    const row = midiRowHtml({ ...MELODY, chordFraction: 0.4 });
+    expect(row).toMatch(/40%/);
+    expect(row).toMatch(/highest/);
+    // ...and says nothing about a part that is one.
+    expect(midiRowHtml(MELODY)).not.toMatch(/%/);
+  });
+
+  it("cannot be turned into markup by a name from the file", () => {
+    const row = midiRowHtml({ ...MELODY, name: '<img src=x onerror="boom">' });
+    expect(row).not.toContain("<img");
+    expect(row).toContain("&lt;img");
+    expect(row.match(/<button/g)).toHaveLength(1);
+  });
+
+  it("escapes a built-in melody's id and name too", () => {
+    expect(starterRowHtml({ id: 'a"b', name: "<b>" })).toBe(
+      '<button type="button" class="starter" data-bundled="a&quot;b">&lt;b&gt;</button>',
+    );
   });
 });
 

@@ -19,20 +19,48 @@ import { AudioFileError, decodeAudioFile } from "./audio/decode.js";
 import { isPlaying, startPlayback, stopPlayback } from "./audio/synth.js";
 import { downloadWav, takeFilename } from "./audio/wav-export.js";
 import { a4FromOffsetCents, transposeMidi } from "./notes/format.js";
+import { bundledMelody } from "./practice/bundled.js";
+import {
+  MAX_MELODY_NOTES,
+  MAX_MIDI_BYTES,
+  MidiError,
+  chordWarning,
+  midiMelodies,
+  parseMidi,
+  type MidiMelody,
+} from "./practice/midi.js";
 import { representativeMidi } from "./practice/range.js";
 import {
+  addTarget,
+  beginDraft,
   beginRangeStep,
+  beginTargetTake,
   captureRangeEnd,
+  discardDraft,
+  editDraft,
   endRangeStep,
+  endTargetTake,
   getPracticeState,
   removeTarget,
+  saveDraft,
   selectTarget,
   setPracticeMessage,
   showLibrary,
+  showMidiPicker,
   showRangeCheck,
   subscribePractice,
   type RangeStep,
 } from "./practice/store.js";
+import {
+  cleanTargetName,
+  defaultTargetName,
+  makeDraft,
+  resetDraftTrim,
+  shiftDraft,
+  targetFromNotes,
+  trimDraft,
+  type TargetDraft,
+} from "./practice/target.js";
 import { createControls } from "./ui/controls.js";
 import { createDebugView } from "./ui/debug.js";
 import { createLiveView, formatClock } from "./ui/live.js";
@@ -138,6 +166,10 @@ const practice = createPracticeView(
     empty: element("practice-empty"),
     rangeSummary: element("practice-range-summary"),
     rangeButton: element<HTMLButtonElement>("practice-range-open"),
+    addRecord: element<HTMLButtonElement>("practice-add-record"),
+    addMidiLabel: element("practice-add-midi"),
+    addMidiInput: element<HTMLInputElement>("practice-add-midi-input"),
+    starters: element("practice-starters"),
     detail: element("practice-target"),
     detailName: element("practice-target-name"),
     detailMeta: element("practice-target-meta"),
@@ -150,6 +182,24 @@ const practice = createPracticeView(
     rangeLow: element<HTMLButtonElement>("practice-range-low"),
     rangeHigh: element<HTMLButtonElement>("practice-range-high"),
     rangeDone: element<HTMLButtonElement>("practice-range-done"),
+    draft: element("practice-draft"),
+    draftBack: element<HTMLButtonElement>("practice-draft-back"),
+    draftHint: element("practice-draft-hint"),
+    draftNotes: element("practice-draft-notes"),
+    draftMeta: element("practice-draft-meta"),
+    draftNote: element("practice-draft-note"),
+    draftTrimStart: element<HTMLButtonElement>("practice-draft-trim-start"),
+    draftTrimEnd: element<HTMLButtonElement>("practice-draft-trim-end"),
+    draftReset: element<HTMLButtonElement>("practice-draft-reset"),
+    draftLower: element<HTMLButtonElement>("practice-draft-lower"),
+    draftHigher: element<HTMLButtonElement>("practice-draft-higher"),
+    draftName: element<HTMLInputElement>("practice-draft-name"),
+    draftSave: element<HTMLButtonElement>("practice-draft-save"),
+    midi: element("practice-midi"),
+    midiBack: element<HTMLButtonElement>("practice-midi-back"),
+    midiTitle: element("practice-midi-title"),
+    midiHint: element("practice-midi-hint"),
+    midiList: element("practice-midi-tracks"),
     message: element("practice-message"),
   },
   {
@@ -167,8 +217,123 @@ const practice = createPracticeView(
     },
     onStopCapture: finishRecording,
     onCloseRange: () => showLibrary(),
+
+    // Same ordering rule as the range take: the microphone first, the screen
+    // second, nothing awaited in between.
+    onRecordTarget: () => {
+      beginRecording("target");
+      beginTargetTake();
+    },
+    onMidiFile: importMidiFile,
+    onAddBundled: addBundledTarget,
+    onPickMelody: pickMidiMelody,
+    onCloseMidi: () => showLibrary(),
+
+    onTrimDraft: (end) => reviseDraft((draft) => trimDraft(draft, end)),
+    onResetTrim: () => reviseDraft(resetDraftTrim),
+    onShiftDraft: (delta) => reviseDraft((draft) => shiftDraft(draft, delta)),
+    onRenameDraft: (name) => reviseDraft((draft) => ({ ...draft, name })),
+    // The fallback only bites if the field was cleared: a target has to be
+    // called *something*, because its name is the only thing the library shows.
+    onSaveDraft: () => saveDraft(defaultTargetName()),
+    onDiscardDraft: () => discardDraft(),
   },
 );
+
+/** Apply an edit to whatever draft is on screen. */
+function reviseDraft(change: (draft: TargetDraft) => TargetDraft): void {
+  const draft = getPracticeState().draft;
+  if (draft) editDraft(change(draft));
+}
+
+/* ── Target sources ───────────────────────────────────────────────────
+ *
+ * Three ways in, one landing point. A recorded take arrives through the same
+ * capture-and-transcribe path as everything else in the app; a MIDI file is
+ * parsed on the spot; a built-in melody is already data. The first two stop at
+ * a draft so the user can trim, move and name; the third is already a finished
+ * melody and skips it.
+ */
+
+/** One of the melodies this build ships with. Already trimmed, already named,
+ *  and at its written pitch — so there is nothing to draft. */
+function addBundledTarget(id: string): void {
+  const melody = bundledMelody(id);
+  if (!melody) return;
+  addTarget(targetFromNotes(melody.name, "bundled", melody.notes));
+  setPracticeMessage(`Added “${melody.name}”.`);
+}
+
+/** The file's own name, without its extension, as the default target name. */
+function midiFileLabel(fileName: string): string {
+  return cleanTargetName(fileName.replace(/\.[^.]+$/, ""), "MIDI melody");
+}
+
+/**
+ * Read a MIDI file and offer what is in it.
+ *
+ * Everything platform-shaped is here — the `File`, its bytes — and the parse
+ * itself is pure and lives in `practice/midi.ts`, which is what lets it be
+ * tested against byte fixtures built in the test file rather than against `.mid`
+ * files committed to a public repo.
+ *
+ * A file with exactly one part skips the picker: choosing from a list of one is
+ * a tap that asks a question with no answer.
+ */
+function importMidiFile(file: File): void {
+  if (file.size > MAX_MIDI_BYTES) {
+    setPracticeMessage("That file is far larger than any melody needs to be.");
+    return;
+  }
+  void file.arrayBuffer().then(
+    (bytes) => {
+      let melodies: MidiMelody[];
+      try {
+        melodies = midiMelodies(parseMidi(new Uint8Array(bytes)));
+      } catch (error) {
+        console.error("[midi] could not read the file", error);
+        setPracticeMessage(
+          error instanceof MidiError
+            ? error.message
+            : "That file could not be read as a MIDI file.",
+        );
+        return;
+      }
+      if (melodies.length === 0) {
+        setPracticeMessage("There are no notes in that MIDI file.");
+        return;
+      }
+      const label = midiFileLabel(file.name);
+      if (melodies.length === 1) {
+        openMelodyDraft(melodies[0], label);
+        return;
+      }
+      showMidiPicker({ fileName: label, melodies });
+    },
+    (error: unknown) => {
+      console.error("[midi] could not open the file", error);
+      setPracticeMessage("That file could not be opened on this device.");
+    },
+  );
+}
+
+/** One part of the MIDI file on screen, chosen from the picker. */
+function pickMidiMelody(id: string): void {
+  const pick = getPracticeState().midi;
+  const melody = pick?.melodies.find((candidate) => candidate.id === id);
+  if (!pick || !melody) return;
+  openMelodyDraft(melody, `${pick.fileName} · ${melody.name}`);
+}
+
+/** Everything the import had to decide *for* the user goes on the draft screen
+ *  as a sentence, so a melody that lost notes says so before it is saved. */
+function openMelodyDraft(melody: MidiMelody, name: string): void {
+  const notes: string[] = [];
+  const chords = chordWarning(melody);
+  if (chords) notes.push(chords);
+  if (melody.truncated) notes.push(`Only the first ${MAX_MELODY_NOTES} notes were kept.`);
+  beginDraft(makeDraft("midi", cleanTargetName(name, "MIDI melody"), melody.notes, notes.join(" ")));
+}
 
 function renderPractice(): void {
   practice.render(getPracticeState(), getState().phase);
@@ -376,8 +541,21 @@ let lastTake: CapturedAudio | null = null;
  * analysis is scheduled, so a mode switch mid-analysis cannot redirect a take
  * that is already in flight.
  */
-type TakeIntent = "transcribe" | RangeStep;
+type TakeIntent = "transcribe" | RangeStep | "target";
 let takeIntent: TakeIntent = "transcribe";
+
+/**
+ * A practice take that ended badly, told to whichever screen started it.
+ *
+ * The transcriber's message line is not on screen in practice mode, so every
+ * failure has to be routed by intent rather than dropped into `AppState`. Both
+ * store calls also clear the flag the screen uses to decide whether a take is
+ * running, which is what stops a failed take leaving a Stop button behind.
+ */
+function practiceTakeFailed(intent: Exclude<TakeIntent, "transcribe">, message: string): void {
+  if (intent === "target") endTargetTake(message);
+  else endRangeStep(message);
+}
 
 /**
  * Called straight from the Record tap, with nothing awaited first: the audio
@@ -426,7 +604,8 @@ function beginRecording(intent: TakeIntent = "transcribe"): void {
         // The transcriber's error phase is a screen practice mode is not
         // showing, so the news has to go where the user is looking.
         setState({ phase: "idle", warning: null });
-        endRangeStep(
+        practiceTakeFailed(
+          intent,
           error instanceof CaptureError
             ? error.message
             : "Could not start recording on this device.",
@@ -461,16 +640,16 @@ setCaptureHandlers({
     // single most useful line there is when a take comes back empty on a
     // phone, and an interruption is no reason to throw it away.
     const processing = getState().warning;
-    const wasRangeTake = takeIntent !== "transcribe";
+    const intent = takeIntent;
     finishRecording();
 
-    if (wasRangeTake) {
+    if (intent !== "transcribe") {
       // The transcriber's status line is not on screen in practice mode, so
       // the news goes to the screen that is. When there *is* audio the
       // analysis that follows will report on it and this stays quiet rather
       // than writing a line the result immediately replaces.
       if (!getState().hasRecording) {
-        setPracticeMessage("That take was interrupted before any audio arrived.");
+        practiceTakeFailed(intent, "That take was interrupted before any audio arrived.");
       }
       return;
     }
@@ -507,7 +686,9 @@ function finishRecording(): void {
     // beats transcribing an empty buffer into a confident "no notes found"
     // about audio that was never recorded.
     setState({ phase: "idle", message: "", warning: null });
-    if (takeIntent !== "transcribe") endRangeStep("That take captured no audio.");
+    if (takeIntent !== "transcribe") {
+      practiceTakeFailed(takeIntent, "That take captured no audio.");
+    }
     return;
   }
   // Held so the debug export has something to save. One take at a time: at the
@@ -515,7 +696,46 @@ function finishRecording(): void {
   // starts.
   lastTake = take;
   setState({ phase: "analyzing", message: "", hasRecording: true });
-  analyze(take, takeIntent === "transcribe" ? "that take" : "that note");
+  analyze(take, TAKE_SUBJECTS[takeIntent]);
+}
+
+/** What a failed analysis is *about*, per intent — the one word that makes an
+ *  error message land on the thing the user was actually doing. */
+const TAKE_SUBJECTS: Record<TakeIntent, string> = {
+  transcribe: "that take",
+  low: "that note",
+  high: "that note",
+  target: "that melody",
+};
+
+/**
+ * Turn a take into a target the user can then trim, move and name.
+ *
+ * The pipeline is the transcriber's, unchanged, and that is what makes this
+ * work for a piano as well as for a whistle: `transcribe()` reports the closest
+ * note to whatever tone it heard, and a piano is a great deal more in tune than
+ * a whistle is. The one place it is unreliable is the bottom of the keyboard,
+ * where a string's fundamental can be quieter than its own harmonics and the
+ * octave above wins the spectral peak — which is exactly what the draft screen's
+ * move buttons are for, and what its hint warns about.
+ */
+function applyTargetTake(notes: readonly Note[]): void {
+  // Back to `idle` rather than `result`, for the reason `applyRangeTake` gives:
+  // practice mode is not showing a transcript, and leaving one behind would
+  // mean finding it on the other tab later.
+  setState({ phase: "idle", notes: [], frames: [], playingIndex: null, message: "" });
+
+  if (notes.length === 0) {
+    endTargetTake("Nothing tonal in that one — try it again a little louder.");
+    return;
+  }
+  beginDraft(
+    makeDraft(
+      "recorded",
+      defaultTargetName(),
+      notes.map((note) => ({ midi: note.midi, durSec: note.durationSec })),
+    ),
+  );
 }
 
 /**
@@ -618,6 +838,8 @@ function analyze(audio: CapturedAudio, subject: string): void {
         const result = transcribe(audio.samples, audio.sampleRate);
         if (intent === "transcribe") {
           applyResult(result.notes, result.frames, result.tuningOffsetCents);
+        } else if (intent === "target") {
+          applyTargetTake(result.notes);
         } else {
           applyRangeTake(intent, result.notes);
         }
@@ -625,7 +847,7 @@ function analyze(audio: CapturedAudio, subject: string): void {
         console.error("[transcribe] failed", error);
         if (intent !== "transcribe") {
           setState({ phase: "idle", notes: [], frames: [] });
-          endRangeStep("Something went wrong listening to that note. Try it again.");
+          practiceTakeFailed(intent, `Something went wrong listening to ${subject}. Try again.`);
           return;
         }
         // A take that crashed the segmenter is the most valuable recording this
