@@ -865,7 +865,11 @@ export function finishEchoAttempt(attempt: RecallAttempt): void {
   const echo = state.echo;
   if (!echo) return;
   const success = echoSucceeded(attempt.alignment);
-  const length = nextEchoLength(echo.length, success);
+  // Ramped from the phrase that was actually whistled, not from the ramp's
+  // current setting. Otherwise a second successful go at the *same* phrase —
+  // which is easier, because by then it is remembered — would move the ramp
+  // twice and hand out five notes after three.
+  const length = nextEchoLength(echo.phrase.length, success);
   const stats = recordDrillAttempt(state.stats, echo.phrase, attempt.alignment);
   setPracticeState({
     echo: {
@@ -873,7 +877,7 @@ export function finishEchoAttempt(attempt: RecallAttempt): void {
       recording: false,
       attempt,
       length,
-      ramp: echoRampText(echo.length, length),
+      ramp: echoRampText(echo.phrase.length, length),
     },
     stats,
     storageError: persistStats(stats),

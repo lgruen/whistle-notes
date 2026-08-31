@@ -344,6 +344,137 @@ Honest limitations, most of them structural:
 
 ---
 
+## Practice mode
+
+The second half of the app turns the transcriber around. Instead of *you* making
+a sound and the app naming it, the app makes a sound and you answer it — with a
+melody you saved, or a phrase it made up on the spot.
+
+### Ear-first, as a rule rather than a preference
+
+**No exercise ever shows you what to whistle.** Not a note name, not a staff, not
+a "starts low" hint. The app plays; you answer; names appear afterwards, as a
+report on what you actually did.
+
+That is a constraint, not a style choice. Reading "whistle a C6" and whistling a
+C6 is a *different skill* from hearing a note and matching it, and it is the
+harder one for someone whose music theory is thin — a practice app that quietly
+substituted it would be teaching sight-reading and calling it ear training. The
+rule survives in the codebase as a narrower claim that is easy to check: **the
+app names what you did, never what it wanted.** A wrong note is named, an extra
+note is named; a missed note and the ghost outline behind every target are drawn
+as a position and a distance. A test greps the practice markup and every
+user-facing sentence for pitch names and interval words, so the rule cannot rot
+into an intention.
+
+### Telling five kinds of wrong apart
+
+Scoring an echo looks trivial and is not. Nobody echoes a phrase in the register
+it played in — a beginner reproduces the *shape*, wherever their mouth is
+comfortable — so comparing absolute pitches would mark a perfect attempt
+completely wrong. And one dropped note shifts every later note by a slot, so
+comparing position by position would report ten failures where there was one.
+
+So the attempt is aligned against the target with Needleman–Wunsch, once per
+candidate transposition, keeping the shift that fits best. Three constants decide
+everything, and their *relationships* matter far more than their values:
+
+| | | |
+|---|---|---|
+| gap | 1 | a target note left unsung, or a note that answers to nothing |
+| substitution | 0 → 1.5 | zero within 30 cents, rising, flat past a whole tone |
+| duration | ≤ 0.02 | a tie-break, never a verdict |
+
+**`substitution_max < 2 × gap` is the anti-cascade guarantee.** Pairing two notes
+always costs less than throwing both away, *whatever* they are — an octave apart,
+a tritone apart, anything. So the aligner can never answer "you missed a note and
+added one" where the honest answer is "you sang one wrong note". That failure is
+the one that makes a diff useless, because it turns one mistake into two and
+pushes the error's location off by a slot. It is a theorem here rather than a
+hope, and the test suite sweeps it directly.
+
+Rhythm never fails a note. Duration enters only as a tie-break worth two
+hundredths of a gap, after both sides have been normalised by their own median —
+so a slow echo of a fast phrase costs nothing, and the only thing rhythm decides
+is genuinely undecidable on pitch alone: which of three identical repeated notes
+was the one you dropped.
+
+What comes out is a verdict per slot:
+
+- **clean** — within 30 cents. The note, wobble and all.
+- **off** — 30 to 70 cents. Recognisably the right note, missed by your mouth.
+- **wrong** — 70 cents or more. A different note came out, and the app names it.
+- **missing** — never sung.
+- **extra** — sung, and answering to nothing in the melody.
+
+### Three problems that all look like "wrong notes"
+
+The reason those five categories are worth the trouble is that a beginner's
+mistakes have at least three different causes, and they want completely different
+practice:
+
+- **Production.** You know the note and your mouth misses it. Shows up as `off`
+  verdicts and as a wide, wandering pitch trail.
+- **Memory.** You do not have the melody. Shows up as `missing` slots, or as the
+  same slot going wrong attempt after attempt.
+- **Interval knowledge.** You know the tune but not how far the next jump is.
+  Shows up as `wrong` verdicts clustered on particular *steps* rather than on
+  particular positions.
+
+So the history is aggregated along two different axes. Per slot of one melody
+("bar three has beaten me nine times out of ten") and per **directed interval** —
+keyed by the signed semitone step, because a rising minor 3rd and a falling one
+are genuinely different skills. Both keep production and wrong-notes apart: the
+cents average only ever averages slots that came out as the *right* note, since a
+wrong note's residual can be 1200 cents and is not a fact about aim at all.
+
+And the exercises line up with the causes. **Hold a note** is production with
+memory and intervals removed — one reference tone, held back, scored as a median
+offset and a wobble width. **Echo a phrase** is interval knowledge with memory
+removed — the phrase is generated, so there is nothing to have practised.
+**Melody recall** is all three at once, which is why it needs the diff.
+
+### Drills that follow the weakness
+
+Each attempt folds into an EWMA per directed interval — a short one, half-life
+about two and a half observations, because the question is "is this a problem
+*today*". A weakness score combines the two failure modes at their natural
+scales: the wrong-note rate, plus at most half a point of aim error measured in
+units of the 70 cents where off-pitch stops being off-pitch.
+
+The phrase generator turns that into a **bias, not a filter**. Every step from a
+semitone to an octave keeps a base weight (small steps common, leaps rare), and a
+weak interval's weight is multiplied up — at most about five and a half times, so
+a weak 6th gets drilled roughly as often as an ordinary step and never crowds
+everything else out. Three reasons it is a multiplier rather than a whitelist:
+with no history every multiplier is 1 and the generator *is* a plain random walk,
+so the cold-start fallback is not a second code path; a drill that only played
+your three worst intervals would stop being an ear test; and over-sampling an
+interval is what *changes* its average, so the bias has to be gentle enough for
+the statistic to climb back out. Phrases ramp from three notes to six as you get
+them.
+
+One detail worth knowing, because getting it wrong would be invisible: the hold
+drill scores the **raw** pitch trail. The transcriber measures each take's global
+tuning bias and takes it out before rounding to note names — which is exactly the
+bias the hold drill exists to report. Feed it a corrected trail and a whistler who
+sits 40 cents sharp on every single note is told they are perfect, by a machine
+that quietly moved the target to meet them.
+
+### Whistling along
+
+There is also a warm-up: the melody scrolls past on a roll, the synth plays it,
+and your own pitch is drawn over the top in real time. Nothing is scored and
+nothing is stored, and that is what makes it possible at all — it is the one
+place the app opens the microphone and the speaker together. Everywhere else that
+is forbidden, because echo cancellation is switched off on purpose (speech AEC
+eats a sustained whistle) and the phone would otherwise transcribe its own
+playback. Here the microphone's output goes nowhere but a line on a canvas, so
+the worst the echo can do is trace the melody faintly under you. The screen says
+so, and suggests headphones.
+
+---
+
 ## Development
 
 ```sh

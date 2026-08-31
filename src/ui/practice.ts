@@ -71,6 +71,8 @@ import type {
   RangeStep,
   RecallAttempt,
 } from "../practice/store.js";
+import type { Voice } from "../audio/synth.js";
+import { VOICE_LABELS, otherVoice } from "./controls.js";
 import { drawDiffOverlay } from "./diffroll.js";
 import { drawFollowRoll } from "./followroll.js";
 import type { Phase } from "./state.js";
@@ -98,6 +100,10 @@ export interface PracticeElements {
    *  guessed register. Hidden once there is a measurement. */
   drillNote: HTMLElement;
 
+  /** The playback voice, again. The transcriber's toggle lives in a dock this
+   *  mode hides, and everything here is something the app plays *at* you. */
+  voice: HTMLButtonElement;
+
   detail: HTMLElement;
   detailName: HTMLElement;
   detailMeta: HTMLElement;
@@ -107,6 +113,9 @@ export interface PracticeElements {
   detailPractice: HTMLButtonElement;
   /** Starts the follow-along warm-up on it. */
   detailFollow: HTMLButtonElement;
+  /** The nudge towards the range check, when this melody is about to be played
+   *  at whatever pitch it was written at. Hidden once there is a measurement. */
+  detailRange: HTMLElement;
   /** The whole history block; hidden until there is an attempt in it. */
   detailHistory: HTMLElement;
   /** One bar per slot, tinted by how often it has gone wrong. */
@@ -159,7 +168,7 @@ export interface PracticeElements {
   holdNext: HTMLButtonElement;
 
   /* The phrase-echo drill, before the attempt. Shares the result screen with
-     recall — see `resultSource` — because a diff of a whistled phrase against
+     recall — see `resultOwner` — because a diff of a whistled phrase against
      the phrase that played is the same picture either way. */
   echo: HTMLElement;
   echoBack: HTMLButtonElement;
@@ -279,6 +288,8 @@ export interface PracticeHandlers {
   onEchoNext(): void;
   /** Leave either drill. */
   onCloseDrill(): void;
+  /** Switch the playback voice. The same preference the dock's toggle sets. */
+  onVoice(voice: Voice): void;
 
   /* Follow along. */
   onFollow(id: string): void;
@@ -298,10 +309,16 @@ export interface PracticeHandlers {
 }
 
 export interface PracticeView {
-  /** `playing` is the synth's own state, and it is needed for the same reason
-   *  `phase` is: the Listen button must never offer to stop a playback that has
-   *  already ended, and the two facts are owned by different modules. */
-  render(state: PracticeState, phase: Phase, playing?: boolean): void;
+  /**
+   * `playing` is the synth's own state, and it is needed for the same reason
+   * `phase` is: the Listen button must never offer to stop a playback that has
+   * already ended, and the two facts are owned by different modules.
+   *
+   * `voice` comes from the same place for the same reason — it is a preference
+   * shared with the transcriber, owned by `ui/state.ts`, and this mode only
+   * needs to show which one is on.
+   */
+  render(state: PracticeState, phase: Phase, playing?: boolean, voice?: Voice): void;
 }
 
 /**
@@ -528,6 +545,23 @@ export const DRILL_RANGE_NUDGE =
 
 export function drillRangeNote(range: WhistleRange | null): string {
   return isDefaultRange(range) ? DRILL_RANGE_NUDGE : "";
+}
+
+/**
+ * The same nudge, on a melody that is about to be played at its written pitch.
+ *
+ * Worth saying *here* rather than only on the library's range card, because
+ * this is the screen where it is about to matter: an unmeasured whistler gets a
+ * melody in whatever register it was written in, which for a MIDI import is
+ * often somewhere nobody can whistle at all — and then every attempt comes back
+ * as a register error the app introduced.
+ */
+export const TARGET_RANGE_NUDGE =
+  "This will play at the pitch it was written at until you measure where you " +
+  "actually whistle — it takes two short takes.";
+
+export function targetRangeNote(range: WhistleRange | null): string {
+  return isDefaultRange(range) ? TARGET_RANGE_NUDGE : "";
 }
 
 /**
@@ -852,6 +886,12 @@ export function createPracticeView(
   elements.drillHold.addEventListener("click", () => handlers.onOpenHold());
   elements.drillEcho.addEventListener("click", () => handlers.onOpenEcho());
 
+  // Reads the voice off the button rather than off a closure variable, so the
+  // control cannot disagree with what it is showing.
+  elements.voice.addEventListener("click", () => {
+    handlers.onVoice(otherVoice(elements.voice.dataset.voice === "supersaw" ? "supersaw" : "clean"));
+  });
+
   elements.holdBack.addEventListener("click", () => handlers.onCloseDrill());
   elements.holdPlay.addEventListener("click", () => {
     if (elements.holdPlay.dataset.running === "true") handlers.onStopListen();
@@ -1018,7 +1058,7 @@ export function createPracticeView(
   let renderedChips = "";
 
   return {
-    render(state, phase, playing = false) {
+    render(state, phase, playing = false, voice = "clean") {
       const recall = state.screen === "recall" ? state.recall : null;
       const echo = state.screen === "echo" ? state.echo : null;
       const hold = state.screen === "hold" ? state.hold : null;
@@ -1113,6 +1153,18 @@ export function createPracticeView(
       elements.drillNote.textContent = drillNote;
       elements.drillNote.hidden = drillNote === "";
 
+      // One preference, two places to set it: the dock's toggle is in a bar
+      // this mode hides, and everything in here is something the app plays at
+      // you. `data-voice` is what the click handler reads back, so the control
+      // and its label cannot drift apart.
+      elements.voice.dataset.voice = voice;
+      elements.voice.textContent = VOICE_LABELS[voice];
+      elements.voice.classList.toggle("is-supersaw", voice === "supersaw");
+      elements.voice.setAttribute(
+        "aria-label",
+        `Playback sound: ${VOICE_LABELS[voice]}. Tap to switch.`,
+      );
+
       const selected = state.targets.find((target) => target.id === state.selectedId) ?? null;
       if (selected) {
         const summary = targetSummary(selected);
@@ -1121,6 +1173,9 @@ export function createPracticeView(
         elements.detailDelete.setAttribute("data-target", selected.id);
         elements.detailPractice.setAttribute("data-target", selected.id);
         elements.detailFollow.setAttribute("data-target", selected.id);
+        const detailNote = targetRangeNote(state.range);
+        elements.detailRange.textContent = detailNote;
+        elements.detailRange.hidden = detailNote === "";
 
         // The history block, which is also the answer to "is this melody
         // getting easier?". Absent until there is something in it: an empty
@@ -1195,7 +1250,10 @@ export function createPracticeView(
         // The reference has to have *stopped* before the take starts: there is
         // no echo cancellation anywhere in this app, so a note still sounding
         // would be measured as part of the hold.
-        elements.holdWhistle.disabled = analysing || playing;
+        // ...and not before the reference has been heard at all: a needle
+        // centred on a note nobody played is not a drill, it is a tuner
+        // pointed at a secret.
+        elements.holdWhistle.disabled = analysing || playing || hold.plays === 0;
         elements.holdBack.disabled = holding || analysing;
 
         const lines = hold.score ? holdResultLines(hold.score) : null;

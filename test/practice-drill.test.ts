@@ -357,6 +357,20 @@ describe("echoPhrase", () => {
     }
   });
 
+  it("stays inside even a register it had to invent", () => {
+    // A measurement so narrow that `drillRange` had to widen it. The walk must
+    // still have somewhere legal to step, or a phrase would wander out of the
+    // register it was generated for.
+    const measured = { lowMidi: 84, highMidi: 84 };
+    const range = drillRange(measured);
+    for (let seed = 0; seed < 100; seed++) {
+      for (const note of echoPhrase(makeRng(seed), { length: 6, range: measured })) {
+        expect(note.midi).toBeGreaterThanOrEqual(range.lowMidi);
+        expect(note.midi).toBeLessThanOrEqual(range.highMidi);
+      }
+    }
+  });
+
   it("clamps its length to what the drill asks for", () => {
     expect(echoPhrase(makeRng(1), { length: 1 })).toHaveLength(ECHO_MIN_NOTES);
     expect(echoPhrase(makeRng(1), { length: 99 })).toHaveLength(ECHO_MAX_NOTES);

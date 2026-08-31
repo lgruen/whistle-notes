@@ -101,11 +101,26 @@ export function statusLines(state: Pick<AppState, "message" | "warning">): reado
 }
 
 /** What each voice is called on its button. Short on purpose: this is the
- *  fourth control in a dock that still has to fit across a 360 px phone. */
-const VOICE_LABELS: Record<Voice, string> = {
+ *  fourth control in a dock that still has to fit across a 360 px phone.
+ *
+ *  Exported because practice mode hides this dock and has a toggle of its own —
+ *  one preference, one set of names for it. */
+export const VOICE_LABELS: Record<Voice, string> = {
   clean: "Clean",
   supersaw: "Supersaw",
 };
+
+/**
+ * The voice a toggle switches *to*.
+ *
+ * Written out rather than derived from `VOICES` for the reason the dock's own
+ * handler is: a third voice would need a different control here anyway, and a
+ * silent modulo would turn "the other one" into "the next one" without anybody
+ * deciding to.
+ */
+export function otherVoice(voice: Voice): Voice {
+  return voice === "supersaw" ? "clean" : "supersaw";
+}
 
 export function createControls(
   elements: ControlElements,
@@ -137,11 +152,8 @@ export function createControls(
   // A single two-state button rather than a segmented pair: the dock has no
   // room for a control that shows you both options, and with exactly two voices
   // "what you have" and "what you get if you tap" carry the same information.
-  // The flip is written out rather than derived from `VOICES` because a third
-  // voice would need a different control here anyway, and a silent modulo would
-  // hide that.
   elements.voice.addEventListener("click", () => {
-    handlers.onVoice(voice === "supersaw" ? "clean" : "supersaw");
+    handlers.onVoice(otherVoice(voice));
   });
 
   elements.importInput.addEventListener("change", () => {

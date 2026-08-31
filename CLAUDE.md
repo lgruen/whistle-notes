@@ -126,9 +126,11 @@ index.html            entry; src/main.ts is the only script; holds the whole
                       layout — header (mode tabs + transpose toggle), then two
                       sibling views: #transcribe-view (live readout, roll, note
                       list, staff, tools/debug) and #practice-view (library,
-                      draft, MIDI picker, range, target detail, and the two
-                      halves of the recall exercise: #practice-recall before an
-                      attempt and #practice-result after it), plus the dock with
+                      draft, MIDI picker, range, target detail, the two drills
+                      #practice-hold and #practice-echo, the follow-along
+                      #practice-follow, and the two halves of an echo exercise:
+                      #practice-recall / #practice-echo before an attempt and
+                      the shared #practice-result after it), plus the dock with
                       record/play/voice/import — which belongs to the
                       transcriber alone and is hidden in practice mode, whose
                       actions live on whichever screen is showing
@@ -142,15 +144,18 @@ src/
                       segment index
   notes/format.ts     re-exports dsp/tuning + display transposition, staff steps
   practice/           PURE island (except store.ts). align (the diagnosis DP),
-                      stats (+ attempt history), range, target (+ drafts),
-                      recall (the exercise: playback layout, diff overlay
-                      layout, verdict strip, the sentences), midi (SMF parser),
-                      bundled (starter melodies), store (the only storage)
+                      stats (+ attempt history + hold averages), range, target
+                      (+ drafts), recall (the exercise: playback layout, diff
+                      overlay layout, verdict strip, the sentences), drill (the
+                      two echo drills: seeded RNG, hold scoring, the adaptive
+                      phrase generator), follow (warm-up layout + timing), midi
+                      (SMF parser), bundled (starter melodies), store (the only
+                      storage)
   audio/              browser-only: capture (mic + worklet), decode (file
                       import), synth (playback voices), wav-export (debug
                       download)
   ui/                 controls state theme live notelist pianoroll diffroll
-                      staff debug sw-update practice
+                      followroll holdmeter staff debug sw-update practice
 public/
   pcm-recorder.worklet.js   plain-JS AudioWorklet forwarder (not bundled)
   icons/                    generated PNGs — commit them (192/512/maskable/
@@ -168,7 +173,7 @@ test/
                       fixtures, wav, harness, architecture, fft interop, golden,
                       ui-* for the app modules, and practice-* for the
                       diagnosis engine, the store, the sources, the recall
-                      exercise and the screens)
+                      exercise, the drills, the warm-up and the screens)
   fixtures/synth.ts   synthetic signal generator
   fixtures/local/     gitignored; the real recordings live here
 ```
@@ -184,9 +189,19 @@ in the config comments does not exist on screen yet.
 
 ## Practice mode
 
-The second half of the app: a library of target melodies, and (from T3 on) the
-exercises that play them at you and score what comes back. See the ear-first
-hard rule above before touching any of its copy.
+The second half of the app: a library of target melodies, and the exercises
+that play them at you and score what comes back. See the ear-first hard rule
+above before touching any of its copy.
+
+Four exercises, and they are deliberately not four flavours of the same thing —
+each removes a different cause of failure so the remaining one can be measured:
+
+| exercise | screen | asks | writes |
+| --- | --- | --- | --- |
+| Melody recall | `recall` → `result` | memory + intervals + production | interval ledger + per-target history |
+| Hold a note | `hold` | production alone | two hold averages |
+| Echo a phrase | `echo` → `result` | intervals, memory removed | interval ledger only |
+| Follow along | `follow` | nothing — a warm-up | nothing |
 
 ### One microphone, two modes
 
@@ -208,7 +223,8 @@ recorded as a target, an attempt at one — goes through the same `startRecordin
 notes go afterwards, and that is carried by one variable:
 
 ```ts
-type TakeIntent = "transcribe" | RangeStep | "target" | "attempt";
+type TakeIntent =
+  | "transcribe" | RangeStep | "target" | "attempt" | "hold" | "echo" | "follow";
 ```
 
 It is **read once, when the analysis is scheduled**, so a mode switch or a fresh
@@ -218,7 +234,12 @@ by intent through `practiceTakeFailed`, because the transcriber's message line i
 not on screen in practice mode — and each of those store calls also clears the
 flag the screen uses to decide whether a Stop button belongs over an open
 microphone. If you add a new kind of take, add an arm here; do not fork the
-record path.
+record path — and add a `TAKE_SUBJECTS` entry, which is exhaustive over the
+intents so a new one has to say what it is about.
+
+`"follow"` is the one arm that never reaches `analyze`: `finishRecording` drops
+its samples outright, because the warm-up scores nothing and a minute of FFTs
+for a screen that never had a result is pure heat.
 
 ### Storage
 
@@ -359,6 +380,102 @@ exist because a whistled take needs one note off each end and a MIDI import
 needs sixty. Drafts are never persisted — restoring a half-made
 target on the next launch would confront the user with notes they no longer
 remember recording.
+
+### The echo drills (T4)
+
+Both open from the library and neither needs a target. `src/practice/drill.ts` is
+pure and takes an **injected `Rng`** — the impure `Math.random` default lives in
+`store.ts`, where the rest of the platform does — which is what makes a phrase
+reproducible from a seed and the adaptive bias measurable in a test rather than
+by eye.
+
+**Hold a note.** A reference plays for 2.5 s, then *stops*, and the user holds it
+back into silence: there is no echo cancellation anywhere in this app, so a
+reference still sounding would be measured as part of the take. While the take
+runs, `ui/holdmeter.ts` drives a needle centred on **the reference**, not on the
+nearest semitone — the transcriber's readout would snap to the note below for
+someone 60 cents flat and then congratulate them at +40. The bar spans ±100 cents
+rather than the transcriber's ±50, because a beginner's first holds land 40–80
+cents out and a needle jammed against the wall shows no improvement.
+
+`scoreHold` takes the longest continuously-voiced stretch, drops the first 25% (a
+whistle *scoops* into its note; including the approach reports a hold as flat),
+and reports the median offset and half the interquartile range. Median and IQR
+because one cracked frame where the breath ran out would move a mean by tens of
+cents and a standard deviation by hundreds.
+
+**The trail must be uncorrected**: `applyHoldTake` calls
+`trailFromFrames(frames, 0)`, deliberately dropping the take's global tuning
+offset. That correction exists to rescue a consistently-sharp whistler from
+coin-flip note names, and it works by measuring exactly the bias this drill
+reports. Pass it in and the drill congratulates the person it is supposed to be
+diagnosing. There is a test named after this.
+
+**Echo a phrase.** `echoPhrase` walks the drill register in steps drawn from
+weighted candidates: ±1–4 semitones common, ±5–7 occasional, ±8–12 rare. The
+third tier is a deliberate extension of the original plan sketch, which stopped
+at 7 — this user's measured weaknesses are 3rds, 6ths and 7ths, and a 6th is nine
+semitones, so a generator that stopped there could never once drill the thing it
+exists for.
+
+`stepWeights` multiplies a weak interval's weight by `1 + 3 × weakness`
+(`intervalWeakness` tops out near 1.5, so ×5.5 at worst). It is a **bias, not a
+filter**, and the fallback is not a branch: with no history every multiplier is 1
+and the generator is exactly the plain random walk. A test asserts that as an
+*identity* on seeded output, so a second code path cannot appear unnoticed.
+`ECHO_MIN_OBSERVATIONS` (5) is higher than `weakestIntervals`' own default,
+because a drill that decided your rising 4th is a weakness after two unlucky
+attempts would keep asking for it for a week.
+
+The ramp moves one note per attempt inside 3–6, and counts `clean` **or** `off`
+as a success: demanding 30-cent accuracy from a beginner's whistle before the
+phrase grows would mean it never moved. Aim is the other drill's question.
+
+**One ledger.** `foldIntervals` in `stats.ts` is the only place directed-interval
+statistics are written, and both `recordAttempt` (recall) and `recordDrillAttempt`
+(the drill) go through it. This matters more than it looks: the drill *reads those
+same numbers back* to choose the next phrase, so a second accumulator with its
+own idea of what a `missing` slot means would show up as a drill quietly
+practising the wrong thing for months without ever throwing. A generated phrase
+keeps **no** per-slot history — a heatmap of "the third note of whatever it was"
+is not a fact about anything.
+
+The hold drill's two EWMAs live in `PracticeStats.holds` and were added
+**without a version bump**, for the reason `history` was: the field is additive,
+and a bump would make an older build discard a year of interval statistics rather
+than ignore four numbers.
+
+### Follow along (T5), and the one place the mic/speaker rule is broken
+
+`startPlayback` refuses while the microphone is open, enforced at the resource
+rather than by a disabled button. The warm-up needs both, so it calls a
+*different* exported function — `startPlaybackOverMicrophone` — chosen over a
+flag so the exemption is greppable and provably has one caller.
+
+What makes it safe is not anything the synth does. The microphone really does
+hear the speaker. It is what the caller does with the audio: **nothing**. No
+transcription, no alignment, no statistics; `finishRecording` drops the samples
+on the `"follow"` intent. The worst the echo can do is trace the melody faintly
+under the user's own line, and the screen says so and suggests headphones. **If
+follow-along ever grows a score, the exemption has to go with it** — that is
+written on both sides of the call.
+
+Device caveat, untested rather than asserted: two `AudioContext`s coexist fine on
+Android, but on iOS the audio session is still record-capable while the mic is
+open, which is what the earpiece-routing trap actually keys off. A warm-up may
+come out quiet on an iPhone.
+
+**One clock.** The playhead runs on the animation clock offset by
+`PLAYBACK_LEAD_SEC`, and each trail point is placed wherever the playhead is that
+frame, carrying whatever pitch the microphone last reported. So the trail lags by
+the analysis latency (a 43 ms window plus a block or two) and nothing has to
+reconcile the capture context's clock with the playback context's. That trade is
+only honest because nothing here is measured.
+
+The roll is **fixed with a moving playhead** rather than scrolling: to show a
+note early enough to prepare for it, a scrolling window would have to be about
+two seconds wide at phone width, and then there is nothing to anticipate beyond
+two seconds — which is the opposite of what a warm-up wants.
 
 ## Dev loop
 

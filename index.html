@@ -165,6 +165,15 @@
             <p class="card-body" id="practice-range-summary"></p>
             <button type="button" class="ghost" id="practice-range-open"></button>
           </div>
+
+          <!-- The playback voice again. Its other toggle lives in the dock,
+               which this mode hides — and every sound in here is one the app
+               plays at you, so it belongs on this screen too. -->
+          <div class="card">
+            <h3 class="card-title">Playback sound</h3>
+            <p class="card-body">What melodies and drills are played with.</p>
+            <button type="button" class="ghost" id="practice-voice">Clean</button>
+          </div>
         </section>
 
         <!-- The draft: a melody that has arrived but is not a target yet.
@@ -232,6 +241,7 @@
           <h2 class="practice-title" id="practice-target-name"></h2>
           <p class="practice-meta" id="practice-target-meta"></p>
           <p class="card-body" id="practice-target-next"></p>
+          <p class="card-body" id="practice-target-range" hidden></p>
           <div class="add-row">
             <button type="button" class="btn btn-save" id="practice-target-practice">
               Practice this

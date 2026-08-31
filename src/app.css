@@ -571,6 +571,14 @@ button {
   color: var(--danger);
 }
 
+/* The practice-side voice toggle, lit for the non-default voice exactly as the
+   dock's is — so "why does it sound like that" has the same visible answer in
+   both halves of the app. */
+.ghost.is-supersaw {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 /* ── Getting a melody in ────────────────────────────────────────────── */
 
 .add-row {

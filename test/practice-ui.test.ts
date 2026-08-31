@@ -51,6 +51,7 @@ import {
   recallHint,
   starterRowHtml,
   targetRowHtml,
+  TARGET_RANGE_NUDGE,
   troubleText,
   verdictStripHtml,
   type PracticeElements,
@@ -347,12 +348,14 @@ const ELEMENT_KEYS = [
   "drillHold",
   "drillEcho",
   "drillNote",
+  "voice",
   "detail",
   "detailName",
   "detailMeta",
   "detailNext",
   "detailPractice",
   "detailFollow",
+  "detailRange",
   "detailHistory",
   "detailHeat",
   "detailTrouble",
@@ -436,6 +439,7 @@ function mountPractice(): {
     patch?: Partial<PracticeState>,
     phase?: "idle" | "recording" | "analyzing",
     playing?: boolean,
+    voice?: "clean" | "supersaw",
   ) => void;
 } {
   const el = Object.fromEntries(ELEMENT_KEYS.map((key) => [key, stub()])) as Screen;
@@ -476,6 +480,7 @@ function mountPractice(): {
     onEchoRetry: vi.fn(),
     onEchoNext: vi.fn(),
     onCloseDrill: vi.fn(),
+    onVoice: vi.fn(),
     onFollow: vi.fn(),
     onFollowStart: vi.fn(),
     onFollowStop: vi.fn(),
@@ -506,8 +511,8 @@ function mountPractice(): {
   return {
     el,
     handlers,
-    render: (patch = {}, phase = "idle", playing = false) =>
-      view.render({ ...base, ...patch }, phase, playing),
+    render: (patch = {}, phase = "idle", playing = false, voice = "clean") =>
+      view.render({ ...base, ...patch }, phase, playing, voice),
   };
 }
 
@@ -1333,6 +1338,15 @@ describe("the hold drill", () => {
     expect(el.holdPlay.textContent).toBe("Hear it");
   });
 
+  it("will not take a hold before the reference has been heard", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "hold", hold: HOLD });
+    // A needle centred on a note nobody played is not a drill.
+    expect(el.holdWhistle.disabled).toBe(true);
+    render({ screen: "hold", hold: { ...HOLD, plays: 1 } });
+    expect(el.holdWhistle.disabled).toBe(false);
+  });
+
   it("hides both ways on until there is a score to move on from", () => {
     const { el, render } = mountPractice();
     render({ screen: "hold", hold: HOLD });
@@ -1517,5 +1531,43 @@ describe("the follow-along warm-up", () => {
     el.followStart.click();
     expect(handlers.onFollowStop).toHaveBeenCalledTimes(1);
     expect(handlers.onFollowStart).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("polish", () => {
+  it("nudges towards the range check on the screen where it is about to matter", () => {
+    const { el, render } = mountPractice();
+    render({ screen: "target", targets: [TARGET], selectedId: TARGET.id });
+    expect(el.detailRange.hidden).toBe(false);
+    expect(el.detailRange.textContent).toBe(TARGET_RANGE_NUDGE);
+    expect(TARGET_RANGE_NUDGE, TARGET_RANGE_NUDGE).not.toMatch(PITCH_NAME);
+    expect(TARGET_RANGE_NUDGE, TARGET_RANGE_NUDGE).not.toMatch(INTERVAL_WORDS);
+
+    render({
+      screen: "target",
+      targets: [TARGET],
+      selectedId: TARGET.id,
+      range: { lowMidi: 79, highMidi: 91 },
+    });
+    expect(el.detailRange.hidden).toBe(true);
+  });
+
+  it("offers the playback voice on a screen that hides the dock", () => {
+    const { el, handlers, render } = mountPractice();
+    render({}, "idle", false, "clean");
+    expect(el.voice.textContent).toBe("Clean");
+    expect(el.voice.dataset.voice).toBe("clean");
+    expect(el.voice.classes.has("is-supersaw")).toBe(false);
+
+    // The click reads the voice off the button, so what it switches to can
+    // never disagree with what it is showing.
+    el.voice.click();
+    expect(handlers.onVoice).toHaveBeenCalledWith("supersaw");
+
+    render({}, "idle", false, "supersaw");
+    expect(el.voice.textContent).toBe("Supersaw");
+    expect(el.voice.classes.has("is-supersaw")).toBe(true);
+    el.voice.click();
+    expect(handlers.onVoice).toHaveBeenLastCalledWith("clean");
   });
 });

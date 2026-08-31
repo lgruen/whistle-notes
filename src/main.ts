@@ -235,12 +235,14 @@ const practice = createPracticeView(
     drillHold: element<HTMLButtonElement>("practice-drill-hold"),
     drillEcho: element<HTMLButtonElement>("practice-drill-echo"),
     drillNote: element("practice-drill-note"),
+    voice: element<HTMLButtonElement>("practice-voice"),
     detail: element("practice-target"),
     detailName: element("practice-target-name"),
     detailMeta: element("practice-target-meta"),
     detailNext: element("practice-target-next"),
     detailPractice: element<HTMLButtonElement>("practice-target-practice"),
     detailFollow: element<HTMLButtonElement>("practice-target-follow"),
+    detailRange: element("practice-target-range"),
     detailHistory: element("practice-target-history"),
     detailHeat: element("practice-target-heat"),
     detailTrouble: element("practice-target-trouble"),
@@ -392,6 +394,10 @@ const practice = createPracticeView(
       stopPlayback();
       closeDrill();
     },
+    // The same store call the dock's toggle makes, and with the same rule: a
+    // running playback is left alone, because it is the right notes in a
+    // different colour. See `setVoice`.
+    onVoice: setVoice,
 
     onFollow: beginFollow,
     onFollowStart: startFollowAlong,
@@ -620,6 +626,11 @@ function startFollowAlong(): void {
  * context's clock with the playback context's. Nothing here is measured, which
  * is what makes that trade honest.
  */
+/** How long a reading lingers after the whistle stops — the same quarter second
+ *  the live readout uses, so a held note draws one line rather than a dotted
+ *  one. */
+const FOLLOW_HOLD_SEC = 0.25;
+
 function followLoop(timestampMs: number): void {
   followHandle = requestAnimationFrame(followLoop);
   const model = followRoll;
@@ -645,20 +656,29 @@ function followLoop(timestampMs: number): void {
   if (followDone(elapsed, model)) stopFollowAlong();
 }
 
-/** How long a reading lingers after the whistle stops — the same quarter second
- *  the live readout uses, so a held note draws one line rather than a dotted
- *  one. */
-const FOLLOW_HOLD_SEC = 0.25;
-
-/** End the warm-up: the line, the melody and the microphone, in that order.
- *  Idempotent, because both the natural end and every Stop come through here. */
-function stopFollowAlong(): void {
+/**
+ * Stop the line and the melody, and put the button back.
+ *
+ * Separate from {@link stopFollowAlong} because the take can also end without
+ * anybody tapping Stop — the 60 s cap fires inside the audio callback, which is
+ * exactly what happens to a warm-up left running in a backgrounded tab, where
+ * this loop is not running to notice the melody finished. `finishRecording`
+ * calls this on its way past, so a take that ends by itself cannot leave a Stop
+ * button over a closed microphone.
+ */
+function endFollowRun(): void {
   if (followHandle) cancelAnimationFrame(followHandle);
   followHandle = 0;
   followRoll = null;
   stopPlayback();
-  finishRecording();
   setFollowRunning(false);
+}
+
+/** End the warm-up: the line, the melody and the microphone, in that order.
+ *  Idempotent, because both the natural end and every Stop come through here. */
+function stopFollowAlong(): void {
+  endFollowRun();
+  finishRecording();
 }
 
 function renderPractice(): void {
@@ -667,7 +687,7 @@ function renderPractice(): void {
   // both: the store is written by this module and the synth by its own
   // callbacks, and a Listen button that disagrees with either is a button that
   // stops nothing.
-  practice.render(getPracticeState(), state.phase, state.playing || isPlaying());
+  practice.render(getPracticeState(), state.phase, state.playing || isPlaying(), state.voice);
 }
 
 subscribePractice(renderPractice);
@@ -1019,6 +1039,13 @@ setCaptureHandlers({
     const intent = takeIntent;
     finishRecording();
 
+    if (intent === "follow") {
+      // Its own arm, because the sentence below is about a take that produced
+      // nothing to analyse — and a warm-up never has anything to analyse. The
+      // melody and the roll have already been stopped by `finishRecording`.
+      setPracticeMessage("That warm-up stopped early.");
+      return;
+    }
     if (intent !== "transcribe") {
       // The transcriber's status line is not on screen in practice mode, so
       // the news goes to the screen that is. When there *is* audio the
@@ -1063,6 +1090,8 @@ function finishRecording(): void {
   // longer than the microphone would keep ~11 MB alive for nothing.
   if (takeIntent === "follow") {
     setState({ phase: "idle", message: "", warning: null, hasRecording: false });
+    // Also when the take ended by itself: see `endFollowRun`.
+    endFollowRun();
     return;
   }
   if (!take) {

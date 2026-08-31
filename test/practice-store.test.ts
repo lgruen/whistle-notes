@@ -592,6 +592,21 @@ describe("the echo drills", () => {
     expect(store.getPracticeState().echo!.length).toBe(ECHO_MIN_NOTES);
   });
 
+  it("moves the ramp once per phrase, however often it is repeated", async () => {
+    const store = await loadStore();
+    store.beginEcho(makeRng(11));
+    const phrase = store.getPracticeState().echo!.phrase;
+    store.finishEchoAttempt(echoOf(phrase));
+    expect(store.getPracticeState().echo!.length).toBe(ECHO_MIN_NOTES + 1);
+
+    // Same phrase again, got again. It is easier the second time — by then it
+    // is remembered — so ramping twice off one phrase would hand out five notes
+    // after three.
+    store.retryEcho();
+    store.finishEchoAttempt(echoOf(phrase));
+    expect(store.getPracticeState().echo!.length).toBe(ECHO_MIN_NOTES + 1);
+  });
+
   it("forgives the register, exactly as the recall exercise does", async () => {
     const store = await loadStore();
     store.beginEcho(makeRng(11));
