@@ -13,12 +13,19 @@
  *   --frames-cache <f>    Run the FFT stage and cache its frames to <f>.
  *   --from-cache <f>      Load frames from <f> and only re-segment. This is
  *                         the point of the threshold-free pitch stage: a sweep
- *                         over segmentation parameters costs milliseconds.
+ *                         over segmentation parameters costs milliseconds. The
+ *                         cache records the analysis settings it was produced
+ *                         with, and refuses to be re-segmented under different
+ *                         ones — pass the audio file too if a sweep needs to
+ *                         move them.
  *   --set <k.k=v>         Override any config value, e.g.
  *                         --set segment.toleranceCents=80. Repeatable.
  *   --sweep <k.k=a,b,c>   Re-segment once per value and print each sequence,
  *                         so neighbouring settings can be compared for
- *                         stability. Repeatable (nested loops).
+ *                         stability. Repeatable (nested loops). Sweeping an
+ *                         `analysis.*` key re-runs the FFT stage for each
+ *                         value, and says so — those settings *produce* the
+ *                         frames rather than interpreting them.
  *   --preset <name>       strict | normal | forgiving.
  *   --plot                ASCII pitch trail — the go/no-go eyeball test.
  *   --stats               Per-second frame statistics.
@@ -28,6 +35,7 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import {
   DEFAULT_CONFIG,
   PitchTracker,
@@ -99,8 +107,16 @@ function parseArgs(argv: string[]): Options {
   return options;
 }
 
-/** `"segment.toleranceCents=80"` → a one-key config override. Values are
- *  coerced: numbers to numbers, `true`/`false` to booleans, rest to strings. */
+/**
+ * `"segment.toleranceCents=80"` → a one-key config override.
+ *
+ * The value is parsed against the *type of the default*, and a mismatch is a
+ * hard error. This matters more than it looks: `--set segment.toleranceCents=60c`
+ * used to sail through as `NaN`, and every comparison against `NaN` is false,
+ * so the run produced a different — and silently wrong — transcription rather
+ * than a complaint. A sweep is only worth anything if the numbers in it are the
+ * numbers you asked for.
+ */
 function parseSetting(setting: string): DspConfigOverrides {
   const eq = setting.indexOf("=");
   if (eq < 0) throw new Error(`--set needs group.key=value, got ${setting}`);
@@ -113,10 +129,22 @@ function parseSetting(setting: string): DspConfigOverrides {
   const groupKey = group as keyof DspConfig;
   if (!(key in DEFAULT_CONFIG[groupKey])) throw new Error(`unknown config key ${path}`);
 
-  let value: unknown = raw;
-  if (raw === "true") value = true;
-  else if (raw === "false") value = false;
-  else if (raw !== "" && !Number.isNaN(Number(raw))) value = Number(raw);
+  const fallback = (DEFAULT_CONFIG[groupKey] as unknown as Record<string, unknown>)[key];
+  let value: unknown;
+  if (typeof fallback === "boolean") {
+    if (raw !== "true" && raw !== "false") {
+      throw new Error(`${path} is a boolean (true|false), got "${raw}"`);
+    }
+    value = raw === "true";
+  } else if (typeof fallback === "number") {
+    const parsed = Number(raw);
+    if (raw.trim() === "" || !Number.isFinite(parsed)) {
+      throw new Error(`${path} is a number, got "${raw}"`);
+    }
+    value = parsed;
+  } else {
+    value = raw;
+  }
 
   return { [groupKey]: { [key]: value } } as DspConfigOverrides;
 }
@@ -142,6 +170,72 @@ function computeFrames(file: string, cfg: DspConfig): FrameCache {
   const { samples, sampleRate } = decodeWav(readFileSync(file));
   const frames = new PitchTracker(sampleRate, cfg).push(samples);
   return { sampleRate, analysis: cfg.analysis, frames };
+}
+
+/** Stable identity for a set of analysis settings, key order and all. */
+function analysisKey(analysis: DspConfig["analysis"]): string {
+  return JSON.stringify(
+    Object.fromEntries(Object.entries(analysis).sort(([a], [b]) => a.localeCompare(b))),
+  );
+}
+
+function analysisDifferences(a: DspConfig["analysis"], b: DspConfig["analysis"]): string[] {
+  const out: string[] = [];
+  for (const key of Object.keys(a) as (keyof DspConfig["analysis"])[]) {
+    if (a[key] !== b[key]) out.push(`analysis.${key} ${String(b[key])} → ${String(a[key])}`);
+  }
+  return out;
+}
+
+/**
+ * Frames for whatever analysis settings a sweep asks for.
+ *
+ * The cached-frame trick is what makes a fifty-point sweep cost milliseconds,
+ * and it is sound for every threshold in segmentation — but `analysis.*` is not
+ * a segmentation threshold, it is what *produced* the frames. Sweeping it
+ * against a cache re-segments the old frames under new labels: a `windowSize`
+ * sweep then reports perfect stability because nothing actually changed, and a
+ * `hopSize` sweep reports pure fiction, because segmentation converts frame
+ * indices to seconds through the hop while the frames stay on the old grid.
+ *
+ * So: one cache per distinct analysis config, re-running the FFT stage when a
+ * sweep moves it, and a loud refusal when that is impossible because the frames
+ * came from a file that is no longer at hand.
+ */
+class FrameSource {
+  private readonly byAnalysis = new Map<string, FrameCache>();
+
+  constructor(
+    private readonly file: string | undefined,
+    loaded?: FrameCache,
+  ) {
+    if (loaded) this.byAnalysis.set(analysisKey(loaded.analysis), loaded);
+  }
+
+  /** True when this config needs an FFT pass that has not been run yet. */
+  needsAnalysis(cfg: DspConfig): boolean {
+    return !this.byAnalysis.has(analysisKey(cfg.analysis));
+  }
+
+  frames(cfg: DspConfig): FrameCache {
+    const key = analysisKey(cfg.analysis);
+    const hit = this.byAnalysis.get(key);
+    if (hit) return hit;
+
+    if (!this.file) {
+      const [known] = [...this.byAnalysis.values()];
+      const changes = known ? analysisDifferences(cfg.analysis, known.analysis) : [];
+      throw new Error(
+        `the cached frames were computed with different analysis settings ` +
+          `(${changes.join(", ") || "unknown difference"}). Frames cannot be re-segmented under ` +
+          `analysis settings they were not produced with — re-run against the audio file instead ` +
+          `of --from-cache.`,
+      );
+    }
+    const computed = computeFrames(this.file, cfg);
+    this.byAnalysis.set(key, computed);
+    return computed;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,17 +442,21 @@ function main(): void {
   let cfg = options.preset ? presetConfig(options.preset) : DEFAULT_CONFIG;
   cfg = applySettings(cfg, options.sets);
 
-  let cache: FrameCache;
+  let source: FrameSource;
   if (options.fromCache) {
-    cache = JSON.parse(readFileSync(options.fromCache, "utf8")) as FrameCache;
-    // Segmentation converts frame indices to seconds via the analysis hop, so
-    // a cache must carry its own analysis settings rather than inherit the
-    // ones being swept.
-    cfg = mergeConfig(cfg, { analysis: cache.analysis });
+    const loaded = JSON.parse(readFileSync(options.fromCache, "utf8")) as FrameCache;
+    if (!loaded.analysis) {
+      throw new Error(
+        `${options.fromCache} predates analysis-aware caching and cannot be trusted; ` +
+          `re-create it with --frames-cache.`,
+      );
+    }
+    source = new FrameSource(options.file, loaded);
   } else {
     if (!options.file) throw new Error("usage: transcribe-file.ts <file.wav> [flags]");
-    cache = computeFrames(options.file, cfg);
+    source = new FrameSource(options.file);
   }
+  const cache = source.frames(cfg);
 
   if (options.framesCache) {
     writeFileSync(options.framesCache, JSON.stringify(cache));
@@ -384,7 +482,7 @@ function main(): void {
   }
 
   if (options.sweeps.length > 0) {
-    runSweep(cache, cfg, options.sweeps);
+    runSweep(source, cfg, options.sweeps);
     return;
   }
 
@@ -403,8 +501,12 @@ function main(): void {
   console.log(sequenceLine(notes));
 }
 
-/** Cartesian product of every `--sweep key=a,b,c`, re-segmenting each time. */
-function runSweep(cache: FrameCache, base: DspConfig, sweeps: string[]): void {
+/**
+ * Cartesian product of every `--sweep key=a,b,c`, re-segmenting each time —
+ * and re-running the FFT stage for any combination that changes `analysis.*`,
+ * which is announced in the output so that a sweep's cost is never a mystery.
+ */
+function runSweep(source: FrameSource, base: DspConfig, sweeps: string[]): void {
   const axes = sweeps.map((sweep) => {
     const eq = sweep.indexOf("=");
     if (eq < 0) throw new Error(`--sweep needs group.key=v1,v2,…, got ${sweep}`);
@@ -422,18 +524,28 @@ function runSweep(cache: FrameCache, base: DspConfig, sweeps: string[]): void {
 
   for (const combination of combinations) {
     const cfg = applySettings(base, combination);
+    const refft = source.needsAnalysis(cfg);
+    const cache = source.frames(cfg);
     const { notes, tuningOffsetCents } = segmentNotes(cache.frames, cfg, cache.sampleRate);
     console.log(
       `${combination.join(" ").padEnd(38)} → ${String(notes.length).padStart(3)} notes, ` +
-        `tune ${centsString(tuningOffsetCents).padStart(3)}c : ${sequenceLine(notes)}`,
+        `tune ${centsString(tuningOffsetCents).padStart(3)}c : ${sequenceLine(notes)}` +
+        `${refft ? `\n  (FFT stage re-run: ${cache.frames.length} frames)` : ""}`,
     );
   }
 }
 
-try {
-  main();
-} catch (error) {
-  // A stack trace for a typo in `--set segment.tolerence=60` helps nobody.
-  console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
+// Run only when invoked as a script, so the argument parsing and the frame
+// cache can be unit-tested. They are worth testing: both have silently
+// produced *plausible* wrong answers, which is the expensive kind.
+export { FrameSource, parseSetting };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    main();
+  } catch (error) {
+    // A stack trace for a typo in `--set segment.tolerence=60` helps nobody.
+    console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
 }
