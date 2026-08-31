@@ -66,14 +66,19 @@ const DAMAGED = "That MIDI file is damaged — it stops part-way through.";
 export const MAX_MIDI_BYTES = 2 * 1024 * 1024;
 
 /**
- * The longest melody an import may become.
+ * The longest melody a target may become.
  *
- * Not a format limit — a usefulness limit, twice over. A practice target is a
- * phrase you can hold in your head and whistle back; the alignment that scores
- * an attempt is O(n·m) in the note counts; and the trim controls take one tap
- * per note, so a five-hundred-note import would be untrimmable anyway. What is
- * over the line is dropped from the end and the user is told so, rather than
- * the import being refused.
+ * Not a format limit — a usefulness limit, three times over. A practice target
+ * is a phrase you can hold in your head and whistle back; the alignment that
+ * scores an attempt is O(n·m) in the note counts and runs once per candidate
+ * register; and the trim controls take one tap per note, so a five-hundred-note
+ * melody would be untrimmable anyway. What is over the line is dropped from the
+ * end and the user is told so, rather than the melody being refused.
+ *
+ * It lives here because imports were the first source that could reach it, but
+ * it applies to **every** target: `applyTargetTake` in `main.ts` caps a recorded
+ * one the same way, since a minute of whistling is a perfectly ordinary way to
+ * arrive at three hundred notes.
  */
 export const MAX_MELODY_NOTES = 64;
 
@@ -155,6 +160,28 @@ class Reader {
   u8(): number {
     this.need(1);
     return this.bytes[this.at++];
+  }
+
+  /**
+   * A data byte, which in MIDI means one with its high bit clear.
+   *
+   * The spec is unambiguous: data bytes are `00`–`7F`, and a status byte can
+   * only appear where an event begins. A file where one turns up mid-event is a
+   * file we have lost sync with — the same conclusion the `0xF1`–`0xFE` arm
+   * below reaches, and the same answer. Reading it anyway is how a note-on with
+   * "pitch" `0xC5` becomes MIDI 197: a number `midiToHz` will happily turn into
+   * 63 kHz, handed to a synth on a device that has to render it.
+   */
+  data(): number {
+    const byte = this.u8();
+    if (byte >= 0x80) throw new MidiError(DAMAGED);
+    return byte;
+  }
+
+  /** How many bytes are left. A chunk header is eight of them, so this is what
+   *  tells the walk in {@link parseMidi} whether another one can exist. */
+  get remaining(): number {
+    return Math.max(0, this.end - this.at);
   }
 
   /** Put back the byte just read. Used for exactly one thing: a running-status
@@ -309,13 +336,20 @@ function parseTrack(reader: Reader, index: number): RawTrack {
   /**
    * Note-ons waiting for their note-off, keyed by channel and pitch.
    *
-   * A list rather than a single tick, because the same pitch can legally be
-   * struck twice before either is released — an overlapping repeated note, or a
-   * sustained chord tone re-triggered. Oldest-first matching (`shift`) is the
-   * convention every sequencer writes and the only one that keeps durations
-   * sane when the two overlap.
+   * Each entry carries its own channel and pitch rather than leaving them to be
+   * recovered from the key by arithmetic. The key is `channel * 128 + pitch`,
+   * which only inverts while `pitch < 128` — true now that {@link Reader.data}
+   * enforces it, and the sort of invariant that is cheaper to carry than to
+   * re-derive at the one place (orphaned notes, below) that used to get it
+   * wrong and alias a note onto another channel.
+   *
+   * The starts are a list rather than a single tick, because the same pitch can
+   * legally be struck twice before either is released — an overlapping repeated
+   * note, or a sustained chord tone re-triggered. Oldest-first matching
+   * (`shift`) is the convention every sequencer writes and the only one that
+   * keeps durations sane when the two overlap.
    */
-  const pending = new Map<number, number[]>();
+  const pending = new Map<number, { channel: number; pitch: number; starts: number[] }>();
   let tick = 0;
   let status = 0;
 
@@ -359,18 +393,17 @@ function parseTrack(reader: Reader, index: number): RawTrack {
     switch (kind) {
       case 0x80:
       case 0x90: {
-        const pitch = reader.u8();
-        const velocity = reader.u8();
+        const pitch = reader.data();
+        const velocity = reader.data();
         // The velocity-0 rule: an "on" at zero is an off, and it is how most
         // files spell every off they have.
         if (kind === 0x90 && velocity > 0) {
           const key = channel * 128 + pitch;
-          const starts = pending.get(key);
-          if (starts) starts.push(tick);
-          else pending.set(key, [tick]);
+          const held = pending.get(key);
+          if (held) held.starts.push(tick);
+          else pending.set(key, { channel, pitch, starts: [tick] });
         } else {
-          const starts = pending.get(channel * 128 + pitch);
-          const startTick = starts?.shift();
+          const startTick = pending.get(channel * 128 + pitch)?.starts.shift();
           // An off with nothing sounding is not an error — it is what a file
           // that starts mid-phrase looks like. Drop it.
           if (startTick !== undefined) {
@@ -382,11 +415,14 @@ function parseTrack(reader: Reader, index: number): RawTrack {
       case 0xa0:
       case 0xb0:
       case 0xe0:
-        reader.skip(2);
+        // Read rather than skipped: a status byte in a data position means the
+        // stream has desynchronised, and every event after it is invention.
+        reader.data();
+        reader.data();
         break;
       case 0xc0:
       case 0xd0:
-        reader.skip(1);
+        reader.data();
         break;
       default:
         // 0xF1–0xFE are real-time messages that belong on a cable, not in a
@@ -400,11 +436,11 @@ function parseTrack(reader: Reader, index: number): RawTrack {
   // happen — a file cut short, an exporter that forgot the last note-off — and
   // dropping them would silently lose the end of the melody, which is exactly
   // the part someone is trying to practise.
-  for (const [key, starts] of pending) {
-    for (const startTick of starts) {
+  for (const held of pending.values()) {
+    for (const startTick of held.starts) {
       track.notes.push({
-        midi: key % 128,
-        channel: Math.floor(key / 128),
+        midi: held.pitch,
+        channel: held.channel,
         startTick,
         endTick: Math.max(tick, startTick),
       });
@@ -412,6 +448,29 @@ function parseTrack(reader: Reader, index: number): RawTrack {
   }
   track.notes.sort((a, b) => a.startTick - b.startTick || a.midi - b.midi);
   return track;
+}
+
+/**
+ * The one tempo map a format 0 or 1 file's tracks all share.
+ *
+ * Every track's tempo events go in, because a file is free to put a ritardando
+ * wherever it likes — but where two tracks claim the *same tick*, the lower
+ * track index wins. That is the SMF convention (format 1 puts the tempo map
+ * alone in track 0) and without it the answer came from `flatMap` order, so a
+ * file with a leftover tempo event in a later track played its whole score at
+ * the wrong speed, with nothing on screen to suggest why. Within one track the
+ * later event still wins, which is what a sequencer means by writing two.
+ */
+function mergeTempo(tracks: readonly RawTrack[]): TempoChange[] {
+  const byTick = new Map<number, { track: number; usPerQuarter: number }>();
+  for (const track of tracks) {
+    for (const change of track.tempo) {
+      const held = byTick.get(change.tick);
+      if (held && held.track < track.index) continue;
+      byTick.set(change.tick, { track: track.index, usPerQuarter: change.usPerQuarter });
+    }
+  }
+  return [...byTick].map(([tick, held]) => ({ tick, usPerQuarter: held.usPerQuarter }));
 }
 
 /**
@@ -438,9 +497,10 @@ function readText(data: Uint8Array): string {
  *
  * - **Format 1** is the common case — parallel tracks sharing one timeline,
  *   with the tempo conventionally alone in track 0. So every track's tempo
- *   events are merged into one map and every track is read through it. A parser
- *   that timed each track by its own events would play a format 1 file at
- *   120 bpm no matter what the score said.
+ *   events are merged into one map (see {@link mergeTempo}, which is also where
+ *   "track 0 owns the tempo" is enforced for events that collide) and every
+ *   track is read through it. A parser that timed each track by its own events
+ *   would play a format 1 file at 120 bpm no matter what the score said.
  * - **Format 0** is one track, so merging is a no-op.
  * - **Format 2** is a *bundle of independent* sequences, each with its own
  *   timeline. Merging there would be actively wrong, so each track is timed by
@@ -466,7 +526,12 @@ export function parseMidi(bytes: Uint8Array): ParsedMidi {
   reader.skip(headerLength - 6);
 
   const raw: RawTrack[] = [];
-  while (!reader.done) {
+  // A chunk header is eight bytes, so anything shorter than that at the end of
+  // the file is not a chunk. Padding to an even length, an editor's stray
+  // newline, a transfer that rounded up to a block: none of them are a reason
+  // to refuse a file whose tracks all read cleanly, and refusing them is what
+  // this loop used to do — one trailing zero byte and the melody was gone.
+  while (reader.remaining >= 8) {
     const id = reader.fourCC();
     const length = reader.u32();
     const end = reader.at + length;
@@ -477,8 +542,7 @@ export function parseMidi(bytes: Uint8Array): ParsedMidi {
   }
   if (raw.length === 0) throw new MidiError(NOT_MIDI);
 
-  const merged = raw.flatMap((track) => track.tempo);
-  const shared = format === 2 ? null : buildTiming(division, merged);
+  const shared = format === 2 ? null : buildTiming(division, mergeTempo(raw));
 
   return {
     format,

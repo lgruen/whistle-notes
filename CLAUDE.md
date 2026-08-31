@@ -363,7 +363,10 @@ same `{name, source, notes: {midi, durSec}[]}` whatever they came from:
   the keyboard", **not** "use the move buttons" — those are for putting a melody
   where the user wants to whistle it. Widening `minHz` is not a free fix: that
   band is why speech and hum are rejected for nothing, and it would need its own
-  sweep against the golden recording.
+  sweep against the golden recording. Capped at `MAX_MELODY_NOTES` like an
+  import, with the same note on the draft screen: a minute of whistling is an
+  ordinary way to arrive at three hundred notes, and every reason the import cap
+  exists applies to them too.
 - **MIDI** — `practice/midi.ts`, a hand-rolled SMF parser (running status,
   velocity-0 note-offs, merged tempo map for format 1, per-track for format 2,
   SMPTE divisions). Splits by track *and* channel, collapses chords to the top

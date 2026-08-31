@@ -282,6 +282,43 @@ describe("the tempo map", () => {
     expect(midi.tracks[0].notes[0].endSec).toBeCloseTo(0.5, 6);
   });
 
+  it("lets track 0 win a tempo two tracks claim at the same tick", () => {
+    // Two tempo events at tick 0 in different tracks is a malformed file, and
+    // the convention decides it: format 1 puts the tempo map alone in track 0,
+    // so a leftover event in a later track does not get to halve the score's
+    // speed. The answer used to come from the order the tracks were flattened
+    // in, which is to say from nothing at all.
+    const both = (first: number, second: number): number =>
+      parseMidi(
+        file(
+          header(1, 2, PPQ),
+          track(setTempo(0, first), on(0, 60), off(PPQ, 60)),
+          track(setTempo(0, second), on(0, 72), off(PPQ, 72)),
+        ),
+      ).tracks[0].notes[0].endSec;
+    expect(both(500_000, 250_000)).toBeCloseTo(0.5, 6);
+    expect(both(250_000, 500_000)).toBeCloseTo(0.25, 6);
+
+    // Within one track the later event still wins, which is what a sequencer
+    // means by writing two at one tick.
+    const twice = parseMidi(
+      file(header(0, 1, PPQ), track(setTempo(0, 500_000), setTempo(0, 250_000), on(0, 60), off(PPQ, 60))),
+    );
+    expect(twice.tracks[0].notes[0].endSec).toBeCloseTo(0.25, 6);
+
+    // ...and a tempo change a later track owns alone is still honoured: the
+    // rule is about collisions, not about ignoring other tracks.
+    const later = parseMidi(
+      file(
+        header(1, 2, PPQ),
+        track(setTempo(0, 500_000)),
+        track(on(0, 60), off(PPQ, 60), setTempo(0, 250_000), on(0, 62), off(PPQ, 62)),
+      ),
+    );
+    // A quarter at 120 bpm, then a quarter at 240: 0.5 s and then 0.25.
+    expect(later.tracks[1].notes[1].endSec).toBeCloseTo(0.75, 6);
+  });
+
   it("times a format 2 file by each track's own tempo", () => {
     // Format 2 is a bundle of independent sequences. Merging the maps — right
     // for format 1 — would time the second track by the first's tempo.
@@ -318,6 +355,60 @@ describe("a file that cannot be read", () => {
     ]) {
       expect(() => parseMidi(bytes)).toThrow(MidiError);
     }
+  });
+
+  /**
+   * Padding is not damage.
+   *
+   * A chunk header is eight bytes; anything shorter than that left at the end
+   * of a file cannot be a chunk, and refusing the file over it throws away a
+   * melody that read perfectly. Real files pick these up — an editor padding to
+   * an even length, a transfer rounding up to a block — and "that MIDI file is
+   * damaged" is a dead end with no way forward on screen.
+   */
+  it("reads a file with a few bytes left over after the last chunk", () => {
+    for (const tail of [[], [0], [0, 0], [0, 0, 0], [0x0a], [0, 0, 0, 0, 0, 0, 0]]) {
+      const midi = parseMidi(
+        file(header(0, 1, PPQ), track(on(0, 60), off(PPQ, 60)), tail),
+      );
+      expect(midi.tracks, `${tail.length} trailing`).toHaveLength(1);
+      expect(midi.tracks[0].notes, `${tail.length} trailing`).toHaveLength(1);
+    }
+    // Eight bytes *is* a chunk header, and one that lies about its length is
+    // still a damaged file rather than padding.
+    expect(() =>
+      parseMidi(file(header(0, 1, PPQ), track(on(0, 60), off(PPQ, 60)), ascii("MTrk"), be32(99))),
+    ).toThrow(MidiError);
+  });
+
+  /**
+   * A data byte with its high bit set means the stream has desynchronised, and
+   * everything after it is invention. Read anyway, a note-on with "pitch"
+   * `0xC5` becomes MIDI 197 — a number the synth turns into 63 kHz, on a device
+   * that has to render it — and in the orphaned-note path it used to alias onto
+   * another channel as well.
+   */
+  it("refuses an event whose data bytes are not data bytes", () => {
+    const damaged = (body: readonly number[]): Uint8Array =>
+      file(header(0, 1, PPQ), chunk("MTrk", body));
+    for (const body of [
+      // Note-on with a pitch of 197, released properly.
+      [...vlq(0), 0x90, 0xc5, 0x40, ...vlq(PPQ), 0x80, 0xc5, 0x00, ...vlq(0), 0xff, 0x2f, 0],
+      // The same, never released, which is the orphan path.
+      [...vlq(0), 0x91, 0xc5, 0x40, ...vlq(PPQ), 0xff, 0x2f, 0],
+      // A velocity out of range.
+      [...vlq(0), 0x90, 60, 0x90, ...vlq(PPQ), 0xff, 0x2f, 0],
+      // ...and the events that are skipped rather than kept, which have to be
+      // read for the same reason: a status byte inside one is a lost stream.
+      [...vlq(0), 0xb0, 0x07, 0x80, ...vlq(0), 0xff, 0x2f, 0],
+      [...vlq(0), 0xc0, 0x80, ...vlq(0), 0xff, 0x2f, 0],
+    ]) {
+      expect(() => parseMidi(damaged(body))).toThrow(MidiError);
+    }
+
+    // A legal file with every data byte at its maximum still reads.
+    const edge = parseMidi(damaged([...vlq(0), 0x90, 0x7f, 0x7f, ...vlq(PPQ), 0x80, 0x7f, 0x40, ...vlq(0), 0xff, 0x2f, 0]));
+    expect(edge.tracks[0].notes[0].midi).toBe(127);
   });
 
   it("refuses a header that does not describe a MIDI file", () => {

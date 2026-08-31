@@ -1174,11 +1174,18 @@ function applyTargetTake(notes: readonly Note[]): void {
     );
     return;
   }
+  // The same ceiling an import gets, and for the same three reasons — a target
+  // is a phrase you can hold in your head, the alignment is O(n·m), and the
+  // trim controls take one tap per note. A recorded target had no limit at all,
+  // which is a minute of whistling turned into a 300-note "melody" nobody can
+  // trim and the aligner has to sweep 29 times per attempt.
+  const kept = notes.slice(0, MAX_MELODY_NOTES);
   beginDraft(
     makeDraft(
       "recorded",
       defaultTargetName(),
-      notes.map((note) => ({ midi: note.midi, durSec: note.durationSec })),
+      kept.map((note) => ({ midi: note.midi, durSec: note.durationSec })),
+      kept.length < notes.length ? `Only the first ${MAX_MELODY_NOTES} notes were kept.` : "",
     ),
   );
 }
