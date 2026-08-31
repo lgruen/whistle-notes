@@ -19,6 +19,11 @@ export interface Palette {
   textDim: string;
   accent: string;
   accentDim: string;
+  /** The middle verdict: recognisably the right note, missed by a whisker.
+   *  Warm rather than red, because being 40 cents flat is the normal condition
+   *  of a beginner's whistle and colouring it like a failure would leave the
+   *  whole diff overlay screaming. */
+  warn: string;
   danger: string;
 }
 
@@ -51,6 +56,7 @@ export function readPalette(element: Element): Palette {
     textDim: property(styles, "--text-dim", "#8b949e"),
     accent: property(styles, "--accent", "#14b8a6"),
     accentDim: property(styles, "--accent-dim", "#0f766e"),
+    warn: property(styles, "--warn", "#d29922"),
     danger: property(styles, "--danger", "#f85149"),
   };
   return cached;

@@ -19,9 +19,27 @@
  * construction: the voice only ever decides what {@link voiceSpec} returns.
  */
 
-import { midiToHz, type Note } from "../dsp/index.js";
+import { midiToHz } from "../dsp/index.js";
 import { transposeMidi } from "../notes/format.js";
 import { isRecording } from "./capture.js";
+
+/**
+ * The whole of what playback reads from a note.
+ *
+ * Structurally satisfied by `src/dsp`'s `Note` — so every existing caller passes
+ * a transcription unchanged — and by anything else that knows when it starts and
+ * how long it lasts. Practice mode's targets are `{midi, durSec}` with no times
+ * at all, and `practice/recall.ts` lays them on a timeline into exactly this
+ * shape without either module importing the other: the practice island may not
+ * depend on the audio half of the app, and this is the contract that lets it
+ * play something anyway.
+ */
+export interface PlayableNote {
+  midi: number;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+}
 
 /** A note placed on the playback timeline, in seconds from the first note. */
 export interface ScheduledNote {
@@ -212,7 +230,7 @@ export function voiceSpec(voice: Voice): VoiceSpec {
  * so what you hear is what the segmenter actually measured.
  */
 export function playbackSchedule(
-  notes: readonly Note[],
+  notes: readonly PlayableNote[],
   transpose: number,
   options: ScheduleOptions = {},
 ): ScheduledNote[] {
@@ -295,7 +313,7 @@ export function isPlaying(): boolean {
  * accumulation.
  */
 export function startPlayback(
-  notes: readonly Note[],
+  notes: readonly PlayableNote[],
   transpose: number,
   playbackHandlers: PlaybackHandlers,
   voice: Voice = "clean",

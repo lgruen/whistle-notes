@@ -391,8 +391,10 @@ export function drawPianoRoll(canvas: HTMLCanvasElement, view: RollView): void {
 }
 
 /** `CanvasRenderingContext2D.roundRect` is recent enough to still be missing
- *  on some Android WebViews, so the path is built by hand. */
-function roundRect(
+ *  on some Android WebViews, so the path is built by hand. Exported for
+ *  `ui/diffroll.ts`, which draws the same kind of rectangle for the same reason
+ *  and has no business carrying a second copy of the workaround. */
+export function roundRect(
   ctx: CanvasRenderingContext2D,
   left: number,
   top: number,
