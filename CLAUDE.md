@@ -32,6 +32,13 @@ The payoff is concrete: `transcribe(samples, sampleRate, cfg)` produces
 bit-identical output in the app and in `tools/transcribe-file.ts`, so a bad
 transcription on the phone can be reproduced and swept offline.
 
+Because the dependency may only point that way, the Hz↔MIDI↔cents maths lives
+in `src/dsp/tuning.ts` — segmentation needs it to fill in `Note.midi` and
+`Note.noteName`. `src/notes/format.ts` re-exports it and adds the display-only
+concerns (octave transposition, staff geometry), so there is exactly one
+implementation of the pitch maths in the repo and the UI still has one place to
+import from.
+
 ### Thresholds live in segmentation, not in pitch detection
 
 The pitch stage emits raw per-frame metrics (`clarity`, `snrDb`,
@@ -46,8 +53,9 @@ index.html            entry; src/main.ts is the only script
 src/
   main.ts             boot, SW registration, build stamp
   app.css             theme custom properties (canvas/SVG read these back)
-  dsp/                PURE. types.ts config.ts index.ts (+ fft/pitch/segment)
-  notes/format.ts     note naming, cents, display transposition, staff steps
+  dsp/                PURE. types.ts config.ts tuning.ts index.ts
+                      (+ fft/window/pitch/tracker/segment in M2–M3)
+  notes/format.ts     re-exports dsp/tuning + display transposition, staff steps
   audio/              browser-only: mic, recorder, file import
   ui/                 views
 public/
