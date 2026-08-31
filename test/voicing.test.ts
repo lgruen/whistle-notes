@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG, PitchTracker, transcribe, type Note } from "../src/dsp/index.js";
-import { voicingTrace } from "../src/dsp/segment.js";
+import { prepare } from "../src/dsp/segment.js";
 import { addNoise, sequence, type SynthSignal } from "./fixtures/synth.js";
 
 /**
@@ -27,7 +27,7 @@ const NAMES = (notes: Note[]): string[] => notes.map((n) => n.noteName);
 /** The adaptive floor, frame by frame, as segmentation actually saw it. */
 function floorTrace(samples: Float32Array): { floorDb: number[]; tSec: number[]; background: boolean[] } {
   const frames = new PitchTracker(SR, DEFAULT_CONFIG).push(samples);
-  const voicing = voicingTrace(frames, DEFAULT_CONFIG, SR);
+  const { voicing } = prepare(frames, DEFAULT_CONFIG, SR);
   return { floorDb: voicing.floorDb, tSec: frames.map((f) => f.tSec), background: voicing.background };
 }
 

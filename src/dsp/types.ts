@@ -184,12 +184,22 @@ export interface SmoothingConfig {
 
 /** Turning a continuous pitch track into discrete notes. */
 export interface SegmentConfig {
-  /** Pitch slope above which a frame is "transitional" (a glide or scoop),
-   *  in semitones per second. Transitional frames still count towards
-   *  continuity and duration, but are excluded from the pitch estimate —
-   *  which is what stops a portamento from spawning phantom notes at every
-   *  semitone it passes through. */
+  /** Average slope above which a *movement* is transitional (a glide or a
+   *  scoop) whatever distance it covers, in semitones per second.
+   *  Transitional frames still count towards continuity and duration, but are
+   *  excluded from the pitch estimate — which is what stops a portamento from
+   *  spawning phantom notes at every semitone it passes through. */
   glideSlopeStPerSec: number;
+  /** Slope at which a frame counts as *moving* at all, in semitones per
+   *  second. Only used to find where a movement starts and stops: consecutive
+   *  frames moving the same way are one movement, and a plateau ends it. */
+  glideMinSlopeStPerSec: number;
+  /** Distance a movement must cover to be transitional however slowly it went,
+   *  in semitones. This is what catches the gentle scoop — too shallow for
+   *  `glideSlopeStPerSec` but far enough that the frames it dwells on near its
+   *  start would otherwise confirm a note of their own, a semitone below the
+   *  one actually whistled. */
+  glideMinSemitones: number;
   /** How far a frame may sit from the running reference pitch and still be
    *  the same note, in cents. The user-facing "wobble snap" knob. */
   toleranceCents: number;

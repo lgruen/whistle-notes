@@ -250,16 +250,62 @@ function computeVoicing(frames: PitchFrame[], cfg: DspConfig, framePeriod: numbe
   return { tonal, candidate, background, floorDb, voiced };
 }
 
+/** Everything stages A–D worked out about a frame track. */
+export interface Prepared {
+  voicing: Voicing;
+  runs: Run[];
+  /** Fractional MIDI after median filtering; NaN outside voiced runs. */
+  smoothed: number[];
+  /** Frames belonging to a transition rather than to a note. */
+  transitional: boolean[];
+  /** Frames belonging to a movement that *was* recognised as a transition and
+   *  then immediately undone — i.e. to a wobble rather than to a glide. */
+  oscillating: boolean[];
+}
+
 /**
- * The voicing decision on its own, for instrumentation.
+ * Stages A–D: voicing, pitch representation, smoothing, glide marking.
  *
- * Not part of the app-facing API — `index.ts` does not re-export it — but the
- * adaptive floor is the one part of this pipeline whose failures are invisible
- * in the output (they show up as notes that are simply *missing*), so the tests
- * need to be able to look at it directly rather than inferring it.
+ * Exported (though not re-exported by `index.ts`, so it is not app-facing)
+ * because these stages are where this pipeline's failures *hide*. A poisoned
+ * noise floor and an over-eager glide detector both show up in the output as
+ * notes that are simply not there, with nothing to distinguish them from a
+ * whistler who never whistled — so the tests have to be able to read the
+ * intermediate decisions rather than infer them from the notes.
  */
-export function voicingTrace(frames: PitchFrame[], cfg: DspConfig, sampleRate: number): Voicing {
-  return computeVoicing(frames, cfg, cfg.analysis.hopSize / sampleRate);
+export function prepare(frames: PitchFrame[], cfg: DspConfig, sampleRate: number): Prepared {
+  const framePeriod = cfg.analysis.hopSize / sampleRate;
+  const a4Hz = cfg.tuning.a4Hz;
+
+  // A — voicing.
+  const voicing = computeVoicing(frames, cfg, framePeriod);
+
+  // B — fractional MIDI. Rounding here would throw away exactly the evidence
+  // that decides every borderline note later.
+  const midiFloat = frames.map((f) => (f.hz !== null && f.hz > 0 ? hzToMidiFloat(f.hz, a4Hz) : NaN));
+
+  // C — smoothing, strictly within voiced runs. A median filter that reached
+  // across a gap would invent pitch in the silence that nobody whistled.
+  const runs = voicedRuns(voicing.voiced, cfg.smoothing.minVoicedRunFrames);
+  const smoothed = midiFloat.slice();
+  const radius = Math.max(0, (cfg.smoothing.medianFilterFrames - 1) >> 1);
+  if (radius > 0) {
+    for (const run of runs) {
+      for (let i = run.start; i <= run.end; i++) {
+        const from = Math.max(run.start, i - radius);
+        const to = Math.min(run.end, i + radius);
+        const values: number[] = [];
+        for (let j = from; j <= to; j++) values.push(midiFloat[j]);
+        smoothed[i] = median(values);
+      }
+    }
+  }
+
+  // D — glide marking. The frames of a transition still count towards duration
+  // and continuity, but their pitch is excluded from the estimate.
+  const { transitional, oscillating } = markTransitional(runs, smoothed, framePeriod, cfg);
+
+  return { voicing, runs, smoothed, transitional, oscillating };
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +330,224 @@ function voicedRuns(voiced: boolean[], minRunFrames: number): Run[] {
     }
   }
   return runs;
+}
+
+/** One stretch of consecutive frames all moving the same way. */
+interface Leg {
+  /** First and last *moving* frame, inclusive. */
+  start: number;
+  end: number;
+  direction: number;
+  /** Signed pitch change across the movement, in semitones. */
+  semitones: number;
+  seconds: number;
+}
+
+/** How much the pitch must gain on its own running extreme to count as still
+ *  making headway, in semitones. Five cents is under the measurement noise on
+ *  a held whistle and far under any real movement, which is the point: it
+ *  separates climbing from flat-with-jitter. */
+const PROGRESS_SEMITONES = 0.05;
+
+/** How close two opposite movements must be to count as one oscillation.
+ *  Vibrato turns around at a smooth extreme and spends barely a frame there;
+ *  a melody puts a whole note between its transitions, and the shortest note
+ *  anyone whistles is several times this. */
+const OSCILLATION_ADJACENT_FRAMES = 3;
+
+/** How much of a movement must be undone for it to have been an oscillation
+ *  rather than a transition. */
+const OSCILLATION_RATIO = 0.5;
+
+/** How far a movement may be pushed back by a wobble riding on top of it and
+ *  still be one movement, in semitones. Whistlers scoop and wobble at the same
+ *  time: a ±50-cent vibrato at 5.5 Hz swings the pitch backwards by four tenths
+ *  of a semitone twice a second, which would otherwise break the scoop
+ *  underneath into pieces too small to recognise. Deliberately a constant and
+ *  not `toleranceCents`: the wobble-snap knob is a statement about how the
+ *  *notes* should be grouped, and letting it also redefine what counts as a
+ *  glide would make one preset mean two unrelated things — the same reasoning
+ *  that keeps the voicing thresholds out of the presets. */
+const WOBBLE_REVERSAL_SEMITONES = 0.6;
+
+/** How long the pitch must stop gaining ground before a movement counts as
+ *  over, in milliseconds. Around the shortest note anyone whistles, which is
+ *  the honest answer to "when has this pitch arrived somewhere?". */
+const MOVEMENT_STALL_MS = 80;
+
+/** Widest wobble that stage G will put back together as one note, measured
+ *  between the two pitches it was reported as, in semitones. A whole tone is
+ *  already an extravagant vibrato; past that, whatever the pitch trail is
+ *  doing, "one note with a wobble" has stopped being the better description.
+ *  Deliberately wider than `toleranceCents`, because by the time this runs the
+ *  two halves have each been measured at their own *extreme* — the distance
+ *  between them is the wobble's full peak-to-peak, not its amplitude.
+ *
+ *  Applied per merge, against the *running* merged pitch, which converges on
+ *  the centre of the wobble as halves are absorbed — so a wobble of up to
+ *  roughly ±2 semitones about its centre is still reunited, and one wider than
+ *  that comes apart. Measured: one note through ±200 cents at 4 Hz, three
+ *  notes at ±300. */
+const MAX_WOBBLE_SEMITONES = 2;
+
+/**
+ * Cut a voiced run into movements: stretches over which the pitch travels
+ * somewhere, separated by the stretches where it is holding still.
+ *
+ * This is the piece the old instantaneous-slope test was missing. A slope
+ * threshold answers "is this frame moving fast?", which conflates two entirely
+ * different things — a fast movement and a *far* one — and a whistler's scoop
+ * is usually the second: 150 cents taken over 160 ms is only 9 semitones per
+ * second, well under any threshold that leaves vibrato alone, yet it covers a
+ * semitone and a half. Looking at whole movements instead lets both questions
+ * be asked separately, of the thing that actually has a distance and a
+ * duration.
+ *
+ * A movement is tracked by its running extreme rather than frame by frame,
+ * which is what lets it survive a wobble. Whistlers scoop *and* wobble at the
+ * same time, and a ±50-cent vibrato at 5.5 Hz swings the pitch backwards by
+ * four tenths of a semitone twice a second — enough to break any
+ * frame-to-frame rule into pieces too small to recognise, while the scoop
+ * underneath sails on. The movement therefore ends only when the pitch either
+ * gives back more than a wobble's worth of its own progress or stops gaining
+ * ground for about as long as the shortest note anyone whistles. Both endings
+ * say the same thing: the pitch arrived somewhere.
+ */
+function movementLegs(
+  run: Run,
+  smoothed: number[],
+  slope: number[],
+  framePeriod: number,
+  cfg: DspConfig,
+): Leg[] {
+  const s = cfg.segment;
+  const legs: Leg[] = [];
+  const stillFrames = Math.max(2, Math.round(MOVEMENT_STALL_MS / 1000 / framePeriod));
+
+  let i = run.start;
+  while (i < run.end) {
+    if (Math.abs(slope[i]) < s.glideMinSlopeStPerSec) {
+      i++;
+      continue;
+    }
+    const direction = Math.sign(slope[i]);
+    // The slope at a frame is measured across its neighbours, so the movement
+    // it reports began at the frame before.
+    const start = Math.max(run.start, i - 1);
+    let extreme = smoothed[start];
+    let end = start;
+    for (let j = start + 1; j <= run.end; j++) {
+      const gained = direction * (smoothed[j] - extreme);
+      if (gained > PROGRESS_SEMITONES) {
+        extreme = smoothed[j];
+        end = j;
+        continue;
+      }
+      if (-gained > WOBBLE_REVERSAL_SEMITONES) break;
+      if (j - end > stillFrames) break;
+    }
+
+    if (end > start) {
+      legs.push({
+        start,
+        end,
+        direction,
+        semitones: smoothed[end] - smoothed[start],
+        seconds: (end - start) * framePeriod,
+      });
+    }
+    i = Math.max(end + 1, i + 1);
+  }
+
+  return legs;
+}
+
+/**
+ * Which frames are a transition rather than a note?
+ *
+ * A movement qualifies if it is *fast* (`glideSlopeStPerSec`, which catches a
+ * portamento however far it travels) or *far* (`glideMinSemitones`, which
+ * catches a scoop however slowly it was taken) — and, crucially, if it is not
+ * immediately undone.
+ *
+ * That last clause is the one that earns its keep. Vibrato and a scoop are the
+ * same gesture over any short window: a smooth slide of a semitone or so,
+ * sometimes faster than a portamento (a ±60-cent wobble at 5 Hz peaks at
+ * 18.8 st/s). No threshold on rate or distance can separate them, and getting
+ * it wrong is expensive in both directions — miss the scoop and its opening
+ * frames confirm a phantom note a semitone flat; catch the vibrato and the
+ * middle of the oscillation is stripped out, leaving a bimodal pile of extremes
+ * whose median is a coin flip between two notes a semitone apart.
+ *
+ * What does separate them is *shape*: an oscillation comes back and a
+ * transition does not. So a movement immediately followed or preceded by a
+ * comparable movement the other way is vibrato, and its frames keep their
+ * pitch. Between two real notes there is a note in the way — several times
+ * longer than the couple of frames a wobble spends turning around — so a
+ * genuine step is never mistaken for half a wobble.
+ */
+function markTransitional(
+  runs: Run[],
+  smoothed: number[],
+  framePeriod: number,
+  cfg: DspConfig,
+): { transitional: boolean[]; oscillating: boolean[] } {
+  const s = cfg.segment;
+  const transitional = new Array<boolean>(smoothed.length).fill(false);
+  const oscillating = new Array<boolean>(smoothed.length).fill(false);
+  const slope = new Array<number>(smoothed.length).fill(0);
+
+  for (const run of runs) {
+    for (let i = run.start; i <= run.end; i++) {
+      const previous = Math.max(run.start, i - 1);
+      const next = Math.min(run.end, i + 1);
+      if (next === previous) continue;
+      slope[i] = (smoothed[next] - smoothed[previous]) / ((next - previous) * framePeriod);
+    }
+
+    const legs = movementLegs(run, smoothed, slope, framePeriod, cfg);
+    for (const [k, leg] of legs.entries()) {
+      const distance = Math.abs(leg.semitones);
+      const rate = distance / leg.seconds;
+      if (distance < s.glideMinSemitones && rate <= s.glideSlopeStPerSec) continue;
+
+      const undone = (other: Leg | undefined, gapFrames: number): boolean =>
+        other !== undefined &&
+        other.direction !== leg.direction &&
+        Math.abs(other.semitones) >= OSCILLATION_RATIO * distance &&
+        gapFrames <= OSCILLATION_ADJACENT_FRAMES;
+      const before = legs[k - 1];
+      const after = legs[k + 1];
+      const undoneBefore = undone(before, before ? leg.start - before.end - 1 : Infinity);
+      const undoneAfter = undone(after, after ? after.start - leg.end - 1 : Infinity);
+      if (undoneBefore || undoneAfter) {
+        // Not a transition — but worth remembering *where* the wobbling was,
+        // because the state machine cannot tell an oscillation's extreme from
+        // a new note and will happily report a wide slow vibrato as a trill.
+        // Stage G uses this to put such a note back together.
+        for (let i = leg.start; i <= leg.end; i++) oscillating[i] = true;
+        // Include the turning point itself: the couple of frames where the
+        // pitch is neither climbing nor falling belong to the wobble as much
+        // as the swings either side of them do.
+        if (undoneBefore) for (let i = before.end; i <= leg.start; i++) oscillating[i] = true;
+        if (undoneAfter) for (let i = leg.end; i <= after.start; i++) oscillating[i] = true;
+        continue;
+      }
+
+      // Mark the frames that are actually in motion, not the whole span. A
+      // movement can legitimately reach across a moment of stillness — a
+      // wobble pausing at the top of its swing, a plateau too short to be a
+      // note — and blanking those frames wholesale would delete any real note
+      // unlucky enough to sit between two transitions. Frames left unmarked
+      // inside a movement are harmless: a note needs `confirmFrames`
+      // *consecutive* ones to exist, and a transition never leaves that many.
+      for (let i = leg.start; i <= leg.end; i++) {
+        if (Math.abs(slope[i]) >= s.glideMinSlopeStPerSec) transitional[i] = true;
+      }
+    }
+  }
+
+  return { transitional, oscillating };
 }
 
 // ---------------------------------------------------------------------------
@@ -443,11 +707,22 @@ function runStateMachine(cfg: DspConfig, input: StateMachineInput): Draft[] {
       if (from < 0) continue;
 
       const claimed = pending.slice(from);
-      current.endIndex = claimed[0].index - 1;
+
+      // A transition immediately before the new pitch is that note's *approach*
+      // — the same thing a scoop is at the start of a run, and it belongs to
+      // the note it arrives at rather than to the one it left. Leaving it with
+      // the previous note would credit that note with time it did not sound,
+      // and dock the new one of the run-up that is audibly part of it: a short
+      // note reached by a glide would then measure as shorter than the
+      // shortest note we are willing to report, and vanish.
+      let onset = claimed[0].index;
+      while (onset - 1 > current.startIndex && input.transitional[onset - 1]) onset--;
+
+      current.endIndex = onset - 1;
       finish();
 
       draft = {
-        startIndex: claimed[0].index,
+        startIndex: onset,
         endIndex: claimed[claimed.length - 1].index,
         firstPitchIndex: claimed[0].index,
         refSpan: 0,
@@ -587,6 +862,78 @@ function mergeDropouts(
         isTrueSilence(previous.endIndex + 1, next.startIndex - 1, frames, voicing, cfg);
 
       if (samePitch && gapMs <= s.gapMergeMs && !silent) {
+        out[out.length - 1] = measure(
+          {
+            startIndex: previous.startIndex,
+            endIndex: next.endIndex,
+            firstPitchIndex: previous.firstPitchIndex,
+            refSpan: Math.max(previous.refSpan, next.refSpan),
+            glidedIn: previous.glidedIn,
+          },
+          context,
+          cfg,
+        );
+        changed = true;
+      } else {
+        out.push(next);
+      }
+    }
+    current = out;
+  }
+
+  return current;
+}
+
+/**
+ * Put back together a note the state machine cut up at its own wobble.
+ *
+ * The state machine has no way to know that a pitch it has held for
+ * `confirmFrames` is about to be abandoned. A wide slow vibrato — ±80 cents at
+ * 4 Hz, which is a lot but well within what people produce — dwells near each
+ * extreme for around a tenth of a second, which is long enough to look exactly
+ * like a note, so a single wobbling note comes out as a trill between two
+ * pitches a semitone apart. Neither of which was whistled: the note is the
+ * thing the wobble is centred on.
+ *
+ * Stage D already knows where the wobbling was — a movement it recognised as
+ * a transition by size or speed, and then declined to mark because a
+ * comparable movement the other way followed within a couple of frames. Two
+ * notes whose boundary sits inside that are two halves of one oscillation, and
+ * the test cannot fire at a real note change, because a real note puts its own
+ * sustain between the two movements and that is far more than a couple of
+ * frames.
+ *
+ * Measuring the reunited note over all of its frames is what makes it come out
+ * right: a median over whole periods of an oscillation is its centre.
+ */
+function mergeWobbles(
+  notes: Measured[],
+  context: FrameContext,
+  oscillating: boolean[],
+  voicing: Voicing,
+  cfg: DspConfig,
+): Measured[] {
+  let changed = true;
+  let current = notes;
+
+  while (changed && current.length > 1) {
+    changed = false;
+    const out: Measured[] = [current[0]];
+    for (let n = 1; n < current.length; n++) {
+      const previous = out[out.length - 1];
+      const next = current[n];
+      const gapFrames = next.startIndex - previous.endIndex - 1;
+      const boundaryWobbles = (): boolean => {
+        for (let i = previous.endIndex; i <= next.startIndex; i++) if (!oscillating[i]) return false;
+        return true;
+      };
+
+      if (
+        gapFrames <= 0 &&
+        Math.abs(previous.midiFloat - next.midiFloat) <= MAX_WOBBLE_SEMITONES &&
+        boundaryWobbles() &&
+        !isTrueSilence(previous.endIndex, next.startIndex, context.frames, voicing, cfg)
+      ) {
         out[out.length - 1] = measure(
           {
             startIndex: previous.startIndex,
@@ -762,44 +1109,8 @@ export function segmentNotes(
   const framePeriod = cfg.analysis.hopSize / sampleRate;
   const a4Hz = cfg.tuning.a4Hz;
 
-  // A — voicing.
-  const voicing = computeVoicing(frames, cfg, framePeriod);
-
-  // B — fractional MIDI. Rounding here would throw away exactly the evidence
-  // that decides every borderline note later.
-  const midiFloat = frames.map((f) => (f.hz !== null && f.hz > 0 ? hzToMidiFloat(f.hz, a4Hz) : NaN));
-
-  // C — smoothing, strictly within voiced runs. A median filter that reached
-  // across a gap would invent pitch in the silence that nobody whistled.
-  const runs = voicedRuns(voicing.voiced, cfg.smoothing.minVoicedRunFrames);
-  const smoothed = midiFloat.slice();
-  const radius = Math.max(0, (cfg.smoothing.medianFilterFrames - 1) >> 1);
-  if (radius > 0) {
-    for (const run of runs) {
-      const source = midiFloat;
-      for (let i = run.start; i <= run.end; i++) {
-        const from = Math.max(run.start, i - radius);
-        const to = Math.min(run.end, i + radius);
-        const values: number[] = [];
-        for (let j = from; j <= to; j++) values.push(source[j]);
-        smoothed[i] = median(values);
-      }
-    }
-  }
-
-  // D — glide marking. A slope this steep is a portamento, not a note: the
-  // frames still count towards duration and continuity, but their pitch is
-  // excluded from the estimate.
-  const transitional = new Array<boolean>(frames.length).fill(false);
-  for (const run of runs) {
-    for (let i = run.start; i <= run.end; i++) {
-      const previous = Math.max(run.start, i - 1);
-      const next = Math.min(run.end, i + 1);
-      if (next === previous) continue;
-      const slope = (smoothed[next] - smoothed[previous]) / ((next - previous) * framePeriod);
-      transitional[i] = Math.abs(slope) > cfg.segment.glideSlopeStPerSec;
-    }
-  }
+  // A–D.
+  const { voicing, runs, smoothed, transitional, oscillating } = prepare(frames, cfg, sampleRate);
 
   // E — the state machine.
   const drafts = runStateMachine(cfg, { runs, smoothed, transitional });
@@ -817,6 +1128,7 @@ export function segmentNotes(
 
   // G — gaps and lengths. Dropout merging runs twice: absorbing a short note
   // can leave two same-pitch neighbours newly adjacent.
+  measured = mergeWobbles(measured, context, oscillating, voicing, cfg);
   measured = mergeDropouts(measured, context, voicing, cfg, framePeriod);
   measured = resolveShortNotes(measured, context, voicing, cfg, framePeriod);
   measured = mergeDropouts(measured, context, voicing, cfg, framePeriod);

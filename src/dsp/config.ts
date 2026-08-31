@@ -84,7 +84,26 @@ export const DEFAULT_CONFIG: DspConfig = {
     // (measured on the reference recording: 95th percentile 13.9 st/s, 99th
     // 20.9, genuine scoops 30–36). The transcription of that recording is
     // identical for anything from 12 to 24, so this is not a fitted constant.
+    //
+    // The overlap this paragraph describes is now handled by *shape* rather
+    // than by rate alone: a movement is only transitional if it is not part of
+    // an oscillation, i.e. if it is not immediately undone. Vibrato is undone
+    // by construction; a scoop is not. That is what lets the rules below catch
+    // slow scoops without stripping the middle out of a wide vibrato.
     glideSlopeStPerSec: 18,
+    // Where a movement begins and ends. A whistle held steady wanders by a few
+    // cents between frames, which at a 10.7 ms hop is already a couple of
+    // semitones per second, so this cannot be near zero; a real scoop runs at
+    // 8–40. 3 separates them with room to spare, and it only ever decides
+    // *extent* — how far a movement reaches — never whether one happened.
+    glideMinSlopeStPerSec: 3,
+    // 80 cents. Under half of this is wobble; a movement that covers most of a
+    // semitone and does not come back is a transition however long it took.
+    // Measured: a scoop of 100–200 cents taken over 160–250 ms runs at 8–11
+    // st/s, sails under the 18 st/s rate test, and used to dwell long enough
+    // near its starting pitch to confirm a phantom note a semitone flat of the
+    // real one — 43 of 150 scoop shapes on a synthetic grid did exactly that.
+    glideMinSemitones: 0.8,
     // 60 cents — a bit over half a semitone. The "wobble snap" knob.
     toleranceCents: 60,
     refMedianLength: 15,

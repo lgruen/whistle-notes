@@ -68,6 +68,26 @@ function fixtureFrames(): { frames: PitchFrame[]; sampleRate: number } {
   return cached;
 }
 
+/** Levenshtein distance in whole notes: how many insertions, deletions or
+ *  substitutions separate two transcriptions. "One note different" and "the
+ *  same notes shifted by one" are worlds apart, and only this tells them
+ *  apart. */
+function editDistance(a: string[], b: string[]): number {
+  const d: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) d[i][0] = i;
+  for (let j = 0; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      d[i][j] = Math.min(
+        d[i - 1][j] + 1,
+        d[i][j - 1] + 1,
+        d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+  }
+  return d[a.length][b.length];
+}
+
 /** Re-segment the cached frames. Only valid for configs that leave
  *  `analysis` alone — every sweep here does. */
 function resegment(cfg: DspConfig): string {
@@ -92,22 +112,54 @@ describe.skipIf(!existsSync(FIXTURE))("golden: tron_reconfigured.wav", () => {
   test("is stable across the whole neighbourhood of its tuning parameters", () => {
     // A transcription that only survives one exact set of thresholds is a
     // transcription that was fitted to this recording rather than derived from
-    // it. Every combination in this neighbourhood must give the same answer —
-    // that is what makes the sequence above worth freezing, and what makes a
-    // future change to any single default safe to reason about.
-    for (const toleranceCents of [40, 50, 60]) {
-      for (const minNoteMs of [60, 80, 100]) {
-        for (const gapMergeMs of [60, 90, 120]) {
-          const cfg = mergeConfig(DEFAULT_CONFIG, {
-            segment: { toleranceCents, minNoteMs, gapMergeMs },
-          });
-          expect(
-            resegment(cfg),
-            `tolerance ${toleranceCents}c, minNote ${minNoteMs}ms, gapMerge ${gapMergeMs}ms`,
-          ).toBe(EXPECTED_SEQUENCE);
-        }
+    // it. This is the test that says otherwise — and it is worth saying exactly
+    // what it can and cannot claim.
+    //
+    // It used to sweep three parameters at three values each and demand an
+    // identical sequence from all twenty-seven, which it got. That was a
+    // stronger-looking claim than the evidence supported: swept more finely,
+    // the *same* code gave 39 notes at a tolerance of 44 and 48 cents, and the
+    // grid's 40/50/60 stepped straight over the boundary. Three points that
+    // happen to agree do not establish a plateau — the same false confidence
+    // an adversarial review found in the scoop test, where two sampled shapes
+    // passed and a third of the grid around them did not.
+    //
+    // So: sweep finely, one axis at a time, over a range wider than anyone
+    // would plausibly set — and measure how far the answer moves rather than
+    // demanding it not move at all. A whistled note that lasts 90 ms really
+    // does disappear when the shortest reportable note is raised to 100, and a
+    // gesture that slides 62 cents really does split when the wobble tolerance
+    // is tightened below that. What must not happen is the transcription
+    // *reorganising* itself: one note appearing or vanishing at the edges of
+    // the range is the signal working as documented, five would mean the
+    // sequence was balanced on a threshold.
+    const golden = EXPECTED_SEQUENCE.split(" ");
+    const axes: [string, string, number[]][] = [
+      ["segment", "toleranceCents", [36, 40, 44, 48, 52, 56, 60, 64, 68, 72]],
+      ["segment", "minNoteMs", [50, 60, 70, 80, 90, 100, 110, 120]],
+      ["segment", "gapMergeMs", [40, 60, 80, 100, 120]],
+      ["segment", "glideSlopeStPerSec", [12, 15, 18, 21, 24, 30]],
+      ["segment", "glideMinSemitones", [0.6, 0.7, 0.8, 0.9, 1.0]],
+      ["segment", "glideMinSlopeStPerSec", [2, 3, 4, 5]],
+      ["segment", "confirmFrames", [3, 5, 7]],
+      ["segment", "driftCapSemitones", [1.2, 1.5, 1.8]],
+    ];
+
+    let exact = 0;
+    let total = 0;
+    for (const [group, key, values] of axes) {
+      for (const value of values) {
+        const cfg = mergeConfig(DEFAULT_CONFIG, { [group]: { [key]: value } });
+        const sequence = resegment(cfg).split(" ");
+        total++;
+        if (sequence.join(" ") === EXPECTED_SEQUENCE) exact++;
+        expect(editDistance(sequence, golden), `${group}.${key} = ${value}`).toBeLessThanOrEqual(1);
       }
     }
+    // The great majority of the neighbourhood is not merely close but
+    // identical: 35 of these 44 settings reproduce the sequence exactly, and
+    // the nine that do not are the two boundaries described above.
+    expect(exact / total).toBeGreaterThan(0.75);
   });
 
   test("is stable across the voicing thresholds too", () => {
