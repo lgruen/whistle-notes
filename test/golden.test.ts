@@ -31,21 +31,28 @@ import { decodeWav } from "../tools/wav.js";
  *     test/fixtures/local/tron_reconfigured.wav
  *
  * ────────────────────────────────────────────────────────────────────────────
- * STATUS: **PROPOSED**, not yet verified.
+ * STATUS: verified at a piano (2026-08-31).
  *
- * The sequence below is what the pipeline currently hears, and it is stable
- * (see the parameter sweeps recorded beneath it). What it is *not*, yet, is
- * confirmed to be what was whistled: that requires the user to play it at a
- * piano and say whether it sounds like the tune they had in mind. Until then
- * this test guards against unintended change, not against being wrong. Once
- * verified, delete this notice — and if the verification says otherwise,
- * change the expectation rather than defending it.
+ * The user played the transcript and confirmed it matches what was whistled —
+ * "the main issue now is my whistling, not the app". The deviations between
+ * this sequence and the source tune (the vocal hook of "Fall", M83 vs Big
+ * Black Delta) are the whistler's, faithfully transcribed: the G6s are a slot
+ * the whistler consistently pitched a semitone sharp (the song sings F#6
+ * there), and the C/C#, D/D# pairs are places the whistle landed 40-50 cents
+ * between two keys. The user's piano-verified *intended* melody, one octave
+ * down and with those slots corrected, is:
+ *
+ *   D#5 F#5 D#5 G#5 | D#5 C#5 D#5 C#5 | D#5 F#5 D#5 F#5 | D#5 F#5 D#5 B4 G#4
+ *
+ * So this test pins the pipeline's reading of the RECORDING, which is the
+ * thing it must not drift from. If it ever fails, the pipeline changed — the
+ * whistle did not.
  * ────────────────────────────────────────────────────────────────────────────
  */
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/local/tron_reconfigured.wav", import.meta.url));
 
-/** PROPOSED — pending verification at a piano. 38 notes. */
+/** Verified at a piano 2026-08-31 (see banner above). 38 notes. */
 const EXPECTED_SEQUENCE =
   "C#6 F6 D6 G#6 D#6 C6 D#6 C#6 C#6 E6 C#6 F6 G6 D6 F6 D6 C6 G5 " +
   "C#6 F6 D#6 G#6 D#6 C#6 D#6 C#6 C#6 E6 F6 D6 F#6 G6 D#6 F6 D#6 B5 G5 G#5";
