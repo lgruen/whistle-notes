@@ -430,4 +430,10 @@ function runSweep(cache: FrameCache, base: DspConfig, sweeps: string[]): void {
   }
 }
 
-main();
+try {
+  main();
+} catch (error) {
+  // A stack trace for a typo in `--set segment.tolerence=60` helps nobody.
+  console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
+}
