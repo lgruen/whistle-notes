@@ -105,6 +105,17 @@ export const DEFAULT_CONFIG: DspConfig = {
     // real one — 43 of 150 scoop shapes on a synthetic grid did exactly that.
     glideMinSemitones: 0.8,
     // 60 cents — a bit over half a semitone. The "wobble snap" knob.
+    //
+    // It says how far a single frame may sit from the running reference and
+    // still be the same note, and it is *not* the widest wobble the pipeline
+    // survives: a vibrato of ±90 cents swings three times this far and still
+    // comes out as one correctly-named note, because stage G recognises an
+    // oscillation by its shape and puts the pieces back together afterwards.
+    // Measured limits of that repair, on a 1.2 s held note: one note through
+    // ±200 cents at 4 Hz, three notes at ±300. Nobody wobbles by half an
+    // octave, but the boundary is real, it is pinned in test/glide.test.ts,
+    // and past it the pipeline reports several plausible notes rather than one
+    // right one — which is the honest failure of the two available.
     toleranceCents: 60,
     refMedianLength: 15,
     // 7 frames ≈ 75 ms at the default hop, which is deliberately close to
@@ -115,6 +126,11 @@ export const DEFAULT_CONFIG: DspConfig = {
     // ~40 ms near each extreme and three frames of "agreement" at the top of a
     // wobble look exactly like a new note. Human vibrato is the constraint
     // here, and it sets the floor at roughly 60 ms.
+    //
+    // It cannot be raised much further to buy more wobble immunity: a wide
+    // wobble at 4 Hz dwells ~100 ms near each extreme, so the value that would
+    // out-wait it is also long enough to swallow real notes. That is why the
+    // wobble is repaired after the fact instead.
     confirmFrames: 7,
     driftCapSemitones: 1.5,
     // Whistlers scoop into notes. Dropping the first quarter of a long note

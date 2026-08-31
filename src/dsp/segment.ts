@@ -834,6 +834,20 @@ function isTrueSilence(
   return false;
 }
 
+/** Typical in-band level of a note, in dBFS. A median, so an attack or a fade
+ *  at one end does not stand for the whole. */
+function noteLevel(note: Measured, frames: PitchFrame[]): number {
+  const levels: number[] = [];
+  for (let i = note.startIndex; i <= note.endIndex; i++) levels.push(frames[i].bandRmsDb);
+  return median(levels);
+}
+
+/** Was every frame in this span louder than `levelDb`? */
+function louderThan(from: number, to: number, levelDb: number, frames: PitchFrame[]): boolean {
+  for (let i = from; i <= to; i++) if (frames[i].bandRmsDb < levelDb) return false;
+  return true;
+}
+
 /** Merge same-pitch notes separated only by a brief dropout. Repeats until
  *  stable, since merging two can bring a third within reach. */
 function mergeDropouts(
@@ -861,7 +875,26 @@ function mergeDropouts(
         gapFrames > 0 &&
         isTrueSilence(previous.endIndex + 1, next.startIndex - 1, frames, voicing, cfg);
 
-      if (samePitch && gapMs <= s.gapMergeMs && !silent) {
+      // A gap *louder* than the notes on either side of it is a different
+      // animal from a dropout: something happened in the room — a cough, a
+      // door, a chair — that buried the whistle rather than interrupted it.
+      // The tone is unrecoverable while it lasts, but a re-articulation would
+      // have been inaudible under it too, so the better guess is that the note
+      // continued. Length is no evidence here, which is why this bypasses
+      // `gapMergeMs`; that limit exists to stop two genuinely repeated notes
+      // in a noisy room from merging, and in that case the gap sits at the
+      // *room's* level, below the notes, not above them.
+      const masked =
+        gapFrames > 0 &&
+        !silent &&
+        louderThan(
+          previous.endIndex + 1,
+          next.startIndex - 1,
+          Math.min(noteLevel(previous, frames), noteLevel(next, frames)),
+          frames,
+        );
+
+      if (samePitch && (gapMs <= s.gapMergeMs || masked) && !silent) {
         out[out.length - 1] = measure(
           {
             startIndex: previous.startIndex,

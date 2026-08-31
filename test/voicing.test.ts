@@ -68,16 +68,33 @@ describe("adaptive noise floor", () => {
     const clean = transcribe(toneWithBurst(null), SR).notes;
     expect(NAMES(clean)).toEqual(["E6"]);
 
+    // The whistler never stopped, so neither should the note. The tone really
+    // is unrecoverable for the 300 ms the burst masks it — but a gap that is
+    // *louder* than the notes either side of it is a room event, not a rest,
+    // and a re-articulation would have been just as inaudible under it.
     const notes = transcribe(toneWithBurst(2.0), SR).notes;
-    expect(new Set(NAMES(notes))).toEqual(new Set(["E6"]));
+    expect(NAMES(notes)).toEqual(["E6"]);
+    expect(notes[0].startSec).toBeCloseTo(clean[0].startSec, 1);
+    expect(notes[0].endSec).toBeCloseTo(clean[0].endSec, 1);
+  });
 
-    // The tone is genuinely unrecoverable while the burst masks it, so a break
-    // *there* is honest. Anywhere else is not: after the burst the note must
-    // resume immediately and run to the end.
-    const last = notes[notes.length - 1];
-    expect(last.startSec).toBeLessThan(2.4);
-    expect(last.endSec).toBeCloseTo(clean[0].endSec, 1);
-    for (const note of notes) expect(note.startSec).not.toBeGreaterThan(2.4);
+  it("does not use that as a licence to merge repeated notes in a noisy room", () => {
+    // The other side of the masking rule. Two E6s with a real silence between
+    // them stay two, however much noise is in the room — because the gap sits
+    // at the *room's* level, below the notes, and not above them as a burst
+    // does. Without this distinction the rule would quietly turn every
+    // re-articulated note in a café into one long one.
+    const repeated = addNoise(
+      sequence(
+        [
+          { midi: 88, durSec: 0.4, gapSec: 0.25, amp: 0.25 },
+          { midi: 88, durSec: 0.4, amp: 0.25 },
+        ],
+        { leadInSec: 0.5, tailSec: 0.4 },
+      ),
+      { type: "pink", levelDb: -40, seed: 7 },
+    );
+    expect(NAMES(transcribe(repeated.samples, SR).notes)).toEqual(["E6", "E6"]);
   });
 
   it("measures the same floor with and without that burst", () => {
