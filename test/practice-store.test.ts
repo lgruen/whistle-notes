@@ -520,7 +520,7 @@ describe("the echo drills", () => {
     const store = await loadStore();
     store.beginHold(makeRng(3));
     store.beginHoldTake();
-    store.finishHold({ medianCents: 24, wobbleCents: 11, steadySec: 2, frames: 150 }, 7);
+    store.finishHold({ medianCents: 24, wobbleCents: 11, driftCents: 0, steadySec: 2, frames: 150 }, 7);
 
     const state = store.getPracticeState();
     expect(state.hold!.recording).toBe(false);
@@ -535,11 +535,38 @@ describe("the echo drills", () => {
     expect(JSON.parse(storage.peek(STATS_KEY)!).holds.count).toBe(1);
   });
 
+  it("shows a hold that slid without folding it into the averages", async () => {
+    // `offsetEwma` is where this whistler's aim sits and `wobbleEwma` is how
+    // still they hold it. A note that travelled a semitone from end to end has
+    // neither: its median is a pitch it passed through, and its interquartile
+    // range under-states the failure four times over. Folding it would flatter
+    // exactly the habit the drill just caught.
+    const store = await loadStore();
+    store.beginHold(makeRng(3));
+    store.finishHold(
+      { medianCents: 10, wobbleCents: 6, driftCents: 0, steadySec: 2, frames: 150 },
+      1,
+    );
+    const settled = store.getPracticeState().stats.holds;
+
+    store.beginHoldTake();
+    const slid = { medianCents: 60, wobbleCents: 19, driftCents: 100, steadySec: 2, frames: 150 };
+    store.finishHold(slid, 2);
+
+    const state = store.getPracticeState();
+    // On screen, in full...
+    expect(state.hold!.score).toEqual(slid);
+    expect(state.hold!.recording).toBe(false);
+    // ...and not in the averages, which still describe held notes only.
+    expect(state.stats.holds).toEqual(settled);
+    expect(JSON.parse(storage.peek(STATS_KEY)!).holds.count).toBe(1);
+  });
+
   it("keeps the note for another go, and changes it for a new one", async () => {
     const store = await loadStore();
     store.beginHold(makeRng(3));
     const first = store.getPracticeState().hold!.referenceMidi;
-    store.finishHold({ medianCents: 0, wobbleCents: 5, steadySec: 2, frames: 150 }, 1);
+    store.finishHold({ medianCents: 0, wobbleCents: 5, driftCents: 0, steadySec: 2, frames: 150 }, 1);
 
     store.retryHold();
     expect(store.getPracticeState().hold!.referenceMidi).toBe(first);

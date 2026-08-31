@@ -175,6 +175,15 @@ export interface OverlayModel {
   /** Vertical extent to draw, in MIDI numbers, padded. */
   minMidi: number;
   maxMidi: number;
+  /**
+   * Where the timeline starts, in seconds. Zero — the start of the take —
+   * except when the melody's opening notes were never sung: they have to be
+   * drawn *before* the first thing that was, and there may be no silence there
+   * to put them in. Negative time is the honest answer, and it is the mirror of
+   * a trailing run of missed notes, which is allowed to run past the end of the
+   * take for the same reason.
+   */
+  originSec: number;
   /** Timeline length, in seconds. */
   spanSec: number;
 }
@@ -312,6 +321,7 @@ export function overlayModel(input: OverlayInput): OverlayModel {
     transposition,
     minMidi: range.min,
     maxMidi: range.max,
+    originSec: items.reduce((min, item) => Math.min(min, item.startSec), 0),
     spanSec: Math.max(
       0.5,
       lastEnd(attempt),
@@ -333,6 +343,16 @@ function lastEnd(attempt: readonly HeardNote[]): number {
  * notes together), the run is centred on the join and allowed to overlap its
  * neighbours slightly — which reads as *squeezed in between*, and is a truer
  * picture than hiding it.
+ *
+ * A run at the **start** is the exception, and it is where the symmetry was
+ * broken. A trailing run borrows time past the end of the take and is never
+ * short of room; a leading run had `0` hard-coded as the time before it, so
+ * whenever the first sung note landed near the start of the take there was
+ * nowhere for the run to go and it overlapped *forward* — squeezing the ghosts
+ * of notes that came first on top of the rectangle of the note that came after
+ * them, which reads as the wrong thing entirely. So it borrows silence before
+ * the take instead, exactly as a trailing run borrows silence after it, and
+ * {@link OverlayModel.originSec} carries the negative time out to the canvas.
  */
 function placeMissing(items: OverlayItem[], slice: number, takeEnd: number): void {
   let i = 0;
@@ -348,14 +368,17 @@ function placeMissing(items: OverlayItem[], slice: number, takeEnd: number): voi
     // The silence available: from the last thing sung before the run to the
     // first thing sung after it. A run at either edge borrows the take's own
     // start or finish.
-    const before = i > 0 ? items[i - 1].endSec : 0;
+    const leading = i === 0;
+    const before = leading ? 0 : items[i - 1].endSec;
     const after = end + 1 < items.length ? items[end + 1].startSec : takeEnd + count * slice;
     const needed = count * slice;
     let start = before;
     let width = after - before;
     if (!(width >= needed)) {
-      const centre = (before + after) / 2;
-      start = Math.max(0, centre - needed / 2);
+      // Backwards for a leading run — there is nothing to its left to disturb —
+      // and centred on the join for an interior one, which is the overhang the
+      // docblock above describes.
+      start = leading ? after - needed : Math.max(0, (before + after) / 2 - needed / 2);
       width = needed;
     }
     for (let k = 0; k < count; k++) {

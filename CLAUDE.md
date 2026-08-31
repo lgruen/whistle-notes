@@ -407,6 +407,18 @@ and reports the median offset and half the interquartile range. Median and IQR
 because one cracked frame where the breath ran out would move a mean by tens of
 cents and a standard deviation by hundreds.
 
+It also reports `driftCents`, and that is a third number rather than a nicety:
+median and IQR are both *positional* and a slide is not. A note that sinks a
+whole semitone over two seconds has its median halfway down the slide and an
+IQR of about half the excursion, so the drill called a 100-cent failure "±19
+cents, steady and close" — under-stated four times over, with the advice
+pointing at the wrong thing (a slide wants more air, a wobble wants less). The
+drift is the last quarter's median minus the first quarter's, extrapolated back
+to the whole stretch and capped at the range the note actually visited. When it
+dominates (`driftDominates`), it is what the score line and the takeaway talk
+about — and `finishHold` **shows it without folding it**, because a note that
+never settled has no aim to contribute and a wobble that flatters it.
+
 **The trail must be uncorrected**: `applyHoldTake` calls
 `trailFromFrames(frames, 0)`, deliberately dropping the take's global tuning
 offset. That correction exists to rescue a consistently-sharp whistler from
@@ -441,11 +453,23 @@ at 7 — this user's measured weaknesses are 3rds, 6ths and 7ths, and a 6th is n
 semitones, so a generator that stopped there could never once drill the thing it
 exists for.
 
-`stepWeights` multiplies a weak interval's weight by `1 + 3 × weakness`
-(`intervalWeakness` tops out near 1.5, so ×5.5 at worst). It is a **bias, not a
-filter**, and the fallback is not a branch: with no history every multiplier is 1
-and the generator is exactly the plain random walk. A test asserts that as an
-*identity* on seeded output, so a second code path cannot appear unnoticed.
+`stepWeights` multiplies a weak interval's weight by `1 + 3 × weakness /
+availability`. It is a **bias, not a filter**, and the fallback is not a branch:
+with no history every multiplier is 1 and the generator is exactly the plain
+random walk. A test asserts that as an *identity* on seeded output, so a second
+code path cannot appear unnoticed.
+
+The `availability` divisor is the part that is easy to leave out and was.
+**A weight is not a frequency**: `echoPhrase` zeroes the steps that would walk
+out of the register and re-normalises, so a step's share of the phrases actually
+drawn is its weight times the fraction of starting notes it is legal from — four
+of thirteen for a ninth against eleven for a whole tone. Without the correction
+a maximally weak sixth reached 4.8% of drawn steps where an ordinary step gets
+about 10%, under a docblock claiming they were comparable. With it, both
+directions of a weak sixth take 11.6%; one direction alone reaches about half
+that, because after a rising ninth there is usually no room for another. The
+divisor is floored (`MIN_AVAILABILITY`) so an octave — legal from one position
+in thirteen — cannot be handed a thirteen-fold weight.
 `ECHO_MIN_OBSERVATIONS` (5) is higher than `weakestIntervals`' own default,
 because a drill that decided your rising 4th is a weakness after two unlucky
 attempts would keep asking for it for a week.
@@ -454,9 +478,14 @@ The ramp moves one note per attempt inside 3–6, and counts `clean` **or** `off
 as a success: demanding 30-cent accuracy from a beginner's whistle before the
 phrase grows would mean it never moved. Aim is the other drill's question.
 
-**One ledger.** `foldIntervals` in `stats.ts` is the only place directed-interval
-statistics are written, and both `recordAttempt` (recall) and `recordDrillAttempt`
-(the drill) go through it. This matters more than it looks: the drill *reads those
+**One ledger, one update per attempt.** `foldIntervals` in `stats.ts` is the only
+place directed-interval statistics are written, and both `recordAttempt` (recall)
+and `recordDrillAttempt` (the drill) go through it. Within one attempt it
+aggregates each directed step *first* and folds once: a melody plays the same
+step several times, and an EWMA applied per slot weighted the last occurrence
+nearly twice the first, so the same three outcomes in a different order in one
+take gave numbers up to a factor of two apart — and the drill would ask for a
+different interval on the strength of where a note happened to fall. This matters more than it looks: the drill *reads those
 same numbers back* to choose the next phrase, so a second accumulator with its
 own idea of what a `missing` slot means would show up as a drill quietly
 practising the wrong thing for months without ever throwing. A generated phrase

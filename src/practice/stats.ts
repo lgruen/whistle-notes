@@ -34,7 +34,13 @@
  * treat practice stats the way `src/ui/state.ts` treats everything else.
  */
 
-import { OFF_CENTS, type Alignment, type TargetNote, type Verdict } from "./align.js";
+import {
+  OFF_CENTS,
+  type Alignment,
+  type SlotResult,
+  type TargetNote,
+  type Verdict,
+} from "./align.js";
 
 /**
  * EWMA weight on the newest observation.
@@ -208,42 +214,73 @@ function ewma(previous: number, count: number, value: number): number {
  *
  * The two callers differ only in what else they remember: a target has a slot
  * history, a generated phrase has nothing to have a history *of*.
+ *
+ * ## One update per interval per attempt
+ *
+ * A melody plays the same directed step more than once — "Twinkle" has four
+ * rising whole tones — and an EWMA folded per *slot* would apply
+ * {@link EWMA_ALPHA} several times inside one attempt, weighting the last
+ * occurrence of a step nearly twice as heavily as the first. The same three
+ * outcomes in a different order in the same take then produced different
+ * numbers, by up to a factor of two, and the drill would go and ask for a
+ * different interval on the strength of it. Position in a melody is not
+ * evidence about an interval.
+ *
+ * So each interval's slots are aggregated across the attempt first — the mean
+ * aim over the ones that were the right note, the fraction of the rest that
+ * were wrong — and *then* folded, once. The lifetime counts are unaffected;
+ * they were only ever sums.
  */
 function foldIntervals(
   intervals: Map<number, IntervalStat>,
   target: readonly TargetNote[],
   alignment: Alignment,
 ): void {
+  /** This attempt's slots, grouped by the directed step that led into them. */
+  const byInterval = new Map<number, SlotResult[]>();
   for (const slot of alignment.slots) {
     // Slot 0 arrives from nowhere: there is no interval into the first note of
     // a melody, so it contributes to the per-slot tally and nothing else.
     if (slot.slot === 0 || slot.slot >= target.length) continue;
     const interval = target[slot.slot].midi - target[slot.slot - 1].midi;
+    const group = byInterval.get(interval);
+    if (group) group.push(slot);
+    else byInterval.set(interval, [slot]);
+  }
+
+  for (const [interval, slots] of byInterval) {
     const previous = intervals.get(interval) ?? emptyInterval(interval);
     const next: IntervalStat = { ...previous };
 
-    if (slot.verdict === "missing") {
-      next.missing++;
-    } else {
-      next.wrongRateEwma = ewma(
-        previous.wrongRateEwma,
-        previous.observations,
-        slot.verdict === "wrong" ? 1 : 0,
-      );
-      next.observations++;
+    let sung = 0;
+    let wrong = 0;
+    let aimed = 0;
+    let cents = 0;
+    for (const slot of slots) {
+      if (slot.verdict === "missing") {
+        next.missing++;
+        continue;
+      }
+      sung++;
       if (slot.verdict === "wrong") {
+        wrong++;
         next.wrong++;
       } else {
         // `clean` and `off` are the two ways of hitting the right note, and
         // only they say anything about aim.
         next[slot.verdict]++;
-        next.absCentsEwma = ewma(
-          previous.absCentsEwma,
-          previous.centsObservations,
-          Math.abs(slot.residualCents ?? 0),
-        );
-        next.centsObservations++;
+        aimed++;
+        cents += Math.abs(slot.residualCents ?? 0);
       }
+    }
+
+    if (sung > 0) {
+      next.wrongRateEwma = ewma(previous.wrongRateEwma, previous.observations, wrong / sung);
+      next.observations += sung;
+    }
+    if (aimed > 0) {
+      next.absCentsEwma = ewma(previous.absCentsEwma, previous.centsObservations, cents / aimed);
+      next.centsObservations += aimed;
     }
     intervals.set(interval, next);
   }
@@ -278,6 +315,10 @@ export function recordDrillAttempt(
  * number answers "how is my aim *today*", and an average that still remembered
  * the first hold of the first session would keep reporting a problem that has
  * been fixed for a month.
+ *
+ * Not every scored hold reaches here: a hold that *slid* has no aim to
+ * contribute and a wobble that under-states what happened, so `store.ts` shows
+ * it and folds nothing. See `finishHold` and `driftDominates` in `drill.ts`.
  */
 export function recordHold(
   stats: PracticeStats,

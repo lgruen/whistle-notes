@@ -6,6 +6,7 @@ import {
   ECHO_MIN_NOTES,
   ECHO_MIN_OBSERVATIONS,
   MIN_HOLD_SEC,
+  driftDominates,
   drillRange,
   echoPhrase,
   echoRampText,
@@ -213,6 +214,54 @@ describe("scoreHold", () => {
     expect(score!.steadySec).toBeGreaterThan(1);
   });
 
+  /**
+   * A slide is not a wobble, and the median and the IQR cannot tell them apart.
+   *
+   * A note that sinks a whole semitone over two seconds has its median halfway
+   * down the slide — a pitch it passed through — and an interquartile range of
+   * about half the excursion. The drill used to report that as "±19 cents,
+   * steady and close": the failure under-stated four times over, and the advice
+   * pointed at the wrong thing, since a slide wants air behind it and a wobble
+   * wants less.
+   */
+  it("measures a slide as the distance it travelled, not as a width", () => {
+    for (const semitones of [0.5, 1, 1.5]) {
+      const points = held(0, 2, (i) => 84 + (i / 188) * semitones);
+      const score = scoreHold(points, 84)!;
+      // Reported across the whole scored stretch, so it is comparable to "a
+      // semitone" rather than to the fraction of one the quartiles span.
+      expect(score.driftCents, `${semitones} st`).toBeCloseTo(75 * semitones, -0.7);
+      expect(driftDominates(score), `${semitones} st`).toBe(true);
+      expect(holdTakeaway(score), `${semitones} st`).toMatch(/slid/i);
+      expect(holdScoreText(score), `${semitones} st`).toMatch(/sliding/i);
+      // The width the wobble reports is a fraction of what actually happened,
+      // which is exactly why it cannot be the whole story.
+      expect(score.wobbleCents, `${semitones} st`).toBeLessThan(
+        Math.abs(score.driftCents) / 2,
+      );
+    }
+  });
+
+  it("keeps calling an oscillation a wobble", () => {
+    // The same excursion as a slide, taken back and forth: a few cycles average
+    // out at both ends, so the drift is nothing and the wobble is the story.
+    const score = scoreHold(held(0, 3, (i) => 84 + 0.5 * Math.sin((i / 94) * 2 * Math.PI * 4)), 84)!;
+    // A whole number of cycles would cancel exactly; a real hold never contains
+    // one, so what is asserted is the discrimination rather than a zero — an
+    // oscillation's ends differ by less than its width, and a slide's by more.
+    expect(Math.abs(score.driftCents)).toBeLessThan(score.wobbleCents);
+    expect(driftDominates(score)).toBe(false);
+    expect(holdTakeaway(score)).toMatch(/wander/i);
+  });
+
+  it("never claims a note travelled further than it went", () => {
+    // A breath that cracks an octave halfway is a step, not a slope, and
+    // extrapolating the reach between two flat quarters would report sixteen
+    // semitones of travel through pitches nothing ever sounded.
+    const score = scoreHold(held(0, 3, (i) => (i < 141 ? 84 : 96)), 84)!;
+    expect(Math.abs(score.driftCents)).toBeLessThanOrEqual(1200 + 1e-6);
+  });
+
   it("refuses to invent a measurement when there is nothing sustained", () => {
     expect(scoreHold([], 84)).toBeNull();
     expect(scoreHold(held(0, MIN_HOLD_SEC / 2, 84), 84)).toBeNull();
@@ -224,9 +273,10 @@ describe("scoreHold", () => {
 });
 
 describe("what the hold drill says", () => {
-  const score = (medianCents: number, wobbleCents: number) => ({
+  const score = (medianCents: number, wobbleCents: number, driftCents = 0) => ({
     medianCents,
     wobbleCents,
+    driftCents,
     steadySec: 2,
     frames: 150,
   });
@@ -287,6 +337,28 @@ function statsWeakAt(interval: number, attempts = 6): PracticeStats {
 
 function steps(phrase: readonly TargetNote[]): number[] {
   return phrase.slice(1).map((note, i) => note.midi - phrase[i].midi);
+}
+
+/** A history in which some intervals are as weak as `intervalWeakness` can
+ *  report — every attempt a wrong note *and* the aim maxed out. Built by hand
+ *  rather than through `recordAttempt`, because the ceiling is the thing being
+ *  measured and nothing short of both failures at once reaches it. */
+function maximallyWeakAt(intervals: readonly number[]): PracticeStats {
+  const map = new Map<number, IntervalStat>();
+  for (const interval of intervals) {
+    map.set(interval, {
+      interval,
+      observations: 10,
+      clean: 0,
+      off: 0,
+      wrong: 10,
+      missing: 0,
+      absCentsEwma: 70,
+      centsObservations: 10,
+      wrongRateEwma: 1,
+    });
+  }
+  return { intervals: map, targets: new Map(), holds: null };
 }
 
 describe("stepWeights", () => {
@@ -377,6 +449,31 @@ describe("echoPhrase", () => {
     expect(echoPhrase(makeRng(1), {})).toHaveLength(ECHO_MIN_NOTES);
   });
 
+  /**
+   * A zero-weight step is one that would walk out of the register, so picking
+   * one is not a statistical wrinkle — it is a phrase the drill cannot play.
+   *
+   * An `rng` returning exactly 0 is legal and is what a caller writes when it
+   * wants the first option; the cumulative scan used to hand it index 0
+   * whatever its weight. At the bottom of the register that is a twelve-
+   * semitone step down, every time: measured, the phrase walked 82, 70, 58, 46,
+   * 34, 22 — five notes below anything anybody can whistle.
+   */
+  it("stays inside the register even for an rng that only ever returns zero", () => {
+    const phrase = echoPhrase(() => 0, { length: 6, range: RANGE });
+    expect(phrase).toHaveLength(6);
+    for (const note of phrase) {
+      expect(note.midi).toBeGreaterThanOrEqual(RANGE.lowMidi);
+      expect(note.midi).toBeLessThanOrEqual(RANGE.highMidi);
+    }
+    // ...and the same at the other end of the draw.
+    const top = echoPhrase(() => 0.9999999999, { length: 6, range: RANGE });
+    for (const note of top) {
+      expect(note.midi).toBeGreaterThanOrEqual(RANGE.lowMidi);
+      expect(note.midi).toBeLessThanOrEqual(RANGE.highMidi);
+    }
+  });
+
   it("mostly walks in small steps when it has nothing to go on", () => {
     const counts = new Map<number, number>();
     for (let seed = 0; seed < 400; seed++) {
@@ -422,6 +519,46 @@ describe("echoPhrase", () => {
     // Still a drill and not a metronome: the weak step is over-sampled, not
     // the only thing left.
     expect(after).toBeLessThan(0.5);
+  });
+
+  /**
+   * The *ceiling*, which the bound above is far too loose to see.
+   *
+   * "Over-sampled" was true and beside the point: a maximally weak sixth still
+   * reached under 5% of drawn steps against an ordinary step's 10%, because a
+   * weight is not a frequency — the walk can only take a ninth from four of the
+   * thirteen notes in this register, and the re-normalisation quietly took
+   * two-thirds of the bias back. So this measures the thing the docblock claims
+   * and both ends of it: enough to matter, and not so much that the drill
+   * becomes three intervals.
+   */
+  it("gets a weak sixth drilled as often as an ordinary step, and no oftener", () => {
+    const share = (stats: PracticeStats | null, wanted: readonly number[]): number => {
+      let seen = 0;
+      let total = 0;
+      for (let seed = 0; seed < 600; seed++) {
+        for (const step of steps(echoPhrase(makeRng(seed), { length: 6, range: RANGE, stats }))) {
+          total++;
+          if (wanted.includes(step)) seen++;
+        }
+      }
+      return seen / total;
+    };
+
+    // An ordinary step, with nothing to go on: the yardstick.
+    const ordinary = share(null, [2]);
+    expect(ordinary).toBeGreaterThan(0.08);
+
+    const sixths = [9, -9];
+    const weak = share(maximallyWeakAt(sixths), sixths);
+    // Measured: 0.9% before the history says anything, 11.6% after — against
+    // an ordinary step's 10.6%. The old behaviour reached 4.8%, so the lower
+    // bound here is one this would have failed.
+    expect(weak).toBeGreaterThan(ordinary / 2);
+    expect(weak).toBeGreaterThan(share(null, sixths) * 6);
+    // ...and the ceiling, which is what keeps it an ear test rather than a
+    // memory test for three intervals.
+    expect(weak).toBeLessThan(0.25);
   });
 });
 

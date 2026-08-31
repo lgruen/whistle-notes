@@ -44,6 +44,7 @@
 
 import type { Alignment, TargetNote } from "./align.js";
 import {
+  driftDominates,
   drillRange,
   echoPhrase,
   echoRampText,
@@ -769,15 +770,28 @@ export function endHoldTake(message = ""): void {
   setPracticeState({ hold: { ...hold, recording: false }, message });
 }
 
-/** A scored hold: show it, remember the two numbers, persist. */
+/**
+ * A scored hold: show it, remember the two numbers, persist.
+ *
+ * **A hold that slid is shown and not folded.** `offsetEwma` is "where this
+ * whistler's aim sits" and `wobbleEwma` is "how still they hold it"; a note that
+ * travelled a semitone from end to end has no aim to contribute — its median is
+ * the middle of a slide, a pitch it passed through rather than held — and its
+ * interquartile range under-states the failure by a factor of four, so folding
+ * it in would flatter the very habit the drill just caught. The screen still
+ * says exactly what happened, and `count` keeps meaning what its docblock says:
+ * holds that are in the averages.
+ */
 export function finishHold(score: HoldScore, at: number = Date.now()): void {
   const hold = state.hold;
   if (!hold) return;
-  const stats = recordHold(state.stats, score.medianCents, score.wobbleCents, at);
+  const stats = driftDominates(score)
+    ? state.stats
+    : recordHold(state.stats, score.medianCents, score.wobbleCents, at);
   setPracticeState({
     hold: { ...hold, recording: false, score },
     stats,
-    storageError: persistStats(stats),
+    storageError: stats === state.stats ? state.storageError : persistStats(stats),
     message: "",
   });
 }

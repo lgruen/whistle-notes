@@ -183,6 +183,38 @@ describe("the overlay", () => {
     expect(missing.targetMidi).toBe(88);
   });
 
+  /**
+   * A run of missed notes at the *start* has nowhere forward to go.
+   *
+   * The trailing case borrows time past the end of the take and is never short
+   * of room; the leading case had zero hard-coded as the time before it, so a
+   * take whose first sung note starts at the very beginning left the ghosts of
+   * the notes that came *first* drawn on top of the note that came after them.
+   * They go backwards instead, and the model says where the timeline now
+   * starts.
+   */
+  it("wedges a missed opening before the take rather than over it", () => {
+    // The melody's first two notes never happened, and the third was whistled
+    // from the very first frame of the take: no silence at the front at all.
+    const attempt: HeardNote[] = [
+      { midi: 88, centsOffset: 0, durationSec: 0.4, startSec: 0, endSec: 0.4 },
+    ];
+    const alignment = alignAttempt(attempt, melody(PHRASE.slice(0, 3)));
+    const model = overlayModel({ alignment, attempt });
+
+    expect(model.items.map((item) => item.outcome)).toEqual(["missing", "missing", "clean"]);
+    expect(model.originSec).toBeLessThan(0);
+    for (let i = 0; i < model.items.length; i++) {
+      const item = model.items[i];
+      expect(item.endSec, `item ${i}`).toBeGreaterThan(item.startSec);
+      expect(item.startSec, `item ${i}`).toBeGreaterThanOrEqual(model.originSec);
+      // Nothing overlaps anything: in particular the ghosts stop exactly where
+      // the note that *was* sung begins.
+      if (i > 0) expect(item.startSec, `item ${i}`).toBeGreaterThanOrEqual(model.items[i - 1].endSec - 1e-9);
+    }
+    expect(model.items[1].endSec).toBeCloseTo(0, 9);
+  });
+
   it("shares the gap between several missed notes in a row", () => {
     // Two notes dropped out of the middle of a longer phrase. Longer, because
     // a four-note target with two notes missing is genuinely ambiguous about

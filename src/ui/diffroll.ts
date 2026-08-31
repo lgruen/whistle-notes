@@ -115,9 +115,14 @@ export function drawDiffOverlay(canvas: HTMLCanvasElement, view: DiffView): void
   const plotTop = PAD.top;
   const plotHeight = Math.max(1, height - PAD.top - PAD.bottom);
   const semitones = Math.max(1, model.maxMidi - model.minMidi);
-  const spanSec = Math.max(0.5, model.spanSec);
+  // The timeline can start before the take does: a melody whose opening notes
+  // were never sung has to draw them somewhere, and there may be no silence at
+  // the front to put them in. See `originSec` in `practice/recall.ts`.
+  const originSec = Math.min(0, model.originSec);
+  const spanSec = Math.max(originSec + 0.5, model.spanSec);
 
-  const x = (tSec: number): number => plotLeft + (tSec / spanSec) * plotWidth;
+  const x = (tSec: number): number =>
+    plotLeft + ((tSec - originSec) / (spanSec - originSec)) * plotWidth;
   const y = (midi: number): number =>
     plotTop + ((model.maxMidi - midi) / semitones) * plotHeight;
   const semitoneHeight = plotHeight / semitones;

@@ -94,6 +94,41 @@ describe("per-interval statistics", () => {
     );
   });
 
+  /**
+   * Position in a melody is not evidence about an interval.
+   *
+   * A tune plays the same directed step several times, and an EWMA folded once
+   * per *slot* applies its weight several times inside one attempt — so the last
+   * occurrence counted for nearly twice the first, and the same three outcomes
+   * in a different order in the same take produced numbers up to a factor of two
+   * apart. The drill reads those numbers back to choose the next phrase, so that
+   * is not a rounding difference: it is the app asking for a different interval
+   * because of where a note happened to fall.
+   */
+  it("does not care which order one attempt's repeats came in", () => {
+    // Three rising major thirds in one melody, with three different outcomes.
+    const thirds = melody([60, 64, 68, 72]);
+    const outcomes = [10, 45, 100];
+    const first = recordAttempt(
+      emptyStats(),
+      "t",
+      thirds,
+      attemptOf(thirds, [0, ...outcomes]),
+      1,
+    );
+    const reversed = recordAttempt(
+      emptyStats(),
+      "t",
+      thirds,
+      attemptOf(thirds, [0, ...[...outcomes].reverse()]),
+      1,
+    );
+    expect(first.intervals.get(4)).toEqual(reversed.intervals.get(4));
+    // ...and one attempt is one EWMA step, whatever it contained: a third
+    // attempt's worth of movement cannot come out of a single take.
+    expect(first.intervals.get(4)!.wrongRateEwma).toBeCloseTo(1 / 3, 12);
+  });
+
   it("starts the average at the first observation, not at zero", () => {
     // Seeded at zero, a first attempt 60 cents flat would read as 15 and take
     // half a dozen attempts to tell the truth — which is most of the sessions

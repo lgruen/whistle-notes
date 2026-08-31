@@ -1296,7 +1296,7 @@ describe("the practice status line", () => {
 /* ── The drills ───────────────────────────────────────────────────────── */
 
 const HOLD: HoldSession = { referenceMidi: 84, plays: 0, recording: false, score: null };
-const SCORE = { medianCents: 24, wobbleCents: 11, steadySec: 2, frames: 150 };
+const SCORE = { medianCents: 24, wobbleCents: 11, driftCents: 0, steadySec: 2, frames: 150 };
 
 /** A generated phrase, as the drill would have made one. */
 const PHRASE = [84, 88, 86].map((midi) => ({ midi, durSec: 0.5 }));

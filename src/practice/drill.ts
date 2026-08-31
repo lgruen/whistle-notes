@@ -37,6 +37,19 @@
  *    what *changes* its EWMA, so the bias has to be gentle enough that the
  *    statistic can climb back out.
  *
+ * What that bias can actually reach is worth writing down, because the obvious
+ * reading of "×5.5 on the weight" is wrong by a factor of three. A weight is not
+ * a frequency here: {@link echoPhrase} zeroes the steps that would leave the
+ * register and re-normalises, so a step's share of the phrases actually drawn is
+ * its weight times the fraction of starting notes it is legal from — and a
+ * ninth is legal from four of the thirteen notes in a default drill register
+ * against eleven for a whole tone. {@link MIN_AVAILABILITY} explains the
+ * correction; measured, with both directions of a sixth maximally weak, they
+ * take 11.6% of drawn steps against an ordinary step's 10.6%, which is what
+ * "about as often as an ordinary step" was always supposed to mean. One
+ * direction alone reaches about half that, because after a rising ninth there is
+ * usually no room for another.
+ *
  * Pure: no DOM, no storage, no `src/audio`, no `src/dsp`. Every random choice
  * comes from an injected {@link Rng}, so a phrase is reproducible from a seed
  * and the bias can be measured in a test instead of eyeballed.
@@ -77,20 +90,41 @@ export function makeRng(seed: number): Rng {
   };
 }
 
-/** Pick from `weights` in proportion. Exactly one {@link Rng} call, which is
- *  what makes a phrase's length and its content independent of each other. */
+/**
+ * Pick from `weights` in proportion. Exactly one {@link Rng} call, which is
+ * what makes a phrase's length and its content independent of each other.
+ *
+ * **A zero weight can never be picked, at either end of the draw.** That is not
+ * a nicety: `echoPhrase` zeroes the steps that would walk out of the register,
+ * so an off-by-one here is a phrase that leaves the range the drill exists to
+ * stay inside. An `rng` returning exactly 0 — legal, and what a test that wants
+ * the first option writes — used to select index 0 whatever its weight, and a
+ * phrase at the bottom of the register then walked down twelve semitones at a
+ * time until it ran out of MIDI. So the scan compares a running cumulative
+ * against the threshold with a *strict* `>`, and the fallback for a threshold
+ * that lands on the very end is the last option that had any weight at all.
+ */
 function weightedPick(weights: readonly number[], rng: Rng): number {
   let total = 0;
-  for (const weight of weights) total += Math.max(0, weight);
-  if (!(total > 0)) return 0;
-  let threshold = rng() * total;
+  let last = -1;
   for (let i = 0; i < weights.length; i++) {
-    threshold -= Math.max(0, weights[i]);
-    // `<= 0` rather than `< 0`: a run of zero weights after the pick must not
-    // let the loop fall off the end and return the last index by accident.
-    if (threshold <= 0) return i;
+    if (weights[i] > 0) {
+      total += weights[i];
+      last = i;
+    }
   }
-  return weights.length - 1;
+  if (last < 0) return 0;
+
+  const threshold = rng() * total;
+  let cumulative = 0;
+  for (let i = 0; i < weights.length; i++) {
+    if (!(weights[i] > 0)) continue;
+    cumulative += weights[i];
+    if (cumulative > threshold) return i;
+  }
+  // Only reachable when floating-point summation lands the threshold on the
+  // total itself.
+  return last;
 }
 
 /* ── Where the drills live ────────────────────────────────────────────── */
@@ -188,21 +222,34 @@ export function holdReference(
 /**
  * What a held note actually did.
  *
- * Two numbers, and they answer different questions. `medianCents` is *aim*: the
- * middle of the note, signed, relative to what was played. `wobbleCents` is
+ * Three numbers, and they answer different questions. `medianCents` is *aim*:
+ * the middle of the note, signed, relative to what was played. `wobbleCents` is
  * *steadiness*: half the interquartile range of the same frames, which is the
- * width the pitch wandered over while it was being held.
+ * width the pitch wandered over while it was being held. `driftCents` is
+ * *direction*: how far the note travelled from one end of the hold to the
+ * other.
  *
  * Median and IQR rather than mean and standard deviation, for the reason
  * everything else in this codebase prefers them: one cracked frame where the
  * breath ran out would move a mean by tens of cents and a standard deviation by
  * hundreds, and neither number would then be about the held note at all.
+ *
+ * The drift is there because the other two are both *positional* and a slide is
+ * not. A note that starts on pitch and sinks a whole semitone over two seconds
+ * has a median halfway down the slide and an interquartile range of half the
+ * excursion — so the drill reported a 100-cent failure as "±19 cents, steady
+ * and close", under-stating it four times over and naming the wrong problem.
+ * A slide and a wobble need opposite advice (more air against less), so they
+ * get separate numbers.
  */
 export interface HoldScore {
   /** Signed cents from the reference: positive is sharp. */
   medianCents: number;
   /** Half the interquartile range of the scored frames, in cents. */
   wobbleCents: number;
+  /** Signed cents travelled across the scored stretch: positive drifts sharp.
+   *  See {@link driftDominates} for when it is the story. */
+  driftCents: number;
   /** How long the scored stretch lasted. */
   steadySec: number;
   /** How many frames it was measured from. */
@@ -283,9 +330,50 @@ export function scoreHold(
   return {
     medianCents: quantile(sorted, 0.5),
     wobbleCents: (quantile(sorted, 0.75) - quantile(sorted, 0.25)) / 2,
+    driftCents: driftAcross(scored, cents),
     steadySec: scored[scored.length - 1].tSec - scored[0].tSec,
     frames: scored.length,
   };
+}
+
+/**
+ * How far the note travelled, end to end, in cents.
+ *
+ * The median of the last quarter of the hold minus the median of the first
+ * quarter, extrapolated back out to the full stretch — a two-point robust slope
+ * rather than a least-squares fit. Medians because one cracked frame at either
+ * end would otherwise *be* the answer, and quarters because the extremes of a
+ * hold are where the breath is least reliable and a first-minus-last would read
+ * the attack and the run-out rather than the note.
+ *
+ * The extrapolation matters: the two quarter-medians sit at the eighth and the
+ * seventh-eighth of the hold, three quarters of it apart, so the raw difference
+ * under-reports a steady slide by a third. Dividing by the fraction of the
+ * stretch they actually span makes this the excursion across the whole hold,
+ * which is the number a person can compare to "a semitone".
+ *
+ * Nearly zero for a vibrato, because a few cycles average out at both ends —
+ * which is exactly the discrimination this number exists to make.
+ */
+function driftAcross(scored: readonly TrailPoint[], cents: readonly number[]): number {
+  const quarter = Math.max(1, Math.floor(scored.length / 4));
+  const head = cents.slice(0, quarter);
+  const tail = cents.slice(scored.length - quarter);
+  const middle = (values: readonly number[]): number =>
+    quantile([...values].sort((a, b) => a - b), 0.5);
+  // Centres of the two quarters, as a fraction of the stretch: with equal
+  // quarters they are 3/4 apart, and the ratio is what turns the difference
+  // between them into the whole hold's excursion.
+  const span = (scored.length - quarter) / scored.length;
+  if (!(span > 0)) return 0;
+  const drift = (middle(tail) - middle(head)) / span;
+  // Never further than the note actually went. Extrapolating a slope is right
+  // for a slide and wrong for a *step* — a breath that cracks an octave halfway
+  // through has both quarters flat, and the reach between them would otherwise
+  // be reported as sixteen semitones of travel through pitches nothing ever
+  // sounded.
+  const reach = Math.max(...cents) - Math.min(...cents);
+  return Math.sign(drift) * Math.min(Math.abs(drift), reach);
 }
 
 /** Inside this, "dead on" is the truer report than a number: a beginner's
@@ -306,20 +394,50 @@ export function holdScoreText(score: HoldScore): string {
     Math.abs(score.medianCents) < HOLD_DEAD_ON_CENTS
       ? "Held it dead on"
       : `Held it ${distanceText(score.medianCents)}`;
-  return `${aim}, wobble ±${Math.round(score.wobbleCents)} cents.`;
+  // The median is the middle of a slide, which is nowhere the note ever sat, so
+  // a hold that slid says how far it went instead of pretending to a width.
+  const spread = driftDominates(score)
+    ? `sliding ${distanceText(score.driftCents)} across the hold`
+    : `wobble ±${Math.round(score.wobbleCents)} cents`;
+  return `${aim}, ${spread}.`;
 }
 
 /** Above this the note wandered more than it sat still, whatever its median. */
 const WOBBLY_CENTS = 25;
+
+/** Below this a slide is a hold that is not quite still, and the wobble is the
+ *  better description of it. The same threshold as {@link WOBBLY_CENTS}, on
+ *  purpose: they are two ways of failing to hold one pitch, and one bar. */
+const DRIFTING_CENTS = WOBBLY_CENTS;
+
+/**
+ * Whether this hold's story is a slide rather than a wobble.
+ *
+ * Both, when both are true — a note can swing *and* sink — so the tie-break is
+ * which one is bigger. A monotone slide's interquartile range is about half its
+ * excursion, and a vibrato's drift is near zero, so the two are well separated
+ * in practice and the factor only decides the genuinely mixed cases.
+ */
+export function driftDominates(score: HoldScore): boolean {
+  return (
+    Math.abs(score.driftCents) >= DRIFTING_CENTS &&
+    Math.abs(score.driftCents) > score.wobbleCents
+  );
+}
 
 /**
  * The one thing worth doing something about, or a word that it went well.
  *
  * Steadiness first when both are bad: a note that is swinging has no stable
  * pitch for an aim correction to be applied *to*, so "hold it longer and
- * calmer" is the instruction that has to land first.
+ * calmer" is the instruction that has to land first. A slide comes before both
+ * — it is the biggest of the three failures and the only one whose fix is about
+ * *sustaining* rather than about aiming.
  */
 export function holdTakeaway(score: HoldScore): string {
+  if (driftDominates(score)) {
+    return `That one slid ${distanceText(score.driftCents)} while you held it — aim for one pitch and keep the air behind it.`;
+  }
   if (score.wobbleCents >= WOBBLY_CENTS) {
     return "That one wandered while you held it — a slower, steadier breath is the fix, before the aim.";
   }
@@ -393,13 +511,44 @@ const MAX_STEP = 12;
 /**
  * How hard the history pushes.
  *
- * {@link intervalWeakness} tops out around 1.5, so a maximally weak interval
- * ends up 1 + 3 × 1.5 = 5.5 times its base weight — enough that a weak 6th is
- * drilled about as often as an ordinary step, and not so much that the drill
- * collapses onto three intervals. See the module header for why this is a bias
- * rather than a filter.
+ * {@link intervalWeakness} tops out around 1.5, so before the availability
+ * correction below a maximally weak interval ends up 1 + 3 × 1.5 = 5.5 times
+ * its base weight. See the module header for why this is a bias rather than a
+ * filter.
  */
 const ADAPT_GAIN = 3;
+
+/**
+ * Floor on the availability correction, i.e. a cap on how far it can push.
+ *
+ * A weight is not a frequency. `echoPhrase` zeroes the steps that would walk
+ * out of the register and re-normalises what is left, so a step's share of the
+ * *drawn* phrases is its weight times the fraction of positions it is legal
+ * from — and a ninth is legal from four of the thirteen notes in a default
+ * drill register, against eleven for a whole tone. Multiplying a weak interval
+ * up without accounting for that leaves it suppressed by nearly three to one
+ * against the ordinary steps it is supposed to be displacing: measured, a
+ * maximally weak 6th reached 4.8% of drawn steps where an ordinary step gets
+ * 10-20%, against a docblock claiming they were comparable.
+ *
+ * So the gain is divided by availability, which cancels the suppression
+ * exactly — bounded here, because an octave leap is legal from one position in
+ * thirteen and an uncapped correction would hand it a thirteen-fold weight and
+ * turn every phrase near the edge of the register into the same leap.
+ */
+const MIN_AVAILABILITY = 0.3;
+
+/**
+ * The fraction of positions in a register from which a step stays inside it.
+ *
+ * Exactly the suppression {@link echoPhrase}'s re-normalisation applies, worked
+ * out from the register's width rather than measured, so the correction above
+ * is a cancellation rather than a fudge factor.
+ */
+function availability(semitones: number, spanSemitones: number): number {
+  const positions = Math.max(1, Math.floor(spanSemitones) + 1);
+  return Math.max(MIN_AVAILABILITY, (positions - Math.abs(semitones)) / positions);
+}
 
 /**
  * How much evidence an interval needs before it is allowed to steer the drill.
@@ -449,6 +598,7 @@ export interface PhraseOptions {
 export function stepWeights(
   stats: PracticeStats | null | undefined,
   minObservations: number = ECHO_MIN_OBSERVATIONS,
+  spanSemitones: number = DEFAULT_DRILL_RANGE.highMidi - DEFAULT_DRILL_RANGE.lowMidi,
 ): Map<number, number> {
   const weights = new Map<number, number>();
   for (const step of CANDIDATE_STEPS) weights.set(step, baseWeight(step));
@@ -461,7 +611,12 @@ export function stepWeights(
     // added: a phrase generator that can produce a leap no drill was designed
     // around is a worse answer than not drilling it.
     if (base === undefined) continue;
-    weights.set(stat.interval, base * (1 + ADAPT_GAIN * intervalWeakness(stat)));
+    // The gain, divided by how often this step is even *legal* — see
+    // {@link MIN_AVAILABILITY}. Only the gain: with no history the multiplier
+    // is 1 and this map is the plain random walk, byte for byte, which is what
+    // makes the fallback a formula rather than a second code path.
+    const gain = ADAPT_GAIN / availability(stat.interval, spanSemitones);
+    weights.set(stat.interval, base * (1 + gain * intervalWeakness(stat)));
   }
   return weights;
 }
@@ -480,12 +635,12 @@ export function echoPhrase(rng: Rng, options: PhraseOptions = {}): TargetNote[] 
     Math.min(ECHO_MAX_NOTES, Math.round(options.length ?? ECHO_MIN_NOTES)),
   );
   const durSec = options.noteSec ?? ECHO_NOTE_SEC;
-  const weights = stepWeights(options.stats, options.minObservations);
 
   // Start in the middle third, so a phrase that walks upward and one that walks
   // downward both have somewhere to go.
   const low = Math.ceil(range.lowMidi);
   const high = Math.floor(range.highMidi);
+  const weights = stepWeights(options.stats, options.minObservations, high - low);
   const inner = Math.max(1, Math.floor((high - low) / 3));
   let midi = low + Math.floor((high - low - inner) / 2) + Math.floor(rng() * (inner + 1));
 
