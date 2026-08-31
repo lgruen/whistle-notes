@@ -149,14 +149,15 @@ export interface VoicingConfig {
   minPeakToSecondDb: number;
   /** Percentile of background `bandRmsDb` taken as the noise floor. */
   noiseFloorPercentile: number;
-  /** How far above the floor a frame that fails the shape tests may still sit
-   *  and count as *evidence about the background*, in dB.
+  /** How far above the *local* room level a frame that fails the shape tests
+   *  may still sit and count as evidence about the background, in dB.
    *
    *  Without this the estimate has no defence against loud shapeless events: a
    *  cough, a door or a chair scrape fails every tone test at 40 dB over the
-   *  room, and admitting it drags the floor up to its level for as long as it
-   *  stays inside the trailing window — silencing the transcription seconds
-   *  *after* the noise, where the cause is invisible. */
+   *  room, and admitting it drags the floor up to its level for as long as the
+   *  window remembers it — silencing the transcription seconds *after* the
+   *  noise, where the cause is invisible. Local, because a global comparison
+   *  makes any room that changes level by more than this unrepresentable. */
   backgroundAboveFloorDb: number;
   /** Span the floor and its seed are measured over, in seconds, centred on the
    *  frame being judged. Adaptive because a quiet room and a café differ by

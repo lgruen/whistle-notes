@@ -59,7 +59,7 @@ export const DEFAULT_CONFIG: DspConfig = {
     // enough that the ordinary few-dB breathing of room tone is all still
     // evidence.
     backgroundAboveFloorDb: 12,
-    // −70 dBFS. A backstop, not a gate — see `absoluteFloorDb`. Chosen from
+    // −70 dBFS. A backstop, not a gate — see VoicingConfig. Chosen from
     // the reference recording rather than from taste: its quietest in-note
     // frame measures −63.8 dBFS in band (a note's dying fall) and its room
     // sits around −67, so −70 is below everything that recording contains as
@@ -97,11 +97,13 @@ export const DEFAULT_CONFIG: DspConfig = {
     // 20.9, genuine scoops 30–36). The transcription of that recording is
     // identical for anything from 12 to 24, so this is not a fitted constant.
     //
-    // The overlap this paragraph describes is now handled by *shape* rather
-    // than by rate alone: a movement is only transitional if it is not part of
-    // an oscillation, i.e. if it is not immediately undone. Vibrato is undone
-    // by construction; a scoop is not. That is what lets the rules below catch
-    // slow scoops without stripping the middle out of a wide vibrato.
+    // The overlap this paragraph describes is not resolved by rate at all. A
+    // movement is only transitional if it is not part of an oscillation — if it
+    // is not immediately undone — which is what lets the rules below catch slow
+    // scoops without stripping the middle out of a wide vibrato. And because a
+    // legato step wearing vibrato passes even that test, the last word belongs
+    // to the pitch the trail is *centred* on: it moves across a note change and
+    // stands still across a wobble. See `centreTrack` in segment.ts.
     glideSlopeStPerSec: 18,
     // Where a movement begins and ends. A whistle held steady wanders by a few
     // cents between frames, which at a 10.7 ms hop is already a couple of
@@ -137,8 +139,8 @@ export const DEFAULT_CONFIG: DspConfig = {
     // It says how far a single frame may sit from the running reference and
     // still be the same note, and it is *not* the widest wobble the pipeline
     // survives: a vibrato of ±90 cents swings three times this far and still
-    // comes out as one correctly-named note, because stage G recognises an
-    // oscillation by its shape and puts the pieces back together afterwards.
+    // comes out as one correctly-named note, because stage G puts the pieces
+    // back together wherever the pitch they are centred on holds still.
     // Measured limits of that repair, on a 1.2 s held note: one note through
     // ±200 cents at 4 Hz, three notes at ±300. Nobody wobbles by half an
     // octave, but the boundary is real, it is pinned in test/glide.test.ts,
