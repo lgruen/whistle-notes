@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- viewport-fit=cover lets the page paint under the notch/home indicator;
+         the CSS pays that back with env(safe-area-inset-*) padding. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <!-- Two theme-colors: the installed app is dark, but a light-mode browser
+         chrome should not get a black address bar. -->
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0e1116" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f8fa" />
+    <meta name="description" content="Whistle a melody, see the piano notes to play" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Whistle" />
+    <link rel="icon" href="./icons/icon-192.png" type="image/png" />
+    <link rel="apple-touch-icon" href="./icons/apple-touch-icon-180.png" />
+    <title>Whistle Notes</title>
+  </head>
+  <body>
+    <main class="app">
+      <h1 class="title">Whistle Notes</h1>
+      <p class="tagline">Whistle a melody, see the piano notes to play.</p>
+      <p class="status" id="status">Scaffold — audio pipeline lands in a later milestone.</p>
+    </main>
+    <footer class="footer">
+      <span id="build-stamp"></span>
+    </footer>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

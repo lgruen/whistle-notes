@@ -1,0 +1,98 @@
+/*
+ * Theme lives entirely in custom properties so the canvas piano-roll and the
+ * SVG staff (later milestones) can read the same colours back out with
+ * getComputedStyle instead of hard-coding a second, drifting palette.
+ */
+:root {
+  color-scheme: dark light;
+
+  --bg: #0e1116;
+  --surface: #161b22;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --accent: #14b8a6;
+  --accent-dim: #0f766e;
+  --danger: #f85149;
+
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f8fa;
+    --surface: #ffffff;
+    --text: #1c2128;
+    --text-dim: #57606a;
+    --accent: #0f766e;
+    --accent-dim: #14b8a6;
+    --danger: #cf222e;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding:
+    var(--safe-top) var(--safe-right)
+    var(--safe-bottom) var(--safe-left);
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Kills the 300 ms tap delay on the controls that arrive in M4. */
+button {
+  touch-action: manipulation;
+}
+
+.app {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 1.5rem;
+  text-align: center;
+}
+
+.title {
+  margin: 0;
+  font-size: clamp(2rem, 9vw, 3rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--accent);
+}
+
+.tagline {
+  margin: 0;
+  color: var(--text);
+}
+
+.status {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.875rem;
+}
+
+.footer {
+  padding: 0.75rem 1rem;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

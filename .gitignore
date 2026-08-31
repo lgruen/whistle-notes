@@ -1,0 +1,12 @@
+node_modules/
+dist/
+dev-dist/
+.DS_Store
+*.log
+coverage/
+
+# Privacy: recordings NEVER enter this public repo. These blanket ignores mean
+# an accidental `git add -A` cannot leak audio. Do not narrow them.
+test/fixtures/local/
+*.m4a
+*.wav
