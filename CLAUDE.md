@@ -74,21 +74,36 @@ harder — skill than the one the mode is teaching. Note and interval names appe
 only as *passive labels about something already played*: the measured range
 readout, and a verdict after an attempt.
 
-There is exactly one place where notes are written out, and its boundary is
-worth stating precisely: **a draft is a transcript under review; a target is a
-melody you are about to be asked for.** The draft screen (`src/ui/practice.ts`)
-names its chips because that is the only moment the user can catch the *app*
-being wrong — a scoop that became a note, or the octave error the detector makes
-on the deepest piano keys — and because the trim and move controls would
-otherwise have nothing to aim at. The moment it is saved, the library, the
-detail screen and every exercise say only its name, its length and its source.
+Notes get written out in exactly two places, and both boundaries are worth
+stating precisely.
 
-`test/practice-ui.test.ts` enforces this against the real copy, not against
-intent: it greps the practice half of `index.html` and the exported sentences of
-`src/ui/practice.ts` for pitch names and interval words, and pins both sides of
-the draft/target boundary. If you add copy there, it has to pass — which also
-means avoiding the word "octave" (say "higher"/"lower") and "seconds" (write
-`2.1 s`) in practice-mode strings.
+**A draft is a transcript under review; a target is a melody you are about to be
+asked for.** The draft screen (`src/ui/practice.ts`) names its chips because
+that is the only moment the user can catch the *app* being wrong — a scoop that
+became a note, or the octave error the detector makes on the deepest piano keys
+— and because the trim and move controls would otherwise have nothing to aim at.
+The moment it is saved, the library, the detail screen and every exercise say
+only its name, its length and its source.
+
+**A prompt is not a report.** After an attempt, names and interval words are
+allowed: they describe something already whistled. The recall result screen uses
+that licence, and holds to a narrower line of its own that is easier to keep
+than a judgement call — **the app names what you did, never what it wanted.** A
+wrong note and an extra note are named; a missed slot, and the ghost behind every
+target rectangle, are drawn as a position and a distance. So the melody's own
+notes are never spelled out on a screen with a Try-again button two inches below
+it. The screen *before* an attempt shows nothing whatsoever: no roll, no staff,
+no name, no "starts on a low note" hint.
+
+`test/practice-ui.test.ts` enforces all of this against the real copy, not
+against intent: it greps the practice half of `index.html` and the exported
+sentences of `src/ui/practice.ts` for pitch names and interval words, checks
+every string the pre-attempt recall screen writes, and pins both boundaries from
+both sides. If you add copy there, it has to pass — which also means avoiding the
+word "octave" (say "higher"/"lower") and "seconds" (write `2.1 s`) in
+practice-mode strings. The exempt strings are the ones only reachable after an
+attempt: `transpositionText`, `takeawayText` and the verdict chips in
+`practice/recall.ts`.
 
 ### Thresholds live in segmentation, not in pitch detection
 
@@ -111,7 +126,9 @@ index.html            entry; src/main.ts is the only script; holds the whole
                       layout — header (mode tabs + transpose toggle), then two
                       sibling views: #transcribe-view (live readout, roll, note
                       list, staff, tools/debug) and #practice-view (library,
-                      draft, MIDI picker, range screens), plus the dock with
+                      draft, MIDI picker, range, target detail, and the two
+                      halves of the recall exercise: #practice-recall before an
+                      attempt and #practice-result after it), plus the dock with
                       record/play/voice/import — which belongs to the
                       transcriber alone and is hidden in practice mode, whose
                       actions live on whichever screen is showing
@@ -125,13 +142,15 @@ src/
                       segment index
   notes/format.ts     re-exports dsp/tuning + display transposition, staff steps
   practice/           PURE island (except store.ts). align (the diagnosis DP),
-                      stats, range, target (+ drafts), midi (SMF parser),
+                      stats (+ attempt history), range, target (+ drafts),
+                      recall (the exercise: playback layout, diff overlay
+                      layout, verdict strip, the sentences), midi (SMF parser),
                       bundled (starter melodies), store (the only storage)
   audio/              browser-only: capture (mic + worklet), decode (file
                       import), synth (playback voices), wav-export (debug
                       download)
-  ui/                 controls state theme live notelist pianoroll staff debug
-                      sw-update practice
+  ui/                 controls state theme live notelist pianoroll diffroll
+                      staff debug sw-update practice
 public/
   pcm-recorder.worklet.js   plain-JS AudioWorklet forwarder (not bundled)
   icons/                    generated PNGs — commit them (192/512/maskable/
@@ -148,7 +167,8 @@ test/
                       segmentation, voicing, glide, music theory, synth
                       fixtures, wav, harness, architecture, fft interop, golden,
                       ui-* for the app modules, and practice-* for the
-                      diagnosis engine, the store, the sources and the screens)
+                      diagnosis engine, the store, the sources, the recall
+                      exercise and the screens)
   fixtures/synth.ts   synthetic signal generator
   fixtures/local/     gitignored; the real recordings live here
 ```
@@ -183,12 +203,12 @@ that refusal as a disabled tab.
 ### Take-intent routing (the thing to extend, not to fork)
 
 Every take — a transcription, either end of the range check, a melody being
-recorded as a target — goes through the same `startRecording` / `stopRecording` /
-`transcribe()` path in `src/main.ts`. The only thing that differs is where the
+recorded as a target, an attempt at one — goes through the same `startRecording`
+/ `stopRecording` / `transcribe()` path in `src/main.ts`. The only thing that differs is where the
 notes go afterwards, and that is carried by one variable:
 
 ```ts
-type TakeIntent = "transcribe" | RangeStep | "target";
+type TakeIntent = "transcribe" | RangeStep | "target" | "attempt";
 ```
 
 It is **read once, when the analysis is scheduled**, so a mode switch or a fresh
@@ -221,15 +241,86 @@ history *of* with it. Each key is one complete document written with one
 `setItem`, which is atomic — a refused write leaves the previous document intact
 and surfaces as `storageError` on screen rather than being swallowed.
 
+Adding the per-attempt history to the stats document **did not bump its
+version**, deliberately: the field is additive, a build that predates it ignores
+it, and a bump would have made that build discard the lifetime counts as well.
+Losing the recent rows is a disappointment; losing a year of practice is not.
+
 ### `src/practice/` is an island too
 
-`align`, `stats`, `range`, `target`, `midi` and `bundled` are pure: no DOM, no
-storage, no imports from `src/ui` or `src/audio`. **`store.ts` is the only module
-in the feature that touches `localStorage`**, and `test/practice-store.test.ts`
-enforces both halves by grepping the sources (with a positive control, so it
-cannot rot into a no-op). The payoff is the same as `src/dsp`'s: the aligner can
-be fuzzed, the SMF parser can be driven from byte fixtures built in a test, and
-none of it needs a browser to be true.
+`align`, `stats`, `range`, `target`, `recall`, `midi` and `bundled` are pure: no
+DOM, no storage, no imports from `src/ui` or `src/audio`. **`store.ts` is the
+only module in the feature that touches `localStorage`**, and
+`test/practice-store.test.ts` enforces both halves by grepping the sources (with
+a positive control, so it cannot rot into a no-op). The payoff is the same as
+`src/dsp`'s: the aligner can be fuzzed, the SMF parser can be driven from byte
+fixtures built in a test, and none of it needs a browser to be true.
+
+`recall.ts` is the sharpest case: it lays a melody out for the synth it may not
+import and lays a diff out on a canvas it may not touch. Both work by
+**structural** types rather than shared imports — `PlayableNote` in
+`audio/synth.ts` is the four fields playback reads, and `HeardNote` in
+`recall.ts` is the five fields a transcription already has — so `result.notes`
+goes straight into the aligner and the overlay with no adapter anywhere, and the
+arithmetic stays checkable without a browser.
+
+### Melody recall (T3)
+
+From a target's detail screen, "Practice this" opens `screen: "recall"`, which is
+two elements switched on `recall.attempt`: `#practice-recall` before the attempt
+and `#practice-result` after it. One `RecallSession` lives in the practice store
+and is never persisted; the history it produces is.
+
+**The melody is transposed into the whistler's range once, in `beginRecall`**,
+and that array is what the synth plays, what `alignAttempt` scores against, and
+what `recordAttempt` reads its intervals from. This is the load-bearing line of
+the whole exercise: scoring against the written pitch while playing the
+transposed one would report a register error the app itself introduced. A range
+measured again mid-session deliberately does not change what the user already
+heard.
+
+Playback goes through the same `startPlayback` the transcriber uses, at the
+stored voice preference (its toggle lives in the dock, which practice mode
+hides). Targets carry durations and no start times, so `targetPlayback` lays them
+end to end with an **80 ms gap** — without it two identical notes in a row are
+one long note, and the app asks for a melody it did not play. Listening is
+optional and unlimited: the difficulty knob is the user's own, and the count is
+reported without a word of judgement.
+
+**The diff overlay** (`ui/diffroll.ts` draws, `practice/recall.ts` lays out) is a
+piano roll in the *attempt's* register, and its whole claim is one vertical
+distance: *at this moment you were here, and the melody wanted you there.*
+
+- The x axis is the attempt's own clock, and each target slot is drawn as a ghost
+  outline occupying **the span of the note that answered it**. That is what lets
+  the measured pitch trail — the layer that tells a badly-aimed note from a scoop
+  that never settled — share the picture with the diff.
+- Every pitch has the alignment's `transposition` *subtracted*, so a melody
+  echoed a 5th up is drawn where the user should have whistled it rather than
+  moved somewhere they never sang.
+- Slots nobody sang have no span to borrow, so they are wedged into the silence
+  between their neighbours and allowed to overhang it slightly — reading as
+  squeezed in between, which is truer than being hidden.
+- Verdict colours come from the stylesheet's custom properties (`--accent`,
+  `--warn`, `--danger`) through `ui/theme.ts`, so the canvas and the verdict
+  chips are one palette in both themes. `--warn` is warm rather than red because
+  forty cents flat is the normal condition of a beginner's whistle.
+
+**The history**, per target, is `TargetTally.history`: the last
+`MAX_ATTEMPT_HISTORY` (20) attempts, newest first, each as its verdicts in order.
+It exists because a sum cannot answer the question that matters — three wrong
+notes across ten attempts and three in one disastrous attempt add up identically.
+The detail screen draws them as strips, and the shape answers it at a glance: the
+same cell red six times is a trouble spot, a different cell each time is ordinary
+bad luck. `troubleSpots()` needs **two** failures at a slot before it says a
+word, because an app that announced one after a single miss would be reporting
+noise. Both the history and the slot tallies reset when the target's note count
+changes, since slot 4 of a five-note melody is a different place from slot 4 of a
+three-note one.
+
+Stats are recorded **only on a completed attempt**. A take the app heard nothing
+in gets a friendly retry and no row: it is not evidence about the whistler, and a
+phantom failure in the heatmap is worse than no data at all.
 
 ### Target sources
 
