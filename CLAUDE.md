@@ -237,10 +237,18 @@ All three land on `addTarget()` in the store, and the model they produce is the
 same `{name, source, notes: {midi, durSec}[]}` whatever they came from:
 
 - **Recorded** — a `"target"` take through the transcriber. Works for whistling
-  *and* for a piano; the one weakness is the bottom of the keyboard, where a
-  string's fundamental can be quieter than its harmonics and the octave above
-  wins the spectral peak. The draft screen's move buttons are the remedy and its
-  hint says so.
+  *and* for a piano: a real piano take comes back within a couple of cents on
+  every note. **The limit is the register, and the failure is a missing note,
+  not a wrong one.** The pitch search starts at 400 Hz (`minHz`), so a note
+  whose fundamental is below roughly the middle of a keyboard has only its
+  harmonics in band, and the clarity gate reads that as unvoiced. Measured on
+  synthetic piano tones: at middle C and below, *no notes at all*; straddling
+  the band edge, a correct melody with the low notes silently missing; an octave
+  above middle C, exact. So the advice in the draft hint is "play it further up
+  the keyboard", **not** "use the move buttons" — those are for putting a melody
+  where the user wants to whistle it. Widening `minHz` is not a free fix: that
+  band is why speech and hum are rejected for nothing, and it would need its own
+  sweep against the golden recording.
 - **MIDI** — `practice/midi.ts`, a hand-rolled SMF parser (running status,
   velocity-0 note-offs, merged tempo map for format 1, per-track for format 2,
   SMPTE divisions). Splits by track *and* channel, collapses chords to the top

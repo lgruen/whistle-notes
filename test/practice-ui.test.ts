@@ -114,6 +114,19 @@ describe("the ear-first rule", () => {
     expect(draftMetaText(draft)).not.toMatch(PITCH_NAME);
   });
 
+  /**
+   * Measured, and therefore worth defending: the pitch search starts at 400 Hz,
+   * so a piano melody played around the middle of the keyboard comes back with
+   * notes *missing* rather than wrong — the clarity gate reads a harmonic-rich
+   * tone whose fundamental is out of band as unvoiced. The actionable advice is
+   * "play it higher up", and it is the kind of sentence that gets tidied away
+   * by someone who does not know why it is there.
+   */
+  it("tells a piano player the one thing that will fix a half-empty take", () => {
+    expect(DRAFT_HINT_RECORDED).toMatch(/missing/i);
+    expect(DRAFT_HINT_RECORDED).toMatch(/further up the keyboard/);
+  });
+
   it("asks for a feeling rather than for a pitch", () => {
     expect(rangeStepHint(null, "low")).toMatch(/comfortably low/);
     expect(rangeStepHint(null, "high")).toMatch(/comfortably high/);

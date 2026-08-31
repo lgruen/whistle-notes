@@ -229,8 +229,9 @@ export function targetRowHtml(target: PracticeTarget): string {
  */
 export const DRAFT_HINT_RECORDED =
   "This is what the app heard. Tap a note to cut the nearer end back to it, and " +
-  "move the whole thing up or down if it came out further away than you played " +
-  "it — that happens most on the deepest piano keys.";
+  "move the whole thing up or down to put it where you like. Notes missing? The " +
+  "app only listens to the top half of a piano — play those ones further up the " +
+  "keyboard and record it again.";
 
 /** The same screen, for a melody that arrived from a file rather than a
  *  microphone: nothing was *heard*, so there is nothing to doubt. */

@@ -716,10 +716,26 @@ const TAKE_SUBJECTS: Record<TakeIntent, string> = {
  * The pipeline is the transcriber's, unchanged, and that is what makes this
  * work for a piano as well as for a whistle: `transcribe()` reports the closest
  * note to whatever tone it heard, and a piano is a great deal more in tune than
- * a whistle is. The one place it is unreliable is the bottom of the keyboard,
- * where a string's fundamental can be quieter than its own harmonics and the
- * octave above wins the spectral peak — which is exactly what the draft screen's
- * move buttons are for, and what its hint warns about.
+ * a whistle is — a real piano take comes back within a couple of cents on every
+ * note.
+ *
+ * The limit is the *register*, and it is sharper than "it gets confused down
+ * there". The pitch search is band-limited from 400 Hz up (`minHz` in
+ * `dsp/config.ts`; that band is also why speech and mains hum are rejected for
+ * free), so a note whose fundamental is below roughly the middle of a keyboard
+ * has nothing in band but its harmonics — and the voicing gate, which asks what
+ * fraction of in-band energy sits under one mainlobe, then reads a
+ * harmonic-rich tone as unvoiced.
+ *
+ * Measured on synthetic piano tones (harmonic stack, exponential decay): a
+ * melody at middle C and an octave below it produces **no notes at all**; a
+ * melody straddling the band edge comes back correct but with the notes under
+ * it silently missing; an octave above middle C it is exact. Note the failure
+ * is a *dropped* note rather than an octave-shifted one, so the draft's move
+ * buttons are not the remedy — playing it further up the keyboard is, and that
+ * is what the hint says. (Synthetic tones are not a piano; the real recording
+ * in `test/fixtures/local` sits above the band edge and is transcribed exactly,
+ * and says nothing either way about what happens below it.)
  */
 function applyTargetTake(notes: readonly Note[]): void {
   // Back to `idle` rather than `result`, for the reason `applyRangeTake` gives:
@@ -728,7 +744,11 @@ function applyTargetTake(notes: readonly Note[]): void {
   setState({ phase: "idle", notes: [], frames: [], playingIndex: null, message: "" });
 
   if (notes.length === 0) {
-    endTargetTake("Nothing tonal in that one — try it again a little louder.");
+    endTargetTake(
+      "Nothing tonal in that one. Try it again a little louder — and if you are " +
+        "at a piano, further up the keyboard: the app only listens to the top " +
+        "half of one.",
+    );
     return;
   }
   beginDraft(
