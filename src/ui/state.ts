@@ -61,6 +61,10 @@ export interface AppState {
    *  means the whistler ran sharp of A440. Surfaced in the result view when it
    *  is big enough to be worth knowing about. */
   tuningOffsetCents: number;
+  /** Whether the audio behind this result is a *live* take still held in
+   *  memory, i.e. whether there is anything for the `.wav` debug export to
+   *  save. False after an import: the user already has that file. */
+  hasRecording: boolean;
 }
 
 const TRANSPOSE_KEY = "whistle-notes:transpose";
@@ -91,6 +95,7 @@ let state: AppState = {
   message: "",
   warning: null,
   tuningOffsetCents: 0,
+  hasRecording: false,
 };
 
 /**

@@ -61,6 +61,29 @@
       <div class="notes" id="notelist" hidden></div>
       <div class="staff" id="staff" hidden></div>
 
+      <!-- Both of these are for whoever is *fixing* the app, so both are
+           deliberately quiet. Saving the take turns a real-world failure into
+           a file the offline harness can sweep; the panel answers "what did
+           this device actually do?", which is the question a laptop cannot. -->
+      <div class="tools">
+        <button type="button" class="ghost" id="save-wav" hidden>
+          Save recording (.wav)
+        </button>
+        <details class="debug" id="debug">
+          <summary>Debug</summary>
+          <dl class="debug-list">
+            <dt>Mic</dt>
+            <dd id="debug-audio">—</dd>
+            <dt>Frame</dt>
+            <dd id="debug-live">—</dd>
+            <dt>Result</dt>
+            <dd id="debug-result">—</dd>
+            <dt>Build</dt>
+            <dd id="debug-build">—</dd>
+          </dl>
+        </details>
+      </div>
+
       <footer class="footer">
         <span id="build-stamp"></span>
       </footer>
@@ -69,6 +92,15 @@
     <div class="dock">
       <button type="button" class="btn btn-record" id="record">Record</button>
       <button type="button" class="btn btn-play" id="play" hidden>Play</button>
+      <!-- The escape hatch. A file goes through the very same transcribe()
+           call a live take does, so this keeps working when the microphone
+           does not — denied, missing, or hijacked by another app. The input
+           is invisible but present and focusable: the label names it, and it
+           covers the button so the tap lands on the input itself. -->
+      <label class="btn btn-file" id="import">
+        Import
+        <input type="file" accept="audio/*" id="import-input" />
+      </label>
     </div>
 
     <script type="module" src="/src/main.ts"></script>

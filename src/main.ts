@@ -13,11 +13,15 @@ import {
   setCaptureHandlers,
   startRecording,
   stopRecording,
+  type CapturedAudio,
 } from "./audio/capture.js";
+import { AudioFileError, decodeAudioFile } from "./audio/decode.js";
 import { isPlaying, startPlayback, stopPlayback } from "./audio/synth.js";
+import { downloadWav, takeFilename } from "./audio/wav-export.js";
 import { a4FromOffsetCents, formatCents, transposeMidi } from "./notes/format.js";
 import { createControls } from "./ui/controls.js";
-import { createLiveView } from "./ui/live.js";
+import { createDebugView } from "./ui/debug.js";
+import { createLiveView, formatClock } from "./ui/live.js";
 import { highlightNoteList, initNoteList, renderNoteList } from "./ui/notelist.js";
 import { drawPianoRoll, invalidateRollSize, resetRollRange } from "./ui/pianoroll.js";
 import { highlightStaff, renderStaff } from "./ui/staff.js";
@@ -51,12 +55,23 @@ const live = createLiveView({
   time: element("live-time"),
 });
 
+const debug = createDebugView({
+  panel: element<HTMLDetailsElement>("debug"),
+  audio: element("debug-audio"),
+  live: element("debug-live"),
+  result: element("debug-result"),
+  build: element("debug-build"),
+});
+
 initNoteList(noteListElement);
 
 const controls = createControls(
   {
     record: element<HTMLButtonElement>("record"),
     play: element<HTMLButtonElement>("play"),
+    importLabel: element("import"),
+    importInput: element<HTMLInputElement>("import-input"),
+    save: element<HTMLButtonElement>("save-wav"),
     transpose: element("transpose"),
     message: element("message"),
   },
@@ -65,6 +80,8 @@ const controls = createControls(
     onStopRecord: finishRecording,
     onPlay: beginPlayback,
     onStopPlay: stopPlayback,
+    onImport: beginImport,
+    onSave: saveRecording,
     onTranspose: (shift) => {
       // The synth schedules pitches up front, so a transposed melody cannot be
       // changed mid-flight; stopping is honest and instant.
@@ -116,6 +133,7 @@ function renderTuning(state: AppState): void {
 function render(state: AppState): void {
   controls.render(state);
   renderTuning(state);
+  debug.render(state);
 
   if (state.notes !== renderedNotes || state.transpose !== renderedTranspose) {
     renderedNotes = state.notes;
@@ -154,7 +172,10 @@ function render(state: AppState): void {
       );
       break;
     case "error":
-      live.show("—", "Tap Record to try again.");
+      // Never a dead end: whatever went wrong with the microphone — denied,
+      // missing, insecure context, no AudioWorklet — a file still goes through
+      // the same pipeline, so the way out is on screen next to the way in.
+      live.show("—", "Tap Record to try again, or import an audio file.");
       break;
     default:
       live.show("—", "Tap Record and whistle a melody.");
@@ -178,6 +199,7 @@ function loop(): void {
   const transpose = getState().transpose;
 
   live.tick(status, transpose, MAX_RECORD_SEC);
+  debug.tick(status);
   drawPianoRoll(canvas, {
     frames: getLiveFrames(),
     notes: [],
@@ -201,6 +223,10 @@ function stopLoop(): void {
 
 /* ── Transitions ──────────────────────────────────────────────────────── */
 
+/** The audio behind the result on screen, when it came from the microphone.
+ *  Kept only so the `.wav` debug export has something to hand over. */
+let lastTake: CapturedAudio | null = null;
+
 /**
  * Called straight from the Record tap, with nothing awaited first: the audio
  * context inside `startRecording` only unlocks inside the gesture, and an
@@ -209,6 +235,7 @@ function stopLoop(): void {
 function beginRecording(): void {
   stopPlayback();
   resetRollRange();
+  lastTake = null;
 
   const started = startRecording();
 
@@ -220,6 +247,7 @@ function beginRecording(): void {
     playingIndex: null,
     message: "",
     warning: null,
+    hasRecording: false,
   });
   live.show("—", "Listening…");
   stopLoop();
@@ -274,24 +302,102 @@ function finishRecording(): void {
     setState({ phase: "idle", message: "", warning: null });
     return;
   }
-  setState({ phase: "analyzing", message: "" });
+  // Held so the debug export has something to save. One take at a time: at the
+  // 60 s cap that is ~11.5 MB, and it is dropped the moment the next one
+  // starts.
+  lastTake = take;
+  setState({ phase: "analyzing", message: "", hasRecording: true });
+  analyze(take, "that take");
+}
 
-  // Paint first, analyse second. `transcribe` is synchronous and can take a
-  // noticeable moment on a phone for a full minute of audio; without yielding
-  // to the browser here, the "listening back…" state never reaches the screen
-  // and the app looks frozen instead of busy. rAF gets us to just before a
-  // paint, and the timeout puts the work in the task *after* it.
+/**
+ * Import a file: the same pipeline, a different tap.
+ *
+ * `transcribe()` cannot tell the difference — and that is the feature. It makes
+ * import an escape hatch when the microphone is unavailable, and a controlled
+ * comparison when the microphone is *available but suspect*: whistle a take
+ * live, whistle the same thing into the phone's voice-memo app, import it, and
+ * whichever one is mush tells you whether the problem is the algorithm or the
+ * platform's voice processing.
+ */
+function beginImport(file: File): void {
+  stopPlayback();
+  resetRollRange();
+  // An imported file is already a file; there is nothing for the export to
+  // give back that the user does not already have.
+  lastTake = null;
+
+  setState({
+    phase: "analyzing",
+    notes: [],
+    frames: [],
+    playing: false,
+    playingIndex: null,
+    message: "",
+    warning: null,
+    hasRecording: false,
+  });
+
+  void decodeAudioFile(file).then(
+    (decoded) => {
+      if (decoded.truncated) {
+        // Truncated rather than rejected: someone importing a long recording
+        // whistled a melody somewhere in it, and "file too long" helps nobody.
+        setState({
+          warning:
+            `That file is ${formatClock(decoded.sourceDurationSec)} long — ` +
+            `only the first ${MAX_RECORD_SEC} seconds were transcribed.`,
+        });
+      }
+      analyze(decoded, "that file");
+    },
+    (error: unknown) => {
+      console.error("[import] failed", error);
+      setState({
+        phase: "error",
+        message:
+          error instanceof AudioFileError
+            ? error.message
+            : "That file could not be read on this device.",
+      });
+    },
+  );
+}
+
+/**
+ * Run the transcription, off the paint path.
+ *
+ * `transcribe` is synchronous and can take a noticeable moment on a phone for a
+ * full minute of audio; without yielding to the browser here, the "listening
+ * back…" state never reaches the screen and the app looks frozen instead of
+ * busy. rAF gets us to just before a paint, and the timeout puts the work in
+ * the task *after* it.
+ */
+function analyze(audio: CapturedAudio, subject: string): void {
   requestAnimationFrame(() => {
     setTimeout(() => {
       try {
-        const result = transcribe(take.samples, take.sampleRate);
+        const result = transcribe(audio.samples, audio.sampleRate);
         applyResult(result.notes, result.frames, result.tuningOffsetCents);
       } catch (error) {
         console.error("[transcribe] failed", error);
-        setState({ phase: "error", message: "Something went wrong analysing that take." });
+        setState({ phase: "error", message: `Something went wrong analysing ${subject}.` });
       }
     }, 0);
   });
+}
+
+/**
+ * Save the take that produced the result on screen.
+ *
+ * A bad transcription is only reproducible if the audio behind it survives, and
+ * a whistle cannot be performed twice the same way. This is what turns "it
+ * heard D6 and I don't know why" into a file the offline harness can sweep.
+ * Encoded and downloaded entirely on the device; nothing is uploaded anywhere.
+ */
+function saveRecording(): void {
+  if (!lastTake) return;
+  downloadWav(lastTake.samples, lastTake.sampleRate, takeFilename());
 }
 
 function beginPlayback(): void {

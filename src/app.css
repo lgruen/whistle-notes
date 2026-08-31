@@ -41,6 +41,15 @@
   box-sizing: border-box;
 }
 
+/* `hidden` is set from TypeScript all over this app, and the rule behind it
+   lives in the *user-agent* stylesheet — which any author rule that sets
+   `display` silently beats, however low its specificity. The Import control is
+   a flex label, so without this it would simply ignore being hidden. One
+   `!important` is cheaper than remembering that at every call site. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
@@ -405,6 +414,9 @@ button {
   border: 0;
   border-radius: 999px;
   font-weight: 700;
+  /* Also on `.btn` rather than only on `button`: the Import control is a
+     <label>, which the element selector above does not reach. */
+  touch-action: manipulation;
 }
 
 .btn:disabled {
@@ -430,6 +442,88 @@ button {
   background: transparent;
   color: var(--accent);
   font-size: 1rem;
+}
+
+/* Same outline treatment as Play, so the dock reads as one primary action and
+   two secondary ones rather than three competing buttons. */
+.btn-file {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-width: 5.5rem;
+  padding: 0 0.9rem;
+  overflow: hidden;
+  border: 1px solid var(--text-dim);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 1rem;
+}
+
+/* Invisible, but really there: the input covers the whole label so the tap
+   lands on the control itself rather than relying on label forwarding, which
+   is where file inputs get quietly unreliable on mobile WebViews. `font-size:
+   0` stops the native widget from dictating the button's size. */
+.btn-file input[type="file"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  font-size: 0;
+  cursor: pointer;
+}
+
+/* ── Debug affordances ──────────────────────────────────────────────── */
+
+.tools {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.4rem;
+}
+
+.ghost {
+  min-height: 2.25rem;
+  padding: 0 0.7rem;
+  border: 1px solid var(--surface);
+  border-radius: 0.5rem;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+
+.debug {
+  width: 100%;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+}
+
+.debug > summary {
+  cursor: pointer;
+  padding: 0.15rem 0;
+  opacity: 0.7;
+}
+
+/* Two columns, so a value that wraps does not drag its label with it. */
+.debug-list {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.6rem;
+  margin: 0.3rem 0 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.debug-list dt {
+  opacity: 0.6;
+}
+
+.debug-list dd {
+  margin: 0;
+  /* Frame metrics and settings strings are long and unbreakable; wrapping
+     anywhere beats a horizontal scrollbar on a phone. */
+  overflow-wrap: anywhere;
 }
 
 .footer {
