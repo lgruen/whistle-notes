@@ -65,6 +65,31 @@ not from modules inside it; `src/notes/format.ts` and `test/voicing.test.ts`
 (which needs the intermediate `prepare()` stages) are the two deliberate
 exceptions.
 
+### Practice mode is ear-first
+
+The app plays, the user whistles back. **No exercise, prompt or library row may
+present a written or named target**, because the user this is built for has
+minimal music theory and reading "whistle a C6" is a different — and much
+harder — skill than the one the mode is teaching. Note and interval names appear
+only as *passive labels about something already played*: the measured range
+readout, and a verdict after an attempt.
+
+There is exactly one place where notes are written out, and its boundary is
+worth stating precisely: **a draft is a transcript under review; a target is a
+melody you are about to be asked for.** The draft screen (`src/ui/practice.ts`)
+names its chips because that is the only moment the user can catch the *app*
+being wrong — a scoop that became a note, or the octave error the detector makes
+on the deepest piano keys — and because the trim and move controls would
+otherwise have nothing to aim at. The moment it is saved, the library, the
+detail screen and every exercise say only its name, its length and its source.
+
+`test/practice-ui.test.ts` enforces this against the real copy, not against
+intent: it greps the practice half of `index.html` and the exported sentences of
+`src/ui/practice.ts` for pitch names and interval words, and pins both sides of
+the draft/target boundary. If you add copy there, it has to pass — which also
+means avoiding the word "octave" (say "higher"/"lower") and "seconds" (write
+`2.1 s`) in practice-mode strings.
+
 ### Thresholds live in segmentation, not in pitch detection
 
 The pitch stage emits raw per-frame metrics (`clarity`, `snrDb`,
@@ -83,21 +108,30 @@ only works at one exact setting is fitted to one recording.
 
 ```
 index.html            entry; src/main.ts is the only script; holds the whole
-                      layout (header + transpose toggle, live readout, roll,
-                      note list, staff, tools/debug, dock with record/play/import)
+                      layout — header (mode tabs + transpose toggle), then two
+                      sibling views: #transcribe-view (live readout, roll, note
+                      list, staff, tools/debug) and #practice-view (library,
+                      draft, MIDI picker, range screens), plus the dock with
+                      record/play/voice/import — which belongs to the
+                      transcriber alone and is hidden in practice mode, whose
+                      actions live on whichever screen is showing
 src/
-  main.ts             boot, phase transitions, the rAF hot loop, import,
-                      transcription, WAV save, playback, SW update policy,
-                      build stamp, fft.js self-check
+  main.ts             boot, phase transitions, the rAF hot loop, take-intent
+                      routing, import (audio and MIDI), transcription, WAV save,
+                      playback, SW update policy, build stamp, fft.js self-check
   app.css             theme custom properties (canvas/SVG read these back)
   vite-env.d.ts       declares __BUILD__
   dsp/                PURE island. types config tuning fft window pitch tracker
                       segment index
   notes/format.ts     re-exports dsp/tuning + display transposition, staff steps
+  practice/           PURE island (except store.ts). align (the diagnosis DP),
+                      stats, range, target (+ drafts), midi (SMF parser),
+                      bundled (starter melodies), store (the only storage)
   audio/              browser-only: capture (mic + worklet), decode (file
-                      import), synth (playback), wav-export (debug download)
+                      import), synth (playback voices), wav-export (debug
+                      download)
   ui/                 controls state theme live notelist pianoroll staff debug
-                      sw-update
+                      sw-update practice
 public/
   pcm-recorder.worklet.js   plain-JS AudioWorklet forwarder (not bundled)
   icons/                    generated PNGs — commit them (192/512/maskable/
@@ -113,7 +147,8 @@ test/
   *.test.ts           vitest; roughly one file per concern (dsp contract, pitch,
                       segmentation, voicing, glide, music theory, synth
                       fixtures, wav, harness, architecture, fft interop, golden,
-                      and ui-* for the app modules)
+                      ui-* for the app modules, and practice-* for the
+                      diagnosis engine, the store, the sources and the screens)
   fixtures/synth.ts   synthetic signal generator
   fixtures/local/     gitignored; the real recordings live here
 ```
@@ -126,6 +161,101 @@ it as a change detector rather than as ground truth.
 `presetConfig()`. They are reachable from the harness (`--preset`) and from
 tests, but **no UI control calls them today** — the "wobble snap" knob described
 in the config comments does not exist on screen yet.
+
+## Practice mode
+
+The second half of the app: a library of target melodies, and (from T3 on) the
+exercises that play them at you and score what comes back. See the ear-first
+hard rule above before touching any of its copy.
+
+### One microphone, two modes
+
+`src/ui/state.ts` owns `mode` (`"transcribe" | "practice"`) and the `phase`
+machine; `src/practice/store.ts` owns everything practice-shaped. They are two
+stores because they have different lifetimes — `AppState` is about the take on
+screen right now, the practice store is a library and a history that outlive the
+session — but they deliberately share **one** `phase`, because `capture.ts` is a
+singleton and routing every take through the same phase machine is what makes it
+impossible for the two halves of the app to open the microphone at once.
+`setMode` refuses a switch while audio is running, and `ui/controls.ts` renders
+that refusal as a disabled tab.
+
+### Take-intent routing (the thing to extend, not to fork)
+
+Every take — a transcription, either end of the range check, a melody being
+recorded as a target — goes through the same `startRecording` / `stopRecording` /
+`transcribe()` path in `src/main.ts`. The only thing that differs is where the
+notes go afterwards, and that is carried by one variable:
+
+```ts
+type TakeIntent = "transcribe" | RangeStep | "target";
+```
+
+It is **read once, when the analysis is scheduled**, so a mode switch or a fresh
+tap mid-analysis cannot redirect a take already in flight. Every failure path
+(start refused, session interrupted, no audio captured, segmenter crash) routes
+by intent through `practiceTakeFailed`, because the transcriber's message line is
+not on screen in practice mode — and each of those store calls also clears the
+flag the screen uses to decide whether a Stop button belongs over an open
+microphone. If you add a new kind of take, add an arm here; do not fork the
+record path.
+
+### Storage
+
+Five keys, all under `whistle-notes:`, all read inside `try`/`catch` (some
+privacy modes make `localStorage` throw on access, and a library nobody can read
+must never be a mode nobody can open):
+
+| key | written by | holds |
+| --- | --- | --- |
+| `whistle-notes:transpose` | `ui/state.ts` | display octave |
+| `whistle-notes:mode` | `ui/state.ts` | which tab was last open |
+| `whistle-notes:voice` | `ui/state.ts` | playback voice |
+| `whistle-notes:practice:v1` | `practice/store.ts` | target library + measured range |
+| `whistle-notes:practice-stats:v1` | `practice/store.ts` | attempt history |
+
+The two practice keys are versioned and separate on purpose: an unknown version
+is a document a future build wrote and is left alone rather than half-read, and a
+quota failure while writing the growing history must not take the library it is a
+history *of* with it. Each key is one complete document written with one
+`setItem`, which is atomic — a refused write leaves the previous document intact
+and surfaces as `storageError` on screen rather than being swallowed.
+
+### `src/practice/` is an island too
+
+`align`, `stats`, `range`, `target`, `midi` and `bundled` are pure: no DOM, no
+storage, no imports from `src/ui` or `src/audio`. **`store.ts` is the only module
+in the feature that touches `localStorage`**, and `test/practice-store.test.ts`
+enforces both halves by grepping the sources (with a positive control, so it
+cannot rot into a no-op). The payoff is the same as `src/dsp`'s: the aligner can
+be fuzzed, the SMF parser can be driven from byte fixtures built in a test, and
+none of it needs a browser to be true.
+
+### Target sources
+
+All three land on `addTarget()` in the store, and the model they produce is the
+same `{name, source, notes: {midi, durSec}[]}` whatever they came from:
+
+- **Recorded** — a `"target"` take through the transcriber. Works for whistling
+  *and* for a piano; the one weakness is the bottom of the keyboard, where a
+  string's fundamental can be quieter than its harmonics and the octave above
+  wins the spectral peak. The draft screen's move buttons are the remedy and its
+  hint says so.
+- **MIDI** — `practice/midi.ts`, a hand-rolled SMF parser (running status,
+  velocity-0 note-offs, merged tempo map for format 1, per-track for format 2,
+  SMPTE divisions). Splits by track *and* channel, collapses chords to the top
+  note, warns when that mattered. **The target model has no rests**: durations
+  are the notes' own sounding lengths capped at the next onset, so a melody with
+  a long rest plays back tighter than the file. Alignment is pitch-ordered, so
+  this costs nothing in scoring.
+- **Bundled** — `practice/bundled.ts`, five public-domain tunes as data,
+  easiest first. One tap, no draft: they are already trimmed and named.
+
+Recorded and MIDI melodies stop at a **draft** (`TargetDraft` in `target.ts`),
+which holds the untouched notes plus a kept range and an octave shift, so
+trimming is always undoable. Drafts are never persisted — restoring a half-made
+target on the next launch would confront the user with notes they no longer
+remember recording.
 
 ## Dev loop
 
